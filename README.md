@@ -31,9 +31,10 @@ python partition_data.py --num-clients 10 --partition-type label_skew --alpha 0.
 
 ## Training
 
-**Run federated learning simulation**:
+**Run federated learning simulations:**
+
 ```sh
-python fedup.py --n_clients 10 --partition_type iid-10 --strategy FedAvg --rounds 10
+python -m FL --n_clients <> --partition_type <> --strategy <> --rounds <>
 ```
 
 **Strategies**:
@@ -41,17 +42,17 @@ python fedup.py --n_clients 10 --partition_type iid-10 --strategy FedAvg --round
 - `FedProx`: Proximal term regularization (`--mu 0.01`)
 - `FedDyn`: Dynamic regularization (`--feddyn_alpha 0.1`)
 - `RobustFilter`: Byzantine-robust aggregation (ε=0.2)
-
+- `FedCoMed`: Coordinate-wise Median
 **Examples**:
 ```sh
 # FedProx with proximal term
-python fedup.py --n_clients 10 --partition_type label_skew-10 --strategy FedProx --mu 0.01
+python3 -m FL --n_clients 10 --partition_type label_skew-10 --strategy FedProx --mu 0.01
 
 # FedDyn with alpha
-python fedup.py --n_clients 10 --partition_type label_skew-10 --strategy FedDyn --feddyn_alpha 0.1
+python3 -m FL --n_clients 10 --partition_type label_skew-10 --strategy FedDyn --feddyn_alpha 0.1
 
 # RobustFilter
-python fedup.py --n_clients 10 --partition_type iid_poisoning-10 --strategy RobustFilter
+python3 -m FL --n_clients 10 --partition_type iid_poisoning-10 --strategy RobustFilter
 ```
 
 **Parameters**:
@@ -61,11 +62,23 @@ python fedup.py --n_clients 10 --partition_type iid_poisoning-10 --strategy Robu
 - `--mu`: FedProx proximal term (default: 0.01)
 - `--feddyn_alpha`: FedDyn regularization (default: 0.1, paper optimal)
 
+**Run federated distillation simulations:**
+
+```sh
+python3 -m FD --n_clients <> --partition_type <> --algorithm <> --rounds <>
+```
+
+**Algorithms**:
+- `FedDKD`: Federated Decentralized Knowledge Distillation
+- `FedProto`: FedProto
+- `FedSSD`: Federated Selective Self Distillation
+- `SSFL-IDS`: Semi-supervised Federated Learning
+- `FedMD`: FedMD
+- `FD`: FederatedDistillation
+
 **Outputs**:
 - `results/{strategy}_{n_clients}client_{partition}.log`: Training logs
 - `results/{strategy}_{n_clients}client_{partition}.xlsx`: Metrics per round
-
-**Simulations:** `fedmd.py` as **FedMD**, `fed_proto.py` as **FedProto**, `nofed.py` as independent learning (baseline), `fed_distillation.py` as **FederatedDistillation** (Jeong et al. 2018), `feddkd.py` as **FedDKD**, `fedssd.py` as **FedSSD**, `fedup.py` as a united pipeline for **FedAvg**, **FedProx**, **FedDyn**, **FedCoMed**. `ssfl_ids.py` as **SSFL-IDS** (Zhao et al. 2019).
 
 ---
 
