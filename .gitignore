@@ -1,2 +1,5 @@
 temp_weights/
 __pycache__/
+data/
+results/
+.vscode/

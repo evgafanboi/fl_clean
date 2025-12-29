@@ -1,6 +1,7 @@
 import argparse
 
 from .algorithms.fd import FederatedDistillation
+from .algorithms.feddkd import FedDKD
 from .algorithms.fedmd import FedMD
 from .algorithms.fedproto import FedProto
 from .algorithms.fedssd import FedSSD
@@ -10,6 +11,7 @@ from .config import FDConfig
 
 ALGORITHM_REGISTRY = {
     "FD": FederatedDistillation,
+    "FedDKD": FedDKD,
     "FedProto": FedProto,
     "FedMD": FedMD,
     "FedSSD": FedSSD,
@@ -33,6 +35,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dis_rounds", type=int, default=3, help="Discriminator rounds for SSFL-IDS variants")
     parser.add_argument("--dist_rounds", type=int, default=2, help="Distillation rounds inside SSFL-IDS loop")
     parser.add_argument("--theta", type=float, default=-1.0, help="Threshold parameter for selective sharing")
+    parser.add_argument("--dkd_steps", type=int, default=3, help="DKD gradient steps per round (for FedDKD)")
+    parser.add_argument("--dkd_lr", type=float, default=0.001, help="Learning rate for DKD SGD updates (for FedDKD)")
     return parser
 
 
@@ -55,6 +59,8 @@ def main(argv=None) -> None:
         dis_rounds=args.dis_rounds,
         dist_rounds=args.dist_rounds,
         theta=args.theta,
+        dkd_steps=args.dkd_steps,
+        dkd_lr=args.dkd_lr,
     )
 
     algorithm_cls = ALGORITHM_REGISTRY.get(config.algorithm)

@@ -17,6 +17,8 @@ class FDConfig:
     dis_rounds: int = 3
     dist_rounds: int = 2
     theta: float = -1.0
+    dkd_steps: int = 3
+    dkd_lr: float = 0.001
 
     def to_algorithm_params(self) -> dict:
         return {
@@ -33,4 +35,6 @@ class FDConfig:
             'dis_rounds': self.dis_rounds,
             'dist_rounds': self.dist_rounds,
             'theta': self.theta,
+            'dkd_steps': self.dkd_steps,
+            'dkd_lr': self.dkd_lr,
         }

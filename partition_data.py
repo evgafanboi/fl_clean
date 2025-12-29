@@ -7,18 +7,19 @@ import pandas as pd
 import pickle
 import argparse
 from sklearn.preprocessing import LabelEncoder
+from tqdm import tqdm
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Partitioning for FL-IDS")
-    parser.add_argument("--output-dir", type=str, default="data/partitions", help="Output directory for client partitions")
-    parser.add_argument("--num-clients", type=int, default=10, help="Number of clients")
+    parser.add_argument("--output_dir", type=str, default="data/partitions", help="Output directory for client partitions")
+    parser.add_argument("--n_clients", type=int, default=10, help="Number of clients")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--partition-type", type=str, choices=["iid", "label_skew", "iid_poisoning"], 
+    parser.add_argument("--partition_type", type=str, choices=["iid", "label_skew", "iid_poisoning"], 
                        default="iid", help="Partitioning strategy")
     parser.add_argument("--alpha", type=float, default=0.5, help="Dirichlet alpha for label_skew")
-    parser.add_argument("--poison-ratio", type=float, default=0.2, help="Ratio of clients to poison")
-    parser.add_argument("--poison-intensity", type=float, default=0.5, help="Fraction of samples to poison per client")
-    parser.add_argument("--public-ratio", type=float, default=0.285, help="Fraction of training data as public dataset")
+    parser.add_argument("--poison_ratio", type=float, default=0.2, help="Ratio of clients to poison")
+    parser.add_argument("--poison_intensity", type=float, default=0.5, help="Fraction of samples to poison per client")
+    parser.add_argument("--public_ratio", type=float, default=0.285, help="Fraction of training data as public dataset")
     return parser.parse_args()
 
 def sample_dirichlet_counts(n_samples, n_clients, alpha, rng):
@@ -103,7 +104,7 @@ def create_iid_poisoning(all_data, n_clients, poison_ratio, poison_intensity, rn
 
 def main():
     args = parse_arguments()
-    n_clients = args.num_clients
+    n_clients = args.n_clients
     class_pkls = sorted(glob.glob(os.path.join("data/CIC23", "*_label*.pkl")))
     partition_type = args.partition_type
     
@@ -111,8 +112,9 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
+    print(f"Step 1/4: Encoding labels from {len(class_pkls)} class files...")
     all_labels = []
-    for class_pkl in class_pkls:
+    for class_pkl in tqdm(class_pkls, desc="Loading class files"):
         with open(class_pkl, 'rb') as f:
             data = pickle.load(f)
         if isinstance(data, pd.DataFrame):
@@ -122,6 +124,7 @@ def main():
             all_labels.extend(y.tolist() if hasattr(y, 'tolist') else list(y))
     label_encoder = LabelEncoder()
     label_encoder.fit(all_labels)
+    print(f"Found {len(label_encoder.classes_)} unique classes")
     np.save(os.path.join(output_dir, "label_classes.npy"), label_encoder.classes_)
     num_classes = len(label_encoder.classes_)
 
@@ -133,7 +136,8 @@ def main():
     client_data = {i: [] for i in range(n_clients)}
     
     if partition_type == "iid":
-        for class_pkl in class_pkls:
+        print(f"Step 2/4: Partitioning data (IID) across {n_clients} clients...")
+        for class_pkl in tqdm(class_pkls, desc="Processing classes"):
             with open(class_pkl, 'rb') as f:
                 data = pickle.load(f)
             if isinstance(data, pd.DataFrame):
@@ -161,7 +165,8 @@ def main():
             del df, data, shuffled_df
     
     elif partition_type == "label_skew":
-        for class_pkl in class_pkls:
+        print(f"Step 2/4: Partitioning data (Label Skew, alpha={args.alpha}) across {n_clients} clients...")
+        for class_pkl in tqdm(class_pkls, desc="Processing classes"):
             with open(class_pkl, 'rb') as f:
                 data = pickle.load(f)
             if isinstance(data, pd.DataFrame):
@@ -192,8 +197,9 @@ def main():
             del df, data
     
     elif partition_type == "iid_poisoning":
+        print(f"Step 2/4: Partitioning data (IID + Poisoning) across {n_clients} clients...")
         all_dataframes = []
-        for class_pkl in class_pkls:
+        for class_pkl in tqdm(class_pkls, desc="Loading classes"):
             with open(class_pkl, 'rb') as f:
                 data = pickle.load(f)
             if isinstance(data, pd.DataFrame):
@@ -234,7 +240,8 @@ def main():
                 f.write(f"    Actually flipped: {stats['flipped_samples']}\n\n")
         del all_data, all_dataframes
 
-    for i in range(n_clients):
+    print(f"Step 3/4: Saving client data files...")
+    for i in tqdm(range(n_clients), desc="Saving clients"):
         if not client_data[i]:
             continue
             
@@ -251,11 +258,16 @@ def main():
         
         del X, y, client_df
 
+    print(f"Step 4/4: Generating distribution tables...")
     generate_distribution_table(output_dir, num_classes)
     
     if args.public_ratio > 0:
+        print(f"Carving public splits ({args.public_ratio:.1%} of data)...")
         carve_public_splits(output_dir, n_clients, num_classes, args.public_ratio, partition_type, rng)
+        print(f"Regenerating distribution tables with public/private splits...")
         generate_distribution_table(output_dir, num_classes)
+    
+    print(f"Partitioning complete! Data saved to: {output_dir}")
 
 def generate_distribution_table(output_dir, num_classes):
     import re
@@ -385,7 +397,7 @@ def carve_public_splits(output_dir, n_clients, num_classes, public_ratio, partit
         total_public = 0
         total_private = 0
         
-        for client_id in range(n_clients):
+        for client_id in tqdm(range(n_clients), desc="Carving public/private"):
             X = np.load(os.path.join(output_dir, f"client_{client_id}_X_train.npy"))
             y = np.load(os.path.join(output_dir, f"client_{client_id}_y_train.npy"))
             
@@ -431,7 +443,7 @@ def carve_public_splits(output_dir, n_clients, num_classes, public_ratio, partit
                 if contributions[client_id] > 0:
                     client_contributions[client_id][class_id] = int(contributions[client_id])
         
-        for client_id in range(n_clients):
+        for client_id in tqdm(range(n_clients), desc="Carving public/private"):
             X = np.load(os.path.join(output_dir, f"client_{client_id}_X_train.npy"))
             y = np.load(os.path.join(output_dir, f"client_{client_id}_y_train.npy"))
             

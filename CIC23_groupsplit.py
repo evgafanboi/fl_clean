@@ -4,62 +4,18 @@ import pickle
 from pathlib import Path
 from sklearn.preprocessing import LabelEncoder
 
-# attack_to_class = { # legacy mapping, not used
-#     "Backdoor_Malware": "Web-based",
-#     "BrowserHijacking": "Web-based",
-#     "CommandInjection": "Web-based",
-#     "XSS": "Web-based",
-#     "Uploading_Attack": "Web-based",
-#     "XSS": "Web-based",
-#     "XSS": "Web-based",
-#     "SqlInjection": "Web-based",
-#     "BenignTraffic": "BenignTraffic",
-#     "DDoS-ACK_Fragmentation": "DDoS",
-#     "DDoS-HTTP_Flood": "DDoS",
-#     "DDoS-ICMP_Flood": "DDoS",
-#     "DDoS-ICMP_Fragmentation": "DDoS",
-#     "DDoS-PSHACK_Flood": "DDoS",
-#     "DDoS-RSTFINFlood": "DDoS",
-#     "DDoS-SYN_Flood": "DDoS",
-#     "DDoS-SlowLoris": "DDoS",
-#     "DDoS-SynonymousIP_Flood": "DDoS",
-#     "DDoS-TCP_Flood": "DDoS",
-#     "DDoS-UDP_Flood": "DDoS",
-#     "DDoS-UDP_Fragmentation": "DDoS",
-#     "MITM-ArpSpoofing": "Spoofing",
-#     "DNS_Spoofing": "Spoofing",
-#     "DictionaryBruteForce": "BruteForce",
-#     "DoS-HTTP_Flood": "DoS",
-#     "DoS-SYN_Flood": "DoS",
-#     "DoS-TCP_Flood": "DoS",
-#     "DoS-UDP_Flood": "DoS",
-#     "Mirai-greeth_flood": "Mirai",
-#     "Mirai-greip_flood": "Mirai",
-#     "Mirai-udpplain": "Mirai",
-#     "Recon-HostDiscovery": "Recon",
-#     "Recon-OSScan": "Recon",
-#     "Recon-PingSweep": "Recon",
-#     "Recon-PortScan": "Recon",
-#     "VulnerabilityScan": "Recon"
-# }
-
 def create_output_directory():
-    """Create the CIC23 directory if it doesn't exist"""
     output_dir = Path('./CIC23')
     output_dir.mkdir(exist_ok=True)
     return output_dir
 
 def process_test_data():
-    """Load test data and save X_test and y_test as both pkl and npy"""
     print("Processing test data...")
     
-    # Load test data from PKL file
     with open('CIC23_test.pkl', 'rb') as f:
         test_data = pickle.load(f)
     
-    # Assuming the data is either a DataFrame or tuple/list with features and labels
     if isinstance(test_data, pd.DataFrame):
-        # Assuming last column is the label
         X_test = test_data.iloc[:, :-1]
         y_test = test_data.iloc[:, -1]
     elif isinstance(test_data, (tuple, list)) and len(test_data) == 2:
@@ -67,21 +23,17 @@ def process_test_data():
     else:
         raise ValueError("Unexpected test data format")
     
-    # Save X_test and y_test as PKL files
     with open('X_test.pkl', 'wb') as f:
         pickle.dump(X_test, f)
     
     with open('y_test.pkl', 'wb') as f:
         pickle.dump(y_test, f)
     
-    # Convert to numpy arrays and save as npy files
     X_test_np = X_test.values if hasattr(X_test, 'values') else np.array(X_test)
     y_test_np = y_test.values if hasattr(y_test, 'values') else np.array(y_test)
     
-    # Ensure proper data types
     X_test_np = X_test_np.astype(np.float32)
     
-    # Save as npy files
     np.save('X_test.npy', X_test_np)
     np.save('y_test.npy', y_test_np)
     
@@ -93,13 +45,11 @@ def process_test_data():
     return X_test, y_test
 
 def process_train_data_in_chunks(chunk_size=10000):
-    """Process training data in chunks and split by labels"""
     print("Processing training data in chunks...")
     
     output_dir = create_output_directory()
-    label_data = {}  # Dictionary to store data for each label
+    label_data = {}
     
-    # Load entire PKL file and process in memory chunks
     print("Loading training PKL file...")
     
     with open('CIC23_train.pkl', 'rb') as f:
@@ -165,8 +115,6 @@ def process_train_data_in_chunks(chunk_size=10000):
     
     elif isinstance(train_data, np.ndarray):
         print(f"NumPy array shape: {train_data.shape}")
-        # Handle case where it's just a numpy array
-        # Assuming last column is the label
         total_rows = train_data.shape[0]
         
         for start_idx in range(0, total_rows, chunk_size):
@@ -193,17 +141,14 @@ def process_train_data_in_chunks(chunk_size=10000):
     else:
         raise ValueError(f"Unsupported training data format: {type(train_data)}")
     
-    # Save each label's data to separate PKL files
     print("Saving label-specific PKL files...")
     for label, chunks in label_data.items():
         print(f"Saving data for label {label}...")
         
         if chunks:
             if isinstance(chunks[0], pd.DataFrame):
-                # Concatenate all chunks for this label
                 combined_data = pd.concat(chunks, ignore_index=True)
             else:
-                # Handle tuple/numpy format
                 all_features = []
                 all_labels = []
                 for features, labels in chunks:
@@ -219,7 +164,6 @@ def process_train_data_in_chunks(chunk_size=10000):
                 
                 combined_data = (combined_features, combined_labels)
             
-            # Save to PKL file
             output_file = output_dir / f'CIC23_label{label}.pkl'
             with open(output_file, 'wb') as f:
                 pickle.dump(combined_data, f)
@@ -233,25 +177,22 @@ def process_train_data_in_chunks(chunk_size=10000):
     return label_data
 
 def main():
-    """Main function to process both test and training PKL data"""
     print("Starting CIC23 PKL data processing...")
     
-    # Process test PKL data
     try:
         X_test, y_test = process_test_data()
-        print("✓ Test PKL data processing completed (saved as both pkl and npy)")
+        print("Test PKL data processing completed (saved as both pkl and npy)")
     except Exception as e:
-        print(f"✗ Error processing test PKL data: {e}")
+        print(f"Error processing test PKL data: {e}")
         import traceback
         traceback.print_exc()
     
-    # Process training PKL data in chunks
     try:
         label_data = process_train_data_in_chunks(chunk_size=10000)
-        print("✓ Training PKL data processing completed")
-        print(f"✓ Created {len(label_data)} label-specific PKL files")
+        print("Training PKL data processing completed")
+        print(f"Created {len(label_data)} label-specific PKL files")
     except Exception as e:
-        print(f"✗ Error processing training PKL data: {e}")
+        print(f"Error processing training PKL data: {e}")
         import traceback
         traceback.print_exc()
     
