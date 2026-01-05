@@ -34,6 +34,7 @@ def create_private_dataset(
     chunk_size: int = 100000,
     to_categorical: bool = True,
     is_sequence: bool = False,
+    poison_loader=None,
 ) -> tf.data.Dataset:
     def generator() -> Iterator[Tuple[np.ndarray, np.ndarray]]:
         X_mmap = np.load(X_path, mmap_mode="r")
@@ -44,6 +45,9 @@ def create_private_dataset(
             end_idx = min(start_idx + chunk_size, total_samples)
             X_chunk = np.array(X_mmap[start_idx:end_idx], dtype=np.float32)
             y_chunk = np.array(y_mmap[start_idx:end_idx], dtype=np.float32)
+
+            if poison_loader is not None:
+                y_chunk = poison_loader.poison_labels(y_chunk.astype(np.int32))
 
             if is_sequence:
                 X_chunk = X_chunk.reshape(-1, 1, input_dim)

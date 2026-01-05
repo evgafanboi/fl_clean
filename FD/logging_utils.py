@@ -17,11 +17,14 @@ def _build_log_filename(
     n_clients: int,
     partition_label: str,
     extra_tokens: Optional[Iterable[str]],
-    results_dir: str
+    results_dir: str,
+    poison_suffix: str = ""
 ) -> str:
     parts = [algorithm_name, f"{n_clients}client", partition_label]
     if extra_tokens:
         parts.extend(str(token) for token in extra_tokens if token)
+    if poison_suffix:
+        parts.append(poison_suffix)
     filename = "_".join(parts)
     return f"{results_dir}/{filename}.log"
 
@@ -31,7 +34,8 @@ def setup_logger(
     n_clients: int,
     partition_label: str,
     extra_tokens: Optional[Iterable[str]] = None,
-    results_dir: str = "results"
+    results_dir: str = "results",
+    poison_suffix: str = ""
 ) -> Tuple[logging.Logger, str, logging.Logger]:
     Path(results_dir).mkdir(parents=True, exist_ok=True)
 
@@ -40,7 +44,8 @@ def setup_logger(
         n_clients=n_clients,
         partition_label=partition_label,
         extra_tokens=extra_tokens,
-        results_dir=results_dir
+        results_dir=results_dir,
+        poison_suffix=poison_suffix
     )
 
     logging.basicConfig(

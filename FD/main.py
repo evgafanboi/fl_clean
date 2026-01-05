@@ -38,6 +38,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dkd_steps", type=int, default=3, help="DKD gradient steps per round (for FedDKD)")
     parser.add_argument("--dkd_lr", type=float, default=0.001, help="Learning rate for DKD SGD updates (for FedDKD)")
     parser.add_argument("--personalized_eval", action="store_true", help="Evaluate individual client models in addition to global model")
+    parser.add_argument("--poison", type=str, default=None, help="Poison config: <attack_type>-<ratio>, e.g., label_flip-0.3")
     return parser
 
 
@@ -63,6 +64,7 @@ def main(argv=None) -> None:
         dkd_steps=args.dkd_steps,
         dkd_lr=args.dkd_lr,
         personalized_eval=args.personalized_eval,
+        poison=args.poison,
     )
 
     algorithm_cls = ALGORITHM_REGISTRY.get(config.algorithm)

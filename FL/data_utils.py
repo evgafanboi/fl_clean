@@ -66,7 +66,8 @@ def create_client_dataset(
     input_dim: int,
     num_classes: int,
     batch_size: int,
-    chunk_size: int = 10000
+    chunk_size: int = 10000,
+    poison_loader=None
 ) -> tf.data.Dataset:
     def generator():
         X_mmap = np.load(X_path, mmap_mode='r')
@@ -77,6 +78,10 @@ def create_client_dataset(
             end_idx = min(start_idx + chunk_size, total_samples)
             X_chunk = np.array(X_mmap[start_idx:end_idx], dtype=np.float32)
             y_chunk = np.array(y_mmap[start_idx:end_idx], dtype=np.float32)
+            
+            if poison_loader is not None:
+                y_chunk = poison_loader.poison_labels(y_chunk.astype(np.int32))
+            
             if len(y_chunk.shape) == 1 or y_chunk.shape[1] == 1:
                 y_chunk = tf.keras.utils.to_categorical(
                     y_chunk.astype(np.int32),

@@ -257,12 +257,18 @@ class FederatedDistillation(DistillationAlgorithm):
                 del y_mmap, y_array
             per_client_counts[state.client_id] = client_counts
 
+            # Apply poisoning for poisoned clients
+            poison_loader = context.poison_loader if state.client_id in context.poisoned_clients else None
+            if poison_loader:
+                print(f"  \u26a0\ufe0f  POISONED CLIENT - Labels will be flipped")
+
             private_dataset = create_private_dataset(
                 state.paths["train_X"],
                 state.paths["train_y"],
                 context.input_dim,
                 context.num_classes,
                 config.batch_size,
+                poison_loader=poison_loader,
             )
 
             global_logits = global_logits_per_client.get(state.client_id, {})

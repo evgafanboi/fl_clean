@@ -20,6 +20,7 @@ class FDConfig:
     dkd_steps: int = 3
     dkd_lr: float = 0.001
     personalized_eval: bool = False
+    poison: str = None
 
     def to_algorithm_params(self) -> dict:
         return {

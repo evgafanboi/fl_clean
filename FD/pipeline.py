@@ -13,6 +13,7 @@ from .colors import COLORS
 from .config import FDConfig
 from .data_utils import load_test_dataset, parse_partition_type, setup_paths
 from .logging_utils import log_timestamp, setup_logger
+from .poison_utils import parse_poison_config, get_or_create_poisoned_clients, PoisonedDataLoader
 
 
 @dataclass
@@ -41,6 +42,8 @@ class PipelineContext:
     results: Dict[int, Dict[str, float]] = field(default_factory=dict)
     client_states: List[ClientState] = field(default_factory=list)
     shared_state: Dict[str, Any] = field(default_factory=dict)
+    poisoned_clients: List[int] = field(default_factory=list)
+    poison_loader: Any = None
 
     def add_client_state(self, client_id: int, model: Any, paths: Dict[str, str], **extras: Any) -> ClientState:
         state = ClientState(client_id=client_id, model=model, paths=paths, data=dict(extras))
@@ -93,11 +96,17 @@ class DistillationPipeline:
 
         extra_log_tokens = self.algorithm.extra_log_tokens()
 
+        # Prepare poison suffix for logging
+        poison_suffix = ""
+        if self.config.poison:
+            poison_suffix = self.config.poison.replace("-", "_")
+
         logger, log_filename, detailed_logger = setup_logger(
             algorithm_name=self.algorithm.name,
             n_clients=n_clients,
             partition_label=partition_label,
             extra_tokens=[f"gamma{self.config.gamma}", *extra_log_tokens.values()],
+            poison_suffix=poison_suffix,
         )
         excel_filename = log_filename.replace(".log", ".xlsx")
 
@@ -114,6 +123,18 @@ class DistillationPipeline:
         test_dataset = load_test_dataset(self.config.batch_size, num_classes)
         test_labels = self._extract_labels(test_dataset, num_classes)
 
+        # Setup poisoning if configured
+        poisoned_clients = []
+        poison_loader = None
+        attack_type, poison_ratio = parse_poison_config(self.config.poison)
+        if attack_type:
+            poisoned_clients = get_or_create_poisoned_clients(
+                partition_label, attack_type, poison_ratio, n_clients
+            )
+            poison_loader = PoisonedDataLoader(attack_type, num_classes)
+            print(f"\n  POISONING ENABLED: {attack_type} attack")
+            print(f"    Poisoned clients: {poisoned_clients} ({len(poisoned_clients)}/{n_clients})")
+
         return PipelineContext(
             config=self.config,
             partition_label=partition_label,
@@ -129,6 +150,8 @@ class DistillationPipeline:
             test_dataset=test_dataset,
             test_labels=test_labels,
             shared_state={"extra_log_tokens": extra_log_tokens},
+            poisoned_clients=poisoned_clients,
+            poison_loader=poison_loader,
         )
 
     def _record_metrics(

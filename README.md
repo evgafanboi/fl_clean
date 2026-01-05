@@ -81,6 +81,10 @@ python3 -m FD --n_clients <> --partition_type <> --algorithm <> --rounds <>
 - `results/{strategy}_{n_clients}client_{partition}.log`: Training logs
 - `results/{strategy}_{n_clients}client_{partition}.xlsx`: Metrics per round
 
+## Poisoning
+
+- To run **label flipping** poisoning, add `--poison label_flip-<ratio>` to the simulation, with `ratio` being `0.1` to `1.0` determining the proportion of clients to be poisoned. Selected clients for poisoning are randomized in the first run and their IDs are stored under `results/poison_history` for subsequent re-runs within the same partition type.
+
 ---
 
 Used libraries listed in `requirements.txt`.

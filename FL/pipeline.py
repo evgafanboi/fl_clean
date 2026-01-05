@@ -23,6 +23,7 @@ from .gpu import configure_gpu_memory
 from .logging_utils import log_timestamp, setup_logger
 from .memory import aggressive_memory_cleanup
 from .model_factory import create_model
+from .poison_utils import parse_poison_config, get_or_create_poisoned_clients, PoisonedDataLoader
 
 
 @dataclass
@@ -40,6 +41,7 @@ class FLConfig:
     model: str = "dense"
     robust_epsilon: float = 0.2
     robust_tau: float = 0.1
+    poison: Optional[str] = None
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -59,6 +61,8 @@ class FederatedLearningPipeline:
         self.detailed_logger: Optional[logging.Logger] = None
         self.log_filename: Optional[str] = None
         self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
+        self.poisoned_clients: List[int] = []
+        self.poison_loader: Optional[PoisonedDataLoader] = None
 
     def _load_class_metadata(self, partition_label: str, client_count: int) -> (List[str], int):
         class_names_file = os.path.join(
@@ -120,12 +124,18 @@ class FederatedLearningPipeline:
         if latest_weights is not None:
             model.set_weights(latest_weights)
 
+        # Apply poisoning for poisoned clients
+        poison_loader = self.poison_loader if client_id in self.poisoned_clients else None
+        if poison_loader:
+            print(f"  \u26a0\ufe0f  POISONED CLIENT - Labels will be flipped")
+
         train_dataset = create_client_dataset(
             paths['train_X'],
             paths['train_y'],
             input_dim,
             num_classes,
             self.config.batch_size,
+            poison_loader=poison_loader
         )
 
         X_train_mmap = np.load(paths['train_X'], mmap_mode='r')
@@ -258,10 +268,16 @@ class FederatedLearningPipeline:
         partition_label, client_count = parse_partition_type(self.config.partition_type)
         n_clients = min(self.config.n_clients, client_count)
 
+        # Prepare poison suffix for logging
+        poison_suffix = ""
+        if self.config.poison:
+            poison_suffix = self.config.poison.replace("-", "_")
+
         self.logger, self.log_filename, self.detailed_logger = setup_logger(
             n_clients,
             partition_label,
             strategy_name=self.config.strategy,
+            poison_suffix=poison_suffix,
         )
         excel_filename = self.log_filename.replace('.log', '.xlsx')
 
@@ -270,6 +286,18 @@ class FederatedLearningPipeline:
 
         paths_list = self._prepare_paths(n_clients, partition_label, client_count)
         self._restore_partitions(paths_list)
+
+        # Setup poisoning if configured
+        attack_type, poison_ratio = parse_poison_config(self.config.poison)
+        if attack_type:
+            self.poisoned_clients = get_or_create_poisoned_clients(
+                partition_label, attack_type, poison_ratio, n_clients
+            )
+            self.poison_loader = PoisonedDataLoader(attack_type, num_classes)
+            log_timestamp(self.logger, f"POISONING ENABLED: {attack_type} attack on {len(self.poisoned_clients)} clients ({poison_ratio*100:.1f}%)")
+            log_timestamp(self.logger, f"Poisoned clients: {self.poisoned_clients}")
+            print(f"\n  POISONING ENABLED: {attack_type} attack")
+            print(f"    Poisoned clients: {self.poisoned_clients} ({len(self.poisoned_clients)}/{n_clients})")
 
         latest_weights = None
         pipeline_start_time = time.time()

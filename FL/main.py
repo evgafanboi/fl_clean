@@ -23,6 +23,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=str, default="dense", help="Model architecture identifier (default: dense)")
     parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (Byzantine ratio)")
     parser.add_argument("--robust_tau", type=float, default=0.1, help="RobustFilter tau parameter")
+    parser.add_argument("--poison", type=str, default=None, help="Poison config: <attack_type>-<ratio>, e.g., label_flip-0.3")
     return parser
 
 
@@ -44,6 +45,7 @@ def main(argv=None):
         model=args.model,
         robust_epsilon=args.robust_epsilon,
         robust_tau=args.robust_tau,
+        poison=args.poison,
     )
 
     run_pipeline(config)

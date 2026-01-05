@@ -14,11 +14,9 @@ def parse_arguments():
     parser.add_argument("--output_dir", type=str, default="data/partitions", help="Output directory for client partitions")
     parser.add_argument("--n_clients", type=int, default=10, help="Number of clients")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--partition_type", type=str, choices=["iid", "label_skew", "iid_poisoning"], 
+    parser.add_argument("--partition_type", type=str, choices=["iid", "label_skew"], 
                        default="iid", help="Partitioning strategy")
     parser.add_argument("--alpha", type=float, default=0.5, help="Dirichlet alpha for label_skew")
-    parser.add_argument("--poison_ratio", type=float, default=0.2, help="Ratio of clients to poison")
-    parser.add_argument("--poison_intensity", type=float, default=0.5, help="Fraction of samples to poison per client")
     parser.add_argument("--public_ratio", type=float, default=0.285, help="Fraction of training data as public dataset")
     return parser.parse_args()
 
@@ -34,73 +32,6 @@ def sample_dirichlet_counts(n_samples, n_clients, alpha, rng):
             idx = indices[i % n_clients]
             counts[idx] += 1 if diff > 0 else -1
     return counts
-
-def create_iid_poisoning(all_data, n_clients, poison_ratio, poison_intensity, rng):
-    n_poisoned = max(1, int(n_clients * poison_ratio))
-    poisoned_clients = rng.choice(n_clients, size=n_poisoned, replace=False)
-    
-    shuffled_data = all_data.sample(frac=1, random_state=42).reset_index(drop=True)
-    n_samples = len(shuffled_data)
-    
-    splits = np.array_split(np.arange(n_samples), n_clients)
-    client_data = {i: [] for i in range(n_clients)}
-    
-    unique_labels = sorted(all_data['label_encoded'].unique())
-    num_classes = len(unique_labels)
-    
-    poison_mappings = {}
-    
-    if 0 in unique_labels and num_classes > 1:
-        target_attack = rng.choice([l for l in unique_labels if l != 0])
-        poison_mappings[0] = target_attack
-    
-    if num_classes > 2:
-        attack_labels = [l for l in unique_labels if l != 0]
-        if len(attack_labels) >= 2:
-            attack_sample = rng.choice(attack_labels, size=min(len(attack_labels), 6), replace=False)
-            for i in range(0, len(attack_sample) - 1, 2):
-                if i + 1 < len(attack_sample):
-                    poison_mappings[attack_sample[i]] = attack_sample[i + 1]
-    
-    if not poison_mappings:
-        for i, label in enumerate(unique_labels):
-            target_label = unique_labels[(i + 1) % num_classes]
-            poison_mappings[label] = target_label
-    
-    poisoning_stats = {}
-    
-    for i in range(n_clients):
-        if len(splits[i]) > 0:
-            client_chunk = shuffled_data.iloc[splits[i]].copy()
-            
-            if i in poisoned_clients:
-                original_labels = client_chunk['label_encoded'].copy()
-                base_intensity = max(0.1, min(0.9, poison_intensity))
-                intensity_variance = 0.2
-                poison_fraction = base_intensity + (rng.random() - 0.5) * intensity_variance
-                poison_fraction = max(0.1, min(0.9, poison_fraction))
-                n_to_poison = int(len(client_chunk) * poison_fraction)
-                poison_indices = rng.choice(len(client_chunk), size=n_to_poison, replace=False)
-                
-                poisoned_count = 0
-                for idx in poison_indices:
-                    original_label = client_chunk.iloc[idx]['label_encoded']
-                    if original_label in poison_mappings:
-                        client_chunk.iloc[idx, client_chunk.columns.get_loc('label_encoded')] = poison_mappings[original_label]
-                        poisoned_count += 1
-                
-                final_labels = client_chunk['label_encoded']
-                flipped_count = (original_labels != final_labels).sum()
-                poisoning_stats[i] = {
-                    'total_samples': len(client_chunk),
-                    'poisoned_samples': poisoned_count,
-                    'flipped_samples': flipped_count,
-                    'poison_fraction': poison_fraction
-                }
-            
-            client_data[i].append(client_chunk)
-    
-    return client_data, (poisoned_clients, poison_mappings, poisoning_stats)
 
 def main():
     args = parse_arguments()
@@ -195,50 +126,6 @@ def main():
                         client_data[i].append(shuffled_df.iloc[start_idx:end_idx])
                     start_idx = end_idx
             del df, data
-    
-    elif partition_type == "iid_poisoning":
-        print(f"Step 2/4: Partitioning data (IID + Poisoning) across {n_clients} clients...")
-        all_dataframes = []
-        for class_pkl in tqdm(class_pkls, desc="Loading classes"):
-            with open(class_pkl, 'rb') as f:
-                data = pickle.load(f)
-            if isinstance(data, pd.DataFrame):
-                df = data
-            elif isinstance(data, (tuple, list)) and len(data) == 2:
-                X, y = data
-                if hasattr(X, 'shape') and len(X.shape) == 2:
-                    feature_cols = [f'feature_{i}' for i in range(X.shape[1])]
-                    df = pd.DataFrame(X, columns=feature_cols)
-                    df['label'] = y
-                else:
-                    continue
-            else:
-                continue
-            all_dataframes.append(df)
-        all_data = pd.concat(all_dataframes, ignore_index=True)
-        all_data['label_encoded'] = label_encoder.transform(all_data['label'])
-        client_data, poisoning_info = create_iid_poisoning(
-            all_data, n_clients, args.poison_ratio, args.poison_intensity, rng
-        )
-        poisoned_clients, poison_mappings, poisoning_stats = poisoning_info
-        with open(os.path.join(output_dir, "poisoned_clients.txt"), "w") as f:
-            f.write("Poisoned Clients Information:\n")
-            f.write("=" * 40 + "\n")
-            f.write(f"Poisoned clients: {list(poisoned_clients)}\n")
-            f.write(f"Total poisoned: {len(poisoned_clients)}/{n_clients}\n\n")
-            
-            f.write("Label Poisoning Mappings:\n")
-            for orig, target in poison_mappings.items():
-                f.write(f"  Class {orig} -> Class {target}\n")
-            
-            f.write("\nPer-Client Poisoning Statistics:\n")
-            for client_id, stats in poisoning_stats.items():
-                f.write(f"  Client {client_id}:\n")
-                f.write(f"    Total samples: {stats['total_samples']}\n")
-                f.write(f"    Poisoned samples: {stats['poisoned_samples']}\n") 
-                f.write(f"    Poison fraction: {stats['poison_fraction']:.1%}\n")
-                f.write(f"    Actually flipped: {stats['flipped_samples']}\n\n")
-        del all_data, all_dataframes
 
     print(f"Step 3/4: Saving client data files...")
     for i in tqdm(range(n_clients), desc="Saving clients"):

@@ -17,11 +17,17 @@ def setup_logger(
     n_clients: int,
     partition_type: str,
     strategy_name: str,
-    results_dir: str = "results"
+    results_dir: str = "results",
+    poison_suffix: str = ""
 ) -> Tuple[logging.Logger, str, logging.Logger]:
     """Configure loggers for the federated learning pipeline."""
     Path(results_dir).mkdir(parents=True, exist_ok=True)
-    log_filename = f"{results_dir}/{strategy_name}_{n_clients}client_{partition_type}.log"
+    
+    # Build filename with poison suffix if provided
+    base_name = f"{strategy_name}_{n_clients}client_{partition_type}"
+    if poison_suffix:
+        base_name = f"{base_name}_{poison_suffix}"
+    log_filename = f"{results_dir}/{base_name}.log"
 
     logging.basicConfig(
         filename=log_filename,
