@@ -158,7 +158,7 @@ class DistillationPipeline:
 
 
 def evaluate_model(model: Any, test_dataset: tf.data.Dataset, reference_labels: np.ndarray) -> Dict[str, float]:
-    predictions = model.predict(test_dataset, verbose=0)
+    predictions = model.predict(test_dataset, verbose=1)
     if isinstance(predictions, list):
         predictions = predictions[0]
     pred_labels = np.argmax(predictions, axis=1)

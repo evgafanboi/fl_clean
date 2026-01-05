@@ -37,6 +37,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--theta", type=float, default=-1.0, help="Threshold parameter for selective sharing")
     parser.add_argument("--dkd_steps", type=int, default=3, help="DKD gradient steps per round (for FedDKD)")
     parser.add_argument("--dkd_lr", type=float, default=0.001, help="Learning rate for DKD SGD updates (for FedDKD)")
+    parser.add_argument("--personalized_eval", action="store_true", help="Evaluate individual client models in addition to global model")
     return parser
 
 
@@ -61,6 +62,7 @@ def main(argv=None) -> None:
         theta=args.theta,
         dkd_steps=args.dkd_steps,
         dkd_lr=args.dkd_lr,
+        personalized_eval=args.personalized_eval,
     )
 
     algorithm_cls = ALGORITHM_REGISTRY.get(config.algorithm)

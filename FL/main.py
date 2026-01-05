@@ -12,7 +12,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--strategy",
         type=str,
         default="FedAvg",
-        help="Aggregation strategy: FedAvg, FedProx, FedDyn, FedCoMed, RobustFilter",
+        help="Aggregation strategy: FedAvg, FedProx, FedDyn, FedCoMed, RobustFilter, DeepFed",
     )
     parser.add_argument("--feddyn_alpha", type=float, default=0.1, help="FedDyn alpha (paper best at 0.1)")
     parser.add_argument("--batch_size", type=int, default=8192, help="Minibatch size for local training")

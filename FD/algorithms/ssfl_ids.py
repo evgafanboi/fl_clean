@@ -282,7 +282,20 @@ class SSFLIDS(DistillationAlgorithm):
 
         if not all_client_hard_labels:
             print(f"{COLORS.WARNING}No client provided confident predictions; skipping distillation{COLORS.ENDC}")
-            round_metrics = {state.client_id: evaluate_model(state.model, context.test_dataset, context.test_labels) for state in context.client_states}
+            server_metrics = evaluate_model(server_model, context.test_dataset, context.test_labels)
+            context.logger.info(
+                "Round %s | Server | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+                round_number,
+                server_metrics["Acc"],
+                server_metrics["F1"],
+                server_metrics["Precision"],
+                server_metrics["Recall"],
+            )
+            round_metrics = {-1: server_metrics}
+            if config.personalized_eval:
+                for state in context.client_states:
+                    metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
+                    round_metrics[state.client_id] = metrics
             round_time = time.time() - round_start
             context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
             context.logger.info("Round %s completed in %.2fs", round_number, round_time)
@@ -328,23 +341,25 @@ class SSFLIDS(DistillationAlgorithm):
             f"Precision={server_metrics['Precision']:.4f}, Recall={server_metrics['Recall']:.4f}{COLORS.ENDC}"
         )
 
-        round_metrics: Dict[int, Dict[str, float]] = {}
-        for state in context.client_states:
-            metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
-            round_metrics[state.client_id] = metrics
-            context.logger.info(
-                "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
-                round_number,
-                state.client_id,
-                metrics["Acc"],
-                metrics["F1"],
-                metrics["Precision"],
-                metrics["Recall"],
-            )
-            print(
-                f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}{COLORS.ENDC}"
-            )
+        round_metrics: Dict[int, Dict[str, float]] = {-1: server_metrics}
+        
+        if config.personalized_eval:
+            for state in context.client_states:
+                metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
+                round_metrics[state.client_id] = metrics
+                context.logger.info(
+                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+                    round_number,
+                    state.client_id,
+                    metrics["Acc"],
+                    metrics["F1"],
+                    metrics["Precision"],
+                    metrics["Recall"],
+                )
+                print(
+                    f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
+                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}{COLORS.ENDC}"
+                )
 
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time

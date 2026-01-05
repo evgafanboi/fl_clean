@@ -77,50 +77,90 @@ def load_public_dataset_from_clients(
     return_labels: bool = False,
     is_sequence: bool = False,
 ) -> Tuple[tf.data.Dataset, int]:
-    X_collections = []
-    y_collections = []
-
+    chunk_size = 10000
+    public_files = []
+    
     for paths in paths_iterable:
         public_X = paths.get("public_X")
         public_y = paths.get("public_y")
         if public_X and tf.io.gfile.exists(public_X):
-            X_data = np.load(public_X)
-            X_collections.append(X_data.astype(np.float32))
+            X_mmap = np.load(public_X, mmap_mode='r')
             if return_labels:
                 if not public_y or not tf.io.gfile.exists(public_y):
                     raise ValueError("Public labels requested but missing")
-                y_data = np.load(public_y)
-                y_collections.append(y_data.astype(np.float32))
-
-    if not X_collections:
+                public_files.append((public_X, public_y, X_mmap.shape[0]))
+            else:
+                public_files.append((public_X, None, X_mmap.shape[0]))
+            del X_mmap
+    
+    if not public_files:
         raise ValueError("No public data found in client partitions")
-
-    X_public = np.concatenate(X_collections, axis=0)
-    total_samples = X_public.shape[0]
-
-    if shuffle:
-        shuffle_idx = np.random.permutation(total_samples)
-        X_public = X_public[shuffle_idx]
-        if return_labels:
-            y_public = np.concatenate(y_collections, axis=0)
-            y_public = y_public.astype(np.float32)[shuffle_idx]
-        else:
-            y_public = None
-    else:
-        y_public = np.concatenate(y_collections, axis=0).astype(np.float32) if return_labels else None
-
-    if is_sequence:
-        X_public = X_public.reshape(-1, 1, X_public.shape[-1])
-
+    
+    total_samples = sum([p[2] for p in public_files])
+    
+    def generator():
+        for x_path, y_path, total in public_files:
+            X_mmap = np.load(x_path, mmap_mode='r')
+            
+            if return_labels:
+                y_mmap = np.load(y_path, mmap_mode='r')
+            
+            for start_idx in range(0, total, chunk_size):
+                end_idx = min(start_idx + chunk_size, total)
+                X_chunk = np.array(X_mmap[start_idx:end_idx], dtype=np.float32)
+                
+                if is_sequence:
+                    X_chunk = X_chunk.reshape(-1, 1, X_chunk.shape[-1])
+                
+                if return_labels:
+                    y_chunk = np.array(y_mmap[start_idx:end_idx], dtype=np.float32)
+                    
+                    if num_classes and (len(y_chunk.shape) == 1 or y_chunk.shape[1] == 1):
+                        y_chunk = tf.keras.utils.to_categorical(y_chunk.astype(np.int32), num_classes).astype(np.float32)
+                    
+                    yield X_chunk, y_chunk
+                    del y_chunk
+                else:
+                    yield X_chunk
+                
+                del X_chunk
+            
+            del X_mmap
+            if return_labels:
+                del y_mmap
+    
     if return_labels:
         if num_classes is None:
             raise ValueError("num_classes required when return_labels is True")
-        if y_public.ndim == 1 or y_public.shape[1] == 1:
-            y_public = tf.keras.utils.to_categorical(y_public.astype(np.int32), num_classes).astype(np.float32)
-        dataset = tf.data.Dataset.from_tensor_slices((X_public, y_public))
+        
+        if is_sequence:
+            output_signature = (
+                tf.TensorSpec(shape=(None, 1, None), dtype=tf.float32),
+                tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32)
+            )
+        else:
+            output_signature = (
+                tf.TensorSpec(shape=(None, None), dtype=tf.float32),
+                tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32)
+            )
+        
+        dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
     else:
-        dataset = tf.data.Dataset.from_tensor_slices(X_public)
-
+        if is_sequence:
+            output_signature = tf.TensorSpec(shape=(None, 1, None), dtype=tf.float32)
+        else:
+            output_signature = tf.TensorSpec(shape=(None, None), dtype=tf.float32)
+        
+        dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
+    
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=min(10000, total_samples))
+    
+    return dataset.unbatch().batch(batch_size).prefetch(tf.data.AUTOTUNE), total_samples
+    
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=min(10000, total_samples))
+    
     return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE), total_samples
 
 
@@ -131,7 +171,7 @@ def numpy_from_dataset(dataset: tf.data.Dataset) -> np.ndarray:
             X_batch = batch[0]
         else:
             X_batch = batch
-        arrays.append(np.array(X_batch))
+        arrays.append(X_batch.numpy())
     if not arrays:
         return np.empty((0,))
     return np.concatenate(arrays, axis=0)

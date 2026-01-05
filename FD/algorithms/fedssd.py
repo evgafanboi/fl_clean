@@ -78,41 +78,52 @@ def train_with_ssd_loss(
     global_logits_layer = global_keras.get_layer("logits")
     global_logits_model = tf.keras.Model(inputs=global_keras.input, outputs=global_logits_layer.output)
 
-    M_class_tensor = tf.constant(M_class.reshape(1, -1), dtype=tf.float32)
+    M_class_expanded = tf.constant(tf.expand_dims(M_class, axis=0), dtype=tf.float32)
+
+    @tf.function
+    def train_step(batch_X, batch_y):
+        with tf.GradientTape() as tape:
+            local_logits, predictions = logits_model(batch_X, training=True)
+            ce_loss = ce_loss_fn(batch_y, predictions)
+
+            global_logits = global_logits_model(batch_X, training=False)
+            global_probs = tf.nn.softmax(global_logits)
+
+            true_labels = tf.cast(tf.argmax(batch_y, axis=1), tf.int32)
+            batch_size = tf.shape(batch_y)[0]
+
+            indices = tf.stack([tf.range(batch_size), true_labels], axis=1)
+            p_g_k2 = tf.gather_nd(global_probs, indices)
+            M_sample_expanded = tf.expand_dims(1.0 - tf.sqrt(tf.maximum(1.0 - p_g_k2, 0.0)), axis=1)
+
+            M = tf.nn.relu(m_max * M_class_expanded * M_sample_expanded - 0.1)
+
+            logit_diff = M * (global_logits - local_logits)
+            ssd_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logit_diff), axis=1))
+
+            total_loss = ce_loss + ssd_loss
+
+        gradients = tape.gradient(total_loss, keras_model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+
+        return ce_loss, ssd_loss, total_loss
+
+    print(f"  Training with SSD loss (m_max={m_max:.2f}) for {epochs} epochs...")
 
     for epoch in range(epochs):
-        epoch_losses = np.zeros(3, dtype=np.float32)
-        batches = 0
+        epoch_losses = tf.constant([0.0, 0.0, 0.0], dtype=tf.float32)
+        num_batches = 0
 
         for batch_X, batch_y in private_dataset:
-            with tf.GradientTape() as tape:
-                local_logits, predictions = logits_model(batch_X, training=True)
-                ce_loss = ce_loss_fn(batch_y, predictions)
+            ce_loss, ssd_loss, total_loss = train_step(batch_X, batch_y)
+            epoch_losses = epoch_losses + tf.stack([ce_loss, ssd_loss, total_loss])
+            num_batches += 1
 
-                global_logits = global_logits_model(batch_X, training=False)
-                global_probs = tf.nn.softmax(global_logits)
-
-                true_labels = tf.argmax(batch_y, axis=1)
-                batch_indices = tf.stack([tf.range(tf.shape(true_labels)[0]), true_labels], axis=1)
-                p_g_k2 = tf.gather_nd(global_probs, batch_indices)
-                M_sample_expanded = tf.expand_dims(1.0 - tf.sqrt(tf.maximum(1.0 - p_g_k2, 0.0)), axis=1)
-
-                M = tf.nn.relu(m_max * M_class_tensor * M_sample_expanded - 0.1)
-                logit_diff = M * (global_logits - local_logits)
-                ssd_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logit_diff), axis=1))
-
-                total_loss = ce_loss + ssd_loss
-
-            gradients = tape.gradient(total_loss, keras_model.trainable_variables)
-            optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
-
-            epoch_losses += np.array([float(ce_loss), float(ssd_loss), float(total_loss)], dtype=np.float32)
-            batches += 1
-
-        if batches > 0:
-            avg_losses = epoch_losses / batches
+        if num_batches > 0:
+            avg_losses = epoch_losses / num_batches
             print(
-                f"    Epoch {epoch + 1}/{epochs} - CE: {avg_losses[0]:.4f}, SSD: {avg_losses[1]:.4f}, Total: {avg_losses[2]:.4f}"
+                f"    Epoch {epoch + 1}/{epochs} - CE: {avg_losses[0]:.4f}, "
+                f"SSD: {avg_losses[1]:.4f}, Total: {avg_losses[2]:.4f}"
             )
 
 
@@ -130,7 +141,6 @@ class FedSSD(DistillationAlgorithm):
             return_labels=True,
             is_sequence=is_sequence,
         )
-        aux_dataset = aux_dataset.cache()
         context.shared_state.update(
             {
                 "aux_dataset": aux_dataset,
@@ -161,7 +171,7 @@ class FedSSD(DistillationAlgorithm):
                 config.batch_size,
                 is_sequence=is_sequence,
             )
-            state.model.fit(train_dataset, epochs=config.epochs, verbose=0)
+            state.model.fit(train_dataset, epochs=config.epochs, verbose=1)
             client_weights.append(state.model.get_weights())
 
             y_mmap = np.load(paths["train_y"], mmap_mode="r")
@@ -240,24 +250,44 @@ class FedSSD(DistillationAlgorithm):
         aggregated_weights = aggregate_weights(client_weights, sample_sizes)
         global_model.set_weights(aggregated_weights)
 
-        round_metrics: Dict[int, Dict[str, float]] = {}
-        for state in context.client_states:
-            metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
-            round_metrics[state.client_id] = metrics
-            context.logger.info(
-                "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
-                round_number,
-                state.client_id,
-                metrics["Acc"],
-                metrics["F1"],
-                metrics["Precision"],
-                metrics["Recall"],
-            )
-            print(
-                f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}{COLORS.ENDC}"
-            )
+        context.shared_state["global_model"] = global_model
+        
+        global_metrics = evaluate_model(global_model, context.test_dataset, context.test_labels)
+        print(
+            f"{COLORS.OKGREEN}Round {round_number} - Global Acc={global_metrics['Acc']:.4f}, "
+            f"F1={global_metrics['F1']:.4f}, Precision={global_metrics['Precision']:.4f}, "
+            f"Recall={global_metrics['Recall']:.4f}{COLORS.ENDC}"
+        )
+        context.logger.info(
+            "Round %s | Global | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+            round_number,
+            global_metrics["Acc"],
+            global_metrics["F1"],
+            global_metrics["Precision"],
+            global_metrics["Recall"],
+        )
 
+        round_metrics: Dict[int, Dict[str, float]] = {-1: global_metrics}
+        
+        if config.personalized_eval:
+            for state in context.client_states:
+                metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
+                round_metrics[state.client_id] = metrics
+                context.logger.info(
+                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+                    round_number,
+                    state.client_id,
+                    metrics["Acc"],
+                    metrics["F1"],
+                    metrics["Precision"],
+                    metrics["Recall"],
+                )
+                print(
+                    f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
+                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}{COLORS.ENDC}"
+                )
+
+        for state in context.client_states:
             state.model.set_weights(global_model.get_weights())
 
         round_time = time.time() - round_start

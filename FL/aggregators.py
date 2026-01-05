@@ -1,11 +1,12 @@
 from dataclasses import dataclass
 from typing import Any, Callable, Dict
 
-from strategy.FedAvg import FedAvg
-from strategy.FedCoMed import FedCoMed
-from strategy.FedDyn import FedDyn
-from strategy.FedProx import FedProx
-from strategy.robust_filter import RobustFilterWeights
+from .strategy.FedAvg import FedAvg
+from .strategy.FedCoMed import FedCoMed
+from .strategy.FedDyn import FedDyn
+from .strategy.FedProx import FedProx
+from .strategy.robust_filter import RobustFilterWeights
+from .strategy.DeepFed import DeepFed
 
 
 @dataclass
@@ -70,6 +71,15 @@ def _robust_filter_client_factory(_: Any, __: Dict[str, Any]) -> FedAvg:
     return FedAvg()
 
 
+def _deepfed_aggregator_factory(params: Dict[str, Any]) -> DeepFed:
+    key_length = params.get('key_length', 1024)  # key length
+    return DeepFed(key_length=key_length)
+
+
+def _deepfed_client_factory(aggregator: DeepFed, _: Dict[str, Any]) -> DeepFed:
+    return aggregator
+
+
 STRATEGY_REGISTRY: Dict[str, StrategyConfig] = {
     'FedAvg': StrategyConfig(
         aggregator_factory=_fedavg_aggregator_factory,
@@ -91,6 +101,10 @@ STRATEGY_REGISTRY: Dict[str, StrategyConfig] = {
     'RobustFilter': StrategyConfig(
         aggregator_factory=_robust_filter_factory,
         client_factory=_robust_filter_client_factory
+    ),
+    'DeepFed': StrategyConfig(
+        aggregator_factory=_deepfed_aggregator_factory,
+        client_factory=_deepfed_client_factory
     )
 }
 

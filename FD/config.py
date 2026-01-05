@@ -19,6 +19,7 @@ class FDConfig:
     theta: float = -1.0
     dkd_steps: int = 3
     dkd_lr: float = 0.001
+    personalized_eval: bool = False
 
     def to_algorithm_params(self) -> dict:
         return {
@@ -37,4 +38,5 @@ class FDConfig:
             'theta': self.theta,
             'dkd_steps': self.dkd_steps,
             'dkd_lr': self.dkd_lr,
+            'personalized_eval': self.personalized_eval,
         }

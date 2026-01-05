@@ -236,7 +236,7 @@ class FederatedLearningPipeline:
         )
 
         self.logger.info(
-            f"Round {round_num} - Loss: {test_loss:.4f}, Acc: {accuracy:.4f}, F1: {f1_score_value:.4f}"
+            f"Round {round_num} | GLOBAL | Acc: {accuracy:.4f} | F1: {f1_score_value:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f} | Loss: {test_loss:.4f}"
         )
         if class_report and self.detailed_logger is not None:
             self.detailed_logger.info(f"Round {round_num}\n{class_report}")

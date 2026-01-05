@@ -43,6 +43,7 @@ python -m FL --n_clients <> --partition_type <> --strategy <> --rounds <>
 - `FedDyn`: Dynamic regularization (`--feddyn_alpha 0.1`)
 - `RobustFilter`: Byzantine-robust aggregation (ε=0.2)
 - `FedCoMed`: Coordinate-wise Median
+- `DeepFed`: FedAvg using Paillier Homomorphic Encryption
 **Examples**:
 ```sh
 # FedProx with proximal term
