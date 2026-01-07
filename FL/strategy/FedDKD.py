@@ -9,7 +9,7 @@ import tensorflow as tf
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..pipeline import PipelineContext, evaluate_model
-from .base import DistillationAlgorithm
+from .base import DistillationStrategy
 from .common import create_model, create_private_dataset
 
 
@@ -56,7 +56,7 @@ def apply_gradient_update(model, gradients, learning_rate):
     optimizer.apply_gradients(zip(gradients, trainable_vars))
 
 
-class FedDKD(DistillationAlgorithm):
+class FedDKD(DistillationStrategy):
     name = "FedDKD"
 
     def __init__(self, config) -> None:
@@ -222,7 +222,7 @@ class FedDKD(DistillationAlgorithm):
         )
         
         context.logger.info(
-            "Round %s - Global | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
             round_number,
             global_metrics["Acc"],
             global_metrics["F1"],

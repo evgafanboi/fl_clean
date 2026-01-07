@@ -2,12 +2,13 @@ import logging
 import os
 import pickle
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 from .aggregators import StrategyRuntime, build_strategy
 from .colors import COLORS
@@ -416,3 +417,172 @@ class FederatedLearningPipeline:
 def run_pipeline(config: FLConfig) -> None:
     pipeline = FederatedLearningPipeline(config)
     pipeline.run()
+
+
+@dataclass
+class ClientState:
+    client_id: int
+    model: Any
+    paths: Dict[str, str]
+    data: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PipelineContext:
+    config: Any
+    partition_label: str
+    client_count: int
+    n_clients: int
+    input_dim: int
+    num_classes: int
+    paths: List[Dict[str, str]]
+    logger: Any
+    detailed_logger: Any
+    log_filename: str
+    excel_filename: str
+    test_dataset: tf.data.Dataset
+    test_labels: np.ndarray
+    results: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    client_states: List[ClientState] = field(default_factory=list)
+    shared_state: Dict[str, Any] = field(default_factory=dict)
+    poisoned_clients: List[int] = field(default_factory=list)
+    poison_loader: Any = None
+
+    def add_client_state(self, client_id: int, model: Any, paths: Dict[str, str], **extras: Any) -> ClientState:
+        state = ClientState(client_id=client_id, model=model, paths=paths, data=dict(extras))
+        self.client_states.append(state)
+        self.results.setdefault(client_id, {})
+        return state
+
+
+def evaluate_model(model: Any, test_dataset: tf.data.Dataset, reference_labels: np.ndarray) -> Dict[str, float]:
+    predictions = model.predict(test_dataset, verbose=1)
+    if isinstance(predictions, list):
+        predictions = predictions[0]
+    pred_labels = np.argmax(predictions, axis=1)
+    true_labels = reference_labels[:len(pred_labels)]
+    
+    accuracy = float(np.mean(pred_labels == true_labels))
+    f1 = float(f1_score(true_labels, pred_labels, average="macro", zero_division=0))
+    precision = float(precision_score(true_labels, pred_labels, average="macro", zero_division=0))
+    recall = float(recall_score(true_labels, pred_labels, average="macro", zero_division=0))
+    
+    return {
+        "Acc": accuracy,
+        "F1": f1,
+        "Precision": precision,
+        "Recall": recall,
+    }
+
+
+def run_distillation_pipeline(config, strategy) -> None:
+    """Run the distillation-based federated learning pipeline."""
+    from .config import FDConfig
+    
+    partition_label, client_count = parse_partition_type(config.partition_type)
+    n_clients = min(config.n_clients, client_count)
+    
+    extra_log_tokens = strategy.extra_log_tokens()
+    
+    poison_suffix = ""
+    if config.poison:
+        poison_suffix = config.poison.replace("-", "_")
+    
+    logger, log_filename, detailed_logger = setup_logger(
+        algorithm_name=strategy.name,
+        n_clients=n_clients,
+        partition_label=partition_label,
+        extra_tokens=[f"gamma{config.gamma}", *extra_log_tokens.values()],
+        poison_suffix=poison_suffix,
+    )
+    excel_filename = log_filename.replace(".log", ".xlsx")
+    
+    y_test = np.load(os.path.join("data", "y_test.npy"), mmap_mode="r")
+    num_classes = len(np.unique(y_test))
+    del y_test
+    
+    sample_X = np.load(os.path.join("data", "X_test.npy"), mmap_mode="r")
+    input_dim = int(sample_X.shape[1])
+    del sample_X
+    
+    paths_list = [setup_paths(str(i), partition_label, client_count) for i in range(n_clients)]
+    
+    test_dataset = load_test_dataset(config.batch_size, num_classes)
+    test_labels = _extract_labels(test_dataset, num_classes)
+    
+    poisoned_clients = []
+    poison_loader = None
+    attack_type, poison_ratio = parse_poison_config(config.poison)
+    if attack_type:
+        poisoned_clients = get_or_create_poisoned_clients(
+            partition_label, attack_type, poison_ratio, n_clients
+        )
+        poison_loader = PoisonedDataLoader(attack_type, num_classes)
+        print(f"\n  POISONING ENABLED: {attack_type} attack")
+        print(f"    Poisoned clients: {poisoned_clients} ({len(poisoned_clients)}/{n_clients})")
+    
+    context = PipelineContext(
+        config=config,
+        partition_label=partition_label,
+        client_count=client_count,
+        n_clients=n_clients,
+        input_dim=input_dim,
+        num_classes=num_classes,
+        paths=paths_list,
+        logger=logger,
+        detailed_logger=detailed_logger,
+        log_filename=log_filename,
+        excel_filename=excel_filename,
+        test_dataset=test_dataset,
+        test_labels=test_labels,
+        shared_state={"extra_log_tokens": extra_log_tokens},
+        poisoned_clients=poisoned_clients,
+        poison_loader=poison_loader,
+    )
+    
+    log_timestamp(logger, "SIMULATION STARTED")
+    log_timestamp(logger, f"Clients: {n_clients}, Rounds: {config.rounds}, Partition: {partition_label}")
+    
+    if context.shared_state.get("extra_log_tokens"):
+        log_timestamp(logger, f"Extra config: {context.shared_state['extra_log_tokens']}")
+    
+    strategy.setup(context)
+    
+    for round_number in range(1, config.rounds + 1):
+        logger.info(f"Round {round_number}/{config.rounds}")
+        print(f"\n{COLORS.HEADER}Round {round_number}/{config.rounds}{COLORS.ENDC}")
+        log_timestamp(logger, f"Round {round_number} started")
+        
+        round_metrics = strategy.run_round(context, round_number)
+        
+        if round_metrics:
+            _record_metrics(context, round_number, round_metrics, excel_filename)
+    
+    strategy.finalize(context)
+    
+    total_time = context.shared_state.get("pipeline_elapsed_s")
+    if total_time is not None:
+        log_timestamp(logger, f"Pipeline completed in {total_time:.2f}s ({total_time/60:.2f}m)")
+    else:
+        log_timestamp(logger, "Pipeline completed")
+
+
+def _extract_labels(dataset: tf.data.Dataset, num_classes: int) -> np.ndarray:
+    labels: List[int] = []
+    for _, batch_y in dataset:
+        batch = batch_y.numpy()
+        if batch.ndim == 1 or batch.shape[1] == 1:
+            labels.extend(batch.astype(int).tolist())
+        else:
+            labels.extend(np.argmax(batch, axis=1).tolist())
+    return np.asarray(labels, dtype=int)
+
+
+def _record_metrics(context: PipelineContext, round_number: int, round_metrics: Dict[int, Dict[str, float]], excel_filename: str) -> None:
+    for client_id, metrics in round_metrics.items():
+        for key, value in metrics.items():
+            metric_key = f"Round_{round_number}_{key}"
+            context.results.setdefault(client_id, {})[metric_key] = value
+    
+    results_df = pd.DataFrame(context.results).T
+    results_df.to_excel(excel_filename)

@@ -9,7 +9,7 @@ import tensorflow as tf
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..pipeline import PipelineContext, evaluate_model
-from .base import DistillationAlgorithm
+from .base import DistillationStrategy
 from .common import create_model, create_private_dataset
 
 
@@ -146,7 +146,7 @@ def local_training_with_prototypes(
             train_step(batch_x, batch_y)
 
 
-class FedProto(DistillationAlgorithm):
+class FedProto(DistillationStrategy):
     name = "FedProto"
 
     def extra_log_tokens(self) -> Dict[str, float]:

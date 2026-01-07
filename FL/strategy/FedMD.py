@@ -9,7 +9,7 @@ import tensorflow as tf
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..pipeline import PipelineContext, evaluate_model
-from .base import DistillationAlgorithm
+from .base import DistillationStrategy
 from .common import (
     create_model,
     create_private_dataset,
@@ -73,7 +73,7 @@ def revisit_phase(model_wrapper, private_dataset: tf.data.Dataset, epochs: int) 
         print(f"      Final REVISIT loss: {history.history['loss'][-1]:.4f}")
 
 
-class FedMD(DistillationAlgorithm):
+class FedMD(DistillationStrategy):
     name = "FedMD"
 
     def __init__(self, config) -> None:

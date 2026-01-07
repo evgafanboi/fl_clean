@@ -9,7 +9,7 @@ import tensorflow as tf
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..pipeline import PipelineContext, evaluate_model
-from .base import DistillationAlgorithm
+from .base import DistillationStrategy
 from .common import create_model, create_private_dataset, load_public_dataset_from_clients
 
 
@@ -127,7 +127,7 @@ def train_with_ssd_loss(
             )
 
 
-class FedSSD(DistillationAlgorithm):
+class FedSSD(DistillationStrategy):
     name = "FedSSD"
 
     def setup(self, context: PipelineContext) -> None:
@@ -197,7 +197,7 @@ class FedSSD(DistillationAlgorithm):
             f"Precision={global_metrics['Precision']:.4f}, Recall={global_metrics['Recall']:.4f}{COLORS.ENDC}"
         )
         context.logger.info(
-            "Round 0 | Global | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+            "Round 0 | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
             global_metrics["Acc"],
             global_metrics["F1"],
             global_metrics["Precision"],
@@ -259,7 +259,7 @@ class FedSSD(DistillationAlgorithm):
             f"Recall={global_metrics['Recall']:.4f}{COLORS.ENDC}"
         )
         context.logger.info(
-            "Round %s | Global | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
             round_number,
             global_metrics["Acc"],
             global_metrics["F1"],

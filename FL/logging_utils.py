@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple
+from typing import Iterable, Optional, Tuple
 
 from .colors import COLORS
 
@@ -14,20 +14,29 @@ def log_timestamp(logger: logging.Logger, message: str) -> None:
 
 
 def setup_logger(
-    n_clients: int,
-    partition_type: str,
-    strategy_name: str,
+    n_clients: int = None,
+    partition_type: str = None,
+    strategy_name: str = None,
+    algorithm_name: str = None,
+    partition_label: str = None,
+    extra_tokens: Optional[Iterable[str]] = None,
     results_dir: str = "results",
     poison_suffix: str = ""
 ) -> Tuple[logging.Logger, str, logging.Logger]:
-    """Configure loggers for the federated learning pipeline."""
+    """Configure loggers for the federated learning pipeline. Supports both FL and FD style arguments."""
     Path(results_dir).mkdir(parents=True, exist_ok=True)
     
-    # Build filename with poison suffix if provided
-    base_name = f"{strategy_name}_{n_clients}client_{partition_type}"
+    # Handle both FL and FD argument styles
+    name = algorithm_name or strategy_name
+    partition = partition_label or partition_type
+    
+    # Build filename with optional extra tokens and poison suffix
+    parts = [name, f"{n_clients}client", partition]
+    if extra_tokens:
+        parts.extend(str(token) for token in extra_tokens if token)
     if poison_suffix:
-        base_name = f"{base_name}_{poison_suffix}"
-    log_filename = f"{results_dir}/{base_name}.log"
+        parts.append(poison_suffix)
+    log_filename = f"{results_dir}/{'_'.join(parts)}.log"
 
     logging.basicConfig(
         filename=log_filename,
