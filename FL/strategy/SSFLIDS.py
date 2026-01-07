@@ -8,7 +8,7 @@ import tensorflow as tf
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
-from ..pipeline import PipelineContext, evaluate_model
+from ..context import PipelineContext, evaluate_model
 from .base import DistillationStrategy
 from .common import (
     create_model,

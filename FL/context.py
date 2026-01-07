@@ -1,0 +1,62 @@
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
+import numpy as np
+import tensorflow as tf
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+
+@dataclass
+class ClientState:
+    client_id: int
+    model: Any
+    paths: Dict[str, str]
+    data: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PipelineContext:
+    config: Any
+    partition_label: str
+    client_count: int
+    n_clients: int
+    input_dim: int
+    num_classes: int
+    paths: List[Dict[str, str]]
+    logger: Any
+    detailed_logger: Any
+    log_filename: str
+    excel_filename: str
+    test_dataset: tf.data.Dataset
+    test_labels: np.ndarray
+    results: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    client_states: List[ClientState] = field(default_factory=list)
+    shared_state: Dict[str, Any] = field(default_factory=dict)
+    poisoned_clients: List[int] = field(default_factory=list)
+    poison_loader: Any = None
+
+    def add_client_state(self, client_id: int, model: Any, paths: Dict[str, str], **extras: Any) -> ClientState:
+        state = ClientState(client_id=client_id, model=model, paths=paths, data=dict(extras))
+        self.client_states.append(state)
+        self.results.setdefault(client_id, {})
+        return state
+
+
+def evaluate_model(model: Any, test_dataset: tf.data.Dataset, reference_labels: np.ndarray) -> Dict[str, float]:
+    predictions = model.predict(test_dataset, verbose=1)
+    if isinstance(predictions, list):
+        predictions = predictions[0]
+    pred_labels = np.argmax(predictions, axis=1)
+    true_labels = reference_labels[:len(pred_labels)]
+    
+    accuracy = float(np.mean(pred_labels == true_labels))
+    f1 = float(f1_score(true_labels, pred_labels, average="macro", zero_division=0))
+    precision = float(precision_score(true_labels, pred_labels, average="macro", zero_division=0))
+    recall = float(recall_score(true_labels, pred_labels, average="macro", zero_division=0))
+    
+    return {
+        "Acc": accuracy,
+        "F1": f1,
+        "Precision": precision,
+        "Recall": recall,
+    }

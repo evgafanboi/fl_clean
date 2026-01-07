@@ -1,5 +1,5 @@
 # Weight aggregation strategies
-from . import FedAvg, FedProx, FedDyn, FedCoMed, DeepFed, robust_filter
+from . import FedAvg, FedProx, FedDyn, FedCoMed, DeepFed, FLTrust, robust_filter
 
 # Distillation strategies
 from . import FD, FedDKD, FedProto, FedMD, FedSSD, SSFLIDS
@@ -8,7 +8,7 @@ from . import FD, FedDKD, FedProto, FedMD, FedSSD, SSFLIDS
 from . import base, common
 
 __all__ = [
-    'FedAvg', 'FedProx', 'FedDyn', 'FedCoMed', 'DeepFed', 'robust_filter',
+    'FedAvg', 'FedProx', 'FedDyn', 'FedCoMed', 'DeepFed', 'FLTrust', 'robust_filter',
     'FD', 'FedDKD', 'FedProto', 'FedMD', 'FedSSD', 'SSFLIDS',
     'base', 'common'
 ]

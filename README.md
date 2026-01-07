@@ -44,6 +44,16 @@ python -m FL --n_clients <> --partition_type <> --strategy <> --rounds <>
 - `RobustFilter`: Byzantine-robust aggregation (ε=0.2)
 - `FedCoMed`: Coordinate-wise Median
 - `DeepFed`: FedAvg using Paillier Homomorphic Encryption
+
+**Federated distillation**:
+- `FedDKD`: Federated Decentralized Knowledge Distillation
+- `FedProto`: FedProto
+- `FedSSD`: Federated Selective Self Distillation
+- `SSFL-IDS`: Semi-supervised Federated Learning
+- `FedMD`: FedMD
+- `FD`: FederatedDistillation
+- `FLTrust`
+
 **Examples**:
 ```sh
 # FedProx with proximal term
@@ -52,8 +62,8 @@ python3 -m FL --n_clients 10 --partition_type label_skew-10 --strategy FedProx -
 # FedDyn with alpha
 python3 -m FL --n_clients 10 --partition_type label_skew-10 --strategy FedDyn --feddyn_alpha 0.1
 
-# RobustFilter
-python3 -m FL --n_clients 10 --partition_type iid_poisoning-10 --strategy RobustFilter
+# FedSSD
+python3 -m FL --n_clients 10 --partition_type label_skew-10 --strategy FedSSD
 ```
 
 **Parameters**:
@@ -63,25 +73,12 @@ python3 -m FL --n_clients 10 --partition_type iid_poisoning-10 --strategy Robust
 - `--mu`: FedProx proximal term (default: 0.01)
 - `--feddyn_alpha`: FedDyn regularization (default: 0.1, paper optimal)
 
-**Run federated distillation simulations:**
-
-```sh
-python3 -m FD --n_clients <> --partition_type <> --algorithm <> --rounds <>
-```
-
-**Algorithms**:
-- `FedDKD`: Federated Decentralized Knowledge Distillation
-- `FedProto`: FedProto
-- `FedSSD`: Federated Selective Self Distillation
-- `SSFL-IDS`: Semi-supervised Federated Learning
-- `FedMD`: FedMD
-- `FD`: FederatedDistillation
 
 **Outputs**:
 - `results/{strategy}_{n_clients}client_{partition}.log`: Training logs
 - `results/{strategy}_{n_clients}client_{partition}.xlsx`: Metrics per round
 
-## Poisoning
+### Poisoning
 
 - To run **label flipping** poisoning, add `--poison label_flip-<ratio>` to the simulation, with `ratio` being `0.1` to `1.0` determining the proportion of clients to be poisoned. Selected clients for poisoning are randomized in the first run and their IDs are stored under `results/poison_history` for subsequent re-runs within the same partition type.
 

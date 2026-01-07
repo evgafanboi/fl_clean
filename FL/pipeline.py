@@ -12,6 +12,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 
 from .aggregators import StrategyRuntime, build_strategy
 from .colors import COLORS
+from .context import ClientState, PipelineContext
 from .data_utils import (
     create_client_dataset,
     load_test_dataset,
@@ -43,6 +44,7 @@ class FLConfig:
     robust_epsilon: float = 0.2
     robust_tau: float = 0.1
     poison: Optional[str] = None
+    root_iterations: int = 1
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -170,7 +172,18 @@ class FederatedLearningPipeline:
             f"client_{client_id}_round_{self.current_round}_weights.pkl"
         )
 
-        if self.config.strategy == "FedDyn":
+        # For FLTrust, save model update (new_weights - old_weights)
+        if self.config.strategy == "FLTrust":
+            if latest_weights is None:
+                # First round: update is just the trained weights
+                update = model.get_weights()
+            else:
+                # Compute update: new - old
+                new_weights = model.get_weights()
+                update = [new_w - old_w for new_w, old_w in zip(new_weights, latest_weights)]
+            with open(weights_file, 'wb') as file_handler:
+                pickle.dump(update, file_handler)
+        elif self.config.strategy == "FedDyn":
             feddyn_data = model.get_feddyn_update()
             with open(weights_file, 'wb') as file_handler:
                 pickle.dump(feddyn_data, file_handler)
@@ -194,11 +207,63 @@ class FederatedLearningPipeline:
                     weights_list.append(saved_data)
         return weights_list
 
-    def _aggregate(self, weights_list, sample_sizes, participating_clients):
+    def _aggregate(self, weights_list, sample_sizes, participating_clients, global_update=None):
         aggregator = self.strategy_runtime.aggregator
-        if self.strategy_runtime.requires_participant_ids:
+        
+        # FLTrust requires global_update parameter
+        if self.config.strategy == "FLTrust":
+            return aggregator.aggregate(weights_list, sample_sizes, global_update=global_update)
+        elif self.strategy_runtime.requires_participant_ids:
             return aggregator.aggregate(weights_list, sample_sizes, participating_clients)
-        return aggregator.aggregate(weights_list, sample_sizes)
+        else:
+            return aggregator.aggregate(weights_list, sample_sizes)
+    
+    def _train_server_on_root_dataset(self, current_weights, input_dim, num_classes):
+        tf.keras.backend.clear_session()
+        
+        model = create_model(
+            architecture=self.config.model,
+            input_dim=input_dim,
+            num_classes=num_classes,
+            batch_size=self.config.batch_size,
+            strategy_runtime=self.strategy_runtime,
+            client_id=None,
+        )
+        
+        if current_weights is not None:
+            model.set_weights(current_weights)
+        
+        partition_path = os.path.join("data", "partitions", f"{self.n_clients}_client", self.partition_label)
+        
+        all_public_X = []
+        all_public_y = []
+        for client_idx in range(self.n_clients):
+            public_X = np.load(os.path.join(partition_path, f"client_{client_idx}_X_public.npy"))
+            public_y = np.load(os.path.join(partition_path, f"client_{client_idx}_y_public.npy"))
+            all_public_X.append(public_X)
+            all_public_y.append(public_y)
+        
+        combined_X = np.concatenate(all_public_X, axis=0)
+        combined_y = np.concatenate(all_public_y, axis=0)
+        
+        root_dataset = tf.data.Dataset.from_tensor_slices((combined_X, combined_y))
+        root_dataset = root_dataset.map(lambda x, y: (x, tf.keras.utils.to_categorical(y, num_classes)))
+        root_dataset = root_dataset.batch(self.config.batch_size).prefetch(tf.data.AUTOTUNE)
+        
+        print(f"  [SERVER] Training on root dataset ({len(combined_X)} samples) for {self.config.root_iterations} iterations")
+        
+        model.fit(root_dataset, epochs=self.config.root_iterations, verbose=0)
+        
+        new_weights = model.get_weights()
+        if current_weights is None:
+            global_update = new_weights
+        else:
+            global_update = [new_w - old_w for new_w, old_w in zip(new_weights, current_weights)]
+        
+        del model, root_dataset, combined_X, combined_y
+        aggressive_memory_cleanup()
+        
+        return global_update
 
     def _evaluate_global_model(
         self,
@@ -286,7 +351,12 @@ class FederatedLearningPipeline:
         input_dim = self._determine_input_dim()
 
         paths_list = self._prepare_paths(n_clients, partition_label, client_count)
-        self._restore_partitions(paths_list)
+        
+        if self.config.strategy != "FLTrust":
+            self._restore_partitions(paths_list)
+        
+        self.n_clients = n_clients
+        self.partition_label = partition_label
 
         # Setup poisoning if configured
         attack_type, poison_ratio = parse_poison_config(self.config.poison)
@@ -336,16 +406,32 @@ class FederatedLearningPipeline:
                 break
 
             weights_list = self._load_client_weights(weights_files)
-            print(f"\n{COLORS.OKBLUE}Aggregating weights ({self.config.strategy}){COLORS.ENDC}")
-            aggregated_weights = self._aggregate(weights_list, sample_sizes, participating_clients)
-            latest_weights = aggregated_weights
+            
+            # For FLTrust, compute server update on root dataset
+            global_update = None
+            if self.config.strategy == "FLTrust":
+                print(f"\n{COLORS.OKBLUE}Training server on root dataset{COLORS.ENDC}")
+                global_update = self._train_server_on_root_dataset(latest_weights, input_dim, num_classes)
+            
+            print(f"\n{COLORS.OKBLUE}Aggregating updates ({self.config.strategy}){COLORS.ENDC}")
+            aggregated_result = self._aggregate(weights_list, sample_sizes, participating_clients, global_update)
+            
+            # For FLTrust, apply update to get new weights
+            if self.config.strategy == "FLTrust":
+                if latest_weights is None:
+                    latest_weights = aggregated_result
+                else:
+                    # Apply update: w_new = w_old + aggregated_update
+                    latest_weights = [old_w + update for old_w, update in zip(latest_weights, aggregated_result)]
+            else:
+                latest_weights = aggregated_result
 
             del weights_list
             aggressive_memory_cleanup()
 
             eval_start_time = time.time()
             metrics = self._evaluate_global_model(
-                aggregated_weights,
+                latest_weights,
                 input_dim,
                 num_classes,
                 class_names,
@@ -395,7 +481,6 @@ class FederatedLearningPipeline:
                 if round_num != self.config.rounds and os.path.exists(weights_file):
                     os.remove(weights_file)
 
-            del aggregated_weights
             aggressive_memory_cleanup()
             time.sleep(1)
 
@@ -419,65 +504,9 @@ def run_pipeline(config: FLConfig) -> None:
     pipeline.run()
 
 
-@dataclass
-class ClientState:
-    client_id: int
-    model: Any
-    paths: Dict[str, str]
-    data: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class PipelineContext:
-    config: Any
-    partition_label: str
-    client_count: int
-    n_clients: int
-    input_dim: int
-    num_classes: int
-    paths: List[Dict[str, str]]
-    logger: Any
-    detailed_logger: Any
-    log_filename: str
-    excel_filename: str
-    test_dataset: tf.data.Dataset
-    test_labels: np.ndarray
-    results: Dict[int, Dict[str, float]] = field(default_factory=dict)
-    client_states: List[ClientState] = field(default_factory=list)
-    shared_state: Dict[str, Any] = field(default_factory=dict)
-    poisoned_clients: List[int] = field(default_factory=list)
-    poison_loader: Any = None
-
-    def add_client_state(self, client_id: int, model: Any, paths: Dict[str, str], **extras: Any) -> ClientState:
-        state = ClientState(client_id=client_id, model=model, paths=paths, data=dict(extras))
-        self.client_states.append(state)
-        self.results.setdefault(client_id, {})
-        return state
-
-
-def evaluate_model(model: Any, test_dataset: tf.data.Dataset, reference_labels: np.ndarray) -> Dict[str, float]:
-    predictions = model.predict(test_dataset, verbose=1)
-    if isinstance(predictions, list):
-        predictions = predictions[0]
-    pred_labels = np.argmax(predictions, axis=1)
-    true_labels = reference_labels[:len(pred_labels)]
-    
-    accuracy = float(np.mean(pred_labels == true_labels))
-    f1 = float(f1_score(true_labels, pred_labels, average="macro", zero_division=0))
-    precision = float(precision_score(true_labels, pred_labels, average="macro", zero_division=0))
-    recall = float(recall_score(true_labels, pred_labels, average="macro", zero_division=0))
-    
-    return {
-        "Acc": accuracy,
-        "F1": f1,
-        "Precision": precision,
-        "Recall": recall,
-    }
-
-
 def run_distillation_pipeline(config, strategy) -> None:
-    """Run the distillation-based federated learning pipeline."""
     from .config import FDConfig
+    from .context import evaluate_model
     
     partition_label, client_count = parse_partition_type(config.partition_type)
     n_clients = min(config.n_clients, client_count)
