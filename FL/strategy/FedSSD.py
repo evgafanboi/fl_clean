@@ -9,6 +9,7 @@ import tensorflow as tf
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, evaluate_model
+from ..logging_utils import log_timestamp
 from .base import DistillationStrategy
 from .common import create_model, create_private_dataset, load_public_dataset_from_clients
 
@@ -149,11 +150,22 @@ class FedSSD(DistillationStrategy):
             }
         )
 
-        print(f"{COLORS.OKGREEN}Warmup training for all clients{COLORS.ENDC}")
+        print(f"{COLORS.OKGREEN}Initializing global model with random weights{COLORS.ENDC}")
 
-        client_weights: List[List[np.ndarray]] = []
+        global_model = create_model(
+            context.input_dim,
+            context.num_classes,
+            config.batch_size,
+            model_type=config.model_type,
+        )
+
+        print(f"{COLORS.OKCYAN}Computing initial credibility matrix on auxiliary dataset{COLORS.ENDC}")
+        M_class = compute_class_metrics(global_model, aux_dataset, context.num_classes)
+        print(
+            f"  M_class statistics -> min: {M_class.min():.4f}, max: {M_class.max():.4f}, mean: {M_class.mean():.4f}"
+        )
+
         sample_sizes: List[int] = []
-
         for client_id, paths in enumerate(context.paths):
             model = create_model(
                 context.input_dim,
@@ -161,51 +173,22 @@ class FedSSD(DistillationStrategy):
                 config.batch_size,
                 model_type=config.model_type,
             )
+            model.set_weights(global_model.get_weights())
             state = context.add_client_state(client_id, model, paths)
-
-            train_dataset = create_private_dataset(
-                paths["train_X"],
-                paths["train_y"],
-                context.input_dim,
-                context.num_classes,
-                config.batch_size,
-                is_sequence=is_sequence,
-            )
-            state.model.fit(train_dataset, epochs=config.epochs, verbose=1)
-            client_weights.append(state.model.get_weights())
 
             y_mmap = np.load(paths["train_y"], mmap_mode="r")
             sample_sizes.append(int(y_mmap.shape[0]))
-            del y_mmap, train_dataset
-            aggressive_memory_cleanup()
-
-        aggregated_weights = aggregate_weights(client_weights, sample_sizes)
-        global_model = create_model(
-            context.input_dim,
-            context.num_classes,
-            config.batch_size,
-            model_type=config.model_type,
-        )
-        global_model.set_weights(aggregated_weights)
+            del y_mmap
 
         context.shared_state["global_model"] = global_model
         context.shared_state["sample_sizes"] = sample_sizes
 
-        global_metrics = evaluate_model(global_model, context.test_dataset, context.test_labels)
-        print(
-            f"{COLORS.OKGREEN}Round 0 - Global Acc={global_metrics['Acc']:.4f}, F1={global_metrics['F1']:.4f}, "
-            f"Precision={global_metrics['Precision']:.4f}, Recall={global_metrics['Recall']:.4f}{COLORS.ENDC}"
-        )
-        context.logger.info(
-            "Round 0 | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
-            global_metrics["Acc"],
-            global_metrics["F1"],
-            global_metrics["Precision"],
-            global_metrics["Recall"],
-        )
+        print(f"{COLORS.OKGREEN}Setup complete - broadcasting initial model to clients{COLORS.ENDC}")
 
     def run_round(self, context: PipelineContext, round_number: int) -> Dict[int, Dict[str, float]]:
         round_start = time.time()
+        log_timestamp(context.logger, f"--- Round {round_number} started ---")
+        
         config = context.config
         global_model = context.shared_state["global_model"]
         aux_dataset = context.shared_state["aux_dataset"]
@@ -259,12 +242,13 @@ class FedSSD(DistillationStrategy):
             f"Recall={global_metrics['Recall']:.4f}{COLORS.ENDC}"
         )
         context.logger.info(
-            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
             round_number,
             global_metrics["Acc"],
             global_metrics["F1"],
             global_metrics["Precision"],
             global_metrics["Recall"],
+            global_metrics.get("Loss", 0.0),
         )
 
         round_metrics: Dict[int, Dict[str, float]] = {-1: global_metrics}
@@ -292,7 +276,11 @@ class FedSSD(DistillationStrategy):
 
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
-        context.logger.info("Round %s completed in %.2fs", round_number, round_time)
+        
+        context.logger.info(
+            f"Round {round_number} summary - ClientLossAvg: 0.0000, GlobalLoss: {global_metrics.get('Loss', 0.0):.4f}"
+        )
+        log_timestamp(context.logger, f"--- Round {round_number} completed in {round_time:.2f}s ---")
         print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
 
         return round_metrics

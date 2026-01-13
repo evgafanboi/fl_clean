@@ -39,7 +39,12 @@ def main():
     class_pkls = sorted(glob.glob(os.path.join("data/CIC23", "*_label*.pkl")))
     partition_type = args.partition_type
     
-    output_dir = os.path.join(args.output_dir, f"{n_clients}_client", partition_type)
+    if partition_type == "label_skew":
+        partition_name = f"{partition_type}_{args.alpha}"
+    else:
+        partition_name = partition_type
+    
+    output_dir = os.path.join(args.output_dir, f"{n_clients}_client", partition_name)
     os.makedirs(output_dir, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 

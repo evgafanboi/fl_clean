@@ -108,12 +108,3 @@ def create_feddyn_dense_model(input_dim, num_classes, batch_size, feddyn_strateg
     from .dense import create_enhanced_dense_model
     base_model = create_enhanced_dense_model(input_dim, num_classes, batch_size)
     return FedDynModelWrapper(base_model, feddyn_strategy, client_id)
-
-
-def create_feddyn_gru_model(input_shape, num_classes, batch_size, feddyn_strategy, client_id):
-    from .gru import create_enhanced_gru_model
-    base_model = create_enhanced_gru_model(input_shape, num_classes, batch_size)
-    return FedDynModelWrapper(base_model, feddyn_strategy, client_id)
-    from .gru import create_enhanced_gru_model
-    base_model = create_enhanced_gru_model(input_shape, num_classes, batch_size)
-    return FedDynModelWrapper(base_model, feddyn_strategy, client_id)

@@ -4,28 +4,19 @@ import numpy as np
 
 def parse_poison_config(poison_arg):
     if not poison_arg:
-        return None, None
-    
-    parts = poison_arg.split('-')
-    if len(parts) != 2:
-        raise ValueError(f"Invalid poison format: {poison_arg}. Expected format: <attack_type>-<ratio>")
-    
+        return None, None, None
+    parts = poison_arg.split()
     attack_type = parts[0]
-    try:
-        ratio = float(parts[1])
-        if not 0 < ratio <= 1:
-            raise ValueError("Poison ratio must be between 0 and 1")
-    except ValueError as e:
-        raise ValueError(f"Invalid poison ratio: {parts[1]}. {e}")
-    
-    return attack_type, ratio
+    value = float(parts[1])
+    ratio = float(parts[2])
+    return attack_type, value, ratio
 
 
-def get_or_create_poisoned_clients(partition_type, attack_type, ratio, n_clients, seed=42):
+def get_or_create_poisoned_clients(partition_type, attack_type, value, ratio, n_clients, seed=42):
     history_dir = os.path.join("results", "poison_history")
     os.makedirs(history_dir, exist_ok=True)
     
-    filename = f"{partition_type}_{attack_type}_{ratio}.txt"
+    filename = f"{partition_type}_{attack_type}_{value}_{ratio}.txt"
     filepath = os.path.join(history_dir, filename)
     
     if os.path.exists(filepath):
@@ -39,7 +30,7 @@ def get_or_create_poisoned_clients(partition_type, attack_type, ratio, n_clients
     poisoned_ids = sorted(rng.choice(n_clients, size=n_poisoned, replace=False).tolist())
     
     with open(filepath, 'w') as f:
-        f.write(f"# Poisoned clients for {partition_type} with {attack_type} attack (ratio={ratio})\n")
+        f.write(f"# Poisoned clients for {partition_type} with {attack_type} attack (value={value}, ratio={ratio})\n")
         f.write(f"# Total clients: {n_clients}, Poisoned: {n_poisoned} ({ratio*100:.1f}%)\n")
         f.write(f"# Attack type: {attack_type}\n")
         f.write(f"# Seed: {seed}\n")

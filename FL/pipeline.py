@@ -44,7 +44,11 @@ class FLConfig:
     robust_epsilon: float = 0.2
     robust_tau: float = 0.1
     poison: Optional[str] = None
+    personalized_eval: bool = False
     root_iterations: int = 1
+    lambda1: float = 1.0
+    lambda2: float = 1.0
+    temperature: float = 1.0
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -53,6 +57,9 @@ class FLConfig:
             'feddyn_alpha': self.feddyn_alpha,
             'epsilon': self.robust_epsilon,
             'robust_tau': self.robust_tau,
+            'lambda1': self.lambda1,
+            'lambda2': self.lambda2,
+            'temperature': self.temperature,
         }
 
 
@@ -66,6 +73,14 @@ class FederatedLearningPipeline:
         self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
         self.poisoned_clients: List[int] = []
         self.poison_loader: Optional[PoisonedDataLoader] = None
+        self.test_dataset = None
+        self.eval_batch_size: Optional[int] = None
+        self.class_names: List[str] = []
+        self.partition_label: Optional[str] = None
+        self.current_round = 0
+        self.poison_attack: Optional[str] = None
+        self.poison_value: Optional[float] = None
+        self.poison_ratio: Optional[float] = None
 
     def _load_class_metadata(self, partition_label: str, client_count: int) -> (List[str], int):
         class_names_file = os.path.join(
@@ -101,6 +116,12 @@ class FederatedLearningPipeline:
         if restored_count > 0:
             print(f"{COLORS.OKGREEN}Restored {restored_count} partitions{COLORS.ENDC}")
 
+    def _get_test_dataset(self, num_classes: int):
+        if self.test_dataset is None:
+            batch_size = self.eval_batch_size or min(self.config.batch_size, 2048)
+            self.test_dataset = load_test_dataset(batch_size, num_classes)
+        return self.test_dataset
+
     def _train_single_client(
         self,
         client_id: int,
@@ -126,11 +147,17 @@ class FederatedLearningPipeline:
 
         if latest_weights is not None:
             model.set_weights(latest_weights)
+        
+        if self.config.strategy == "FedMLB" and hasattr(model, 'set_global_weights') and latest_weights is not None:
+            model.set_global_weights(latest_weights)
 
-        # Apply poisoning for poisoned clients
-        poison_loader = self.poison_loader if client_id in self.poisoned_clients else None
-        if poison_loader:
-            print(f"  \u26a0\ufe0f  POISONED CLIENT - Labels will be flipped")
+        poisoned = client_id in self.poisoned_clients
+        poison_loader = self.poison_loader if poisoned and self.poison_attack == "label_flip" else None
+        if poisoned and self.poison_attack == "label_flip":
+            print(f"  \u26a0\ufe0f  POISONED CLIENT - Labels flipped")
+        if poisoned and self.poison_attack == "gradient_scale":
+            scale = self.poison_value or 1.0
+            print(f"  \u26a0\ufe0f  POISONED CLIENT - Scaling gradients x{scale:.1f}")
 
         train_dataset = create_client_dataset(
             paths['train_X'],
@@ -167,6 +194,12 @@ class FederatedLearningPipeline:
         self.logger.info(f"Client {client_id}: Loss={loss:.4f}")
         print(f"{COLORS.WARNING}Client {client_id}: Loss={loss:.4f}{COLORS.ENDC}")
 
+        if self.config.personalized_eval:
+            self._evaluate_personalized_client(model, client_id, num_classes)
+
+        trained_weights = model.get_weights()
+        poisoned_weights = self._apply_poison_to_weights(trained_weights, latest_weights, client_id)
+
         weights_file = os.path.join(
             self.config.weights_cache_dir,
             f"client_{client_id}_round_{self.current_round}_weights.pkl"
@@ -175,21 +208,20 @@ class FederatedLearningPipeline:
         # For FLTrust, save model update (new_weights - old_weights)
         if self.config.strategy == "FLTrust":
             if latest_weights is None:
-                # First round: update is just the trained weights
-                update = model.get_weights()
+                update = poisoned_weights
             else:
-                # Compute update: new - old
-                new_weights = model.get_weights()
-                update = [new_w - old_w for new_w, old_w in zip(new_weights, latest_weights)]
+                update = [new_w - old_w for new_w, old_w in zip(poisoned_weights, latest_weights)]
             with open(weights_file, 'wb') as file_handler:
                 pickle.dump(update, file_handler)
         elif self.config.strategy == "FedDyn":
             feddyn_data = model.get_feddyn_update()
+            if 'weights' in feddyn_data:
+                feddyn_data['weights'] = poisoned_weights
             with open(weights_file, 'wb') as file_handler:
                 pickle.dump(feddyn_data, file_handler)
         else:
             with open(weights_file, 'wb') as file_handler:
-                pickle.dump(model.get_weights(), file_handler)
+                pickle.dump(poisoned_weights, file_handler)
 
         del model, train_dataset, history
         aggressive_memory_cleanup()
@@ -265,6 +297,42 @@ class FederatedLearningPipeline:
         
         return global_update
 
+    def _apply_poison_to_weights(self, weights, latest_weights, client_id):
+        if self.poison_attack == "gradient_scale" and latest_weights is not None and client_id in self.poisoned_clients:
+            scale = self.poison_value or 1.0
+            scaled = []
+            for new_w, old_w in zip(weights, latest_weights):
+                scaled.append(old_w + (new_w - old_w) * scale)
+            return scaled
+        return weights
+
+    def _evaluate_personalized_client(self, model, client_id: int, num_classes: int):
+        test_dataset = self._get_test_dataset(num_classes)
+        result = evaluate_model_with_metrics(
+            model,
+            test_dataset,
+            num_classes,
+            self.class_names,
+            self.current_round,
+            self.config.strategy,
+            self.partition_label,
+            collect_details=False,
+        )
+        test_loss, accuracy, f1_value, precision, recall = result[:5]
+        self.logger.info(
+            "Round %s | Client %s | PERSONALIZED | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+            self.current_round,
+            client_id,
+            accuracy,
+            f1_value,
+            precision,
+            recall,
+            test_loss,
+        )
+        print(
+            f"{COLORS.OKBLUE}Client {client_id} personalized eval -> Acc={accuracy:.4f}, F1={f1_value:.4f}, Loss={test_loss:.4f}{COLORS.ENDC}"
+        )
+
     def _evaluate_global_model(
         self,
         aggregated_weights,
@@ -285,8 +353,7 @@ class FederatedLearningPipeline:
         )
         eval_model.set_weights(aggregated_weights)
 
-        eval_batch_size = min(self.config.batch_size, 2048)
-        test_dataset = load_test_dataset(eval_batch_size, num_classes)
+        test_dataset = self._get_test_dataset(num_classes)
 
         if round_num == self.config.rounds:
             print(f"{COLORS.HEADER}FINAL GLOBAL EVALUATION{COLORS.ENDC}")
@@ -337,7 +404,7 @@ class FederatedLearningPipeline:
         # Prepare poison suffix for logging
         poison_suffix = ""
         if self.config.poison:
-            poison_suffix = self.config.poison.replace("-", "_")
+            poison_suffix = self.config.poison.replace(" ", "_")
 
         self.logger, self.log_filename, self.detailed_logger = setup_logger(
             n_clients,
@@ -348,6 +415,9 @@ class FederatedLearningPipeline:
         excel_filename = self.log_filename.replace('.log', '.xlsx')
 
         class_names, num_classes = self._load_class_metadata(partition_label, client_count)
+        self.class_names = class_names
+        self.eval_batch_size = min(self.config.batch_size, 2048)
+        self.test_dataset = load_test_dataset(self.eval_batch_size, num_classes)
         input_dim = self._determine_input_dim()
 
         paths_list = self._prepare_paths(n_clients, partition_label, client_count)
@@ -359,15 +429,19 @@ class FederatedLearningPipeline:
         self.partition_label = partition_label
 
         # Setup poisoning if configured
-        attack_type, poison_ratio = parse_poison_config(self.config.poison)
+        attack_type, poison_value, poison_ratio = parse_poison_config(self.config.poison)
+        self.poison_attack = attack_type
+        self.poison_value = poison_value
+        self.poison_ratio = poison_ratio
         if attack_type:
             self.poisoned_clients = get_or_create_poisoned_clients(
-                partition_label, attack_type, poison_ratio, n_clients
+                partition_label, attack_type, poison_value, poison_ratio, n_clients
             )
-            self.poison_loader = PoisonedDataLoader(attack_type, num_classes)
-            log_timestamp(self.logger, f"POISONING ENABLED: {attack_type} attack on {len(self.poisoned_clients)} clients ({poison_ratio*100:.1f}%)")
+            if attack_type == "label_flip":
+                self.poison_loader = PoisonedDataLoader(attack_type, num_classes)
+            log_timestamp(self.logger, f"POISONING ENABLED: {attack_type} attack value={poison_value} on {len(self.poisoned_clients)} clients")
             log_timestamp(self.logger, f"Poisoned clients: {self.poisoned_clients}")
-            print(f"\n  POISONING ENABLED: {attack_type} attack")
+            print(f"\n  POISONING ENABLED: {attack_type} attack (value={poison_value})")
             print(f"    Poisoned clients: {self.poisoned_clients} ({len(self.poisoned_clients)}/{n_clients})")
 
         latest_weights = None
@@ -375,6 +449,22 @@ class FederatedLearningPipeline:
         log_timestamp(self.logger, "=== FL PIPELINE STARTED ===")
         log_timestamp(self.logger, f"Strategy: {self.config.strategy}, Clients: {n_clients}, Rounds: {self.config.rounds}")
         round_times: List[float] = []
+        
+        if self.config.strategy == "FedMLB":
+            print(f"\n{COLORS.OKCYAN}Initializing FedMLB server model (Round 0){COLORS.ENDC}")
+            log_timestamp(self.logger, "Round 0 - Initializing server model")
+            init_model = create_model(
+                architecture=self.config.model,
+                input_dim=input_dim,
+                num_classes=num_classes,
+                batch_size=self.config.batch_size,
+                strategy_runtime=self.strategy_runtime,
+                client_id=None,
+            )
+            latest_weights = init_model.get_weights()
+            del init_model
+            aggressive_memory_cleanup()
+            print(f"{COLORS.OKGREEN}Server model initialized with random weights{COLORS.ENDC}")
 
         for round_num in range(1, self.config.rounds + 1):
             self.current_round = round_num
@@ -515,7 +605,7 @@ def run_distillation_pipeline(config, strategy) -> None:
     
     poison_suffix = ""
     if config.poison:
-        poison_suffix = config.poison.replace("-", "_")
+        poison_suffix = config.poison.replace(" ", "_")
     
     logger, log_filename, detailed_logger = setup_logger(
         algorithm_name=strategy.name,
@@ -541,13 +631,14 @@ def run_distillation_pipeline(config, strategy) -> None:
     
     poisoned_clients = []
     poison_loader = None
-    attack_type, poison_ratio = parse_poison_config(config.poison)
+    attack_type, poison_value, poison_ratio = parse_poison_config(config.poison)
     if attack_type:
         poisoned_clients = get_or_create_poisoned_clients(
-            partition_label, attack_type, poison_ratio, n_clients
+            partition_label, attack_type, poison_value, poison_ratio, n_clients
         )
-        poison_loader = PoisonedDataLoader(attack_type, num_classes)
-        print(f"\n  POISONING ENABLED: {attack_type} attack")
+        if attack_type == "label_flip":
+            poison_loader = PoisonedDataLoader(attack_type, num_classes)
+        print(f"\n  POISONING ENABLED: {attack_type} attack (value={poison_value})")
         print(f"    Poisoned clients: {poisoned_clients} ({len(poisoned_clients)}/{n_clients})")
     
     context = PipelineContext(

@@ -92,7 +92,8 @@ def evaluate_model_with_metrics(
     class_names: Optional[Sequence[str]] = None,
     round_num: Optional[int] = None,
     strategy_name: Optional[str] = None,
-    partition_type: Optional[str] = None
+    partition_type: Optional[str] = None,
+    collect_details: bool = True,
 ):
     y_true = []
     y_pred = []
@@ -129,20 +130,25 @@ def evaluate_model_with_metrics(
     precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
     recall_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
 
-    f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
-    precision_per_class = precision_score(y_true, y_pred, average=None, zero_division=0)
-    recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
-    cm = confusion_matrix(y_true, y_pred)
+    per_class_metrics = None
+    cm = None
+    class_report = ""
+    if collect_details:
+        f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
+        precision_per_class = precision_score(y_true, y_pred, average=None, zero_division=0)
+        recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
+        cm = confusion_matrix(y_true, y_pred)
+        per_class_metrics = (f1_per_class, precision_per_class, recall_per_class)
 
-    if class_names is None:
-        class_names = [f"Class_{i}" for i in range(num_classes)]
+        if class_names is None:
+            class_names = [f"Class_{i}" for i in range(num_classes)]
 
-    class_report = classification_report(
-        y_true,
-        y_pred,
-        target_names=class_names,
-        zero_division=0
-    )
+        class_report = classification_report(
+            y_true,
+            y_pred,
+            target_names=class_names,
+            zero_division=0
+        )
 
     del y_pred, y_true
     gc.collect()
@@ -153,7 +159,7 @@ def evaluate_model_with_metrics(
         f1_macro,
         precision_macro,
         recall_macro,
-        (f1_per_class, precision_per_class, recall_per_class),
+        per_class_metrics,
         cm,
         class_report,
     )

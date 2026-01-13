@@ -8,6 +8,7 @@ from .strategy.FedProx import FedProx
 from .strategy.robust_filter import RobustFilterWeights
 from .strategy.DeepFed import DeepFed
 from .strategy.FLTrust import FLTrust
+from .strategy.FedMLB import FedMLB
 
 
 @dataclass
@@ -90,6 +91,17 @@ def _fltrust_client_factory(aggregator: FLTrust, _: Dict[str, Any]) -> FLTrust:
     return aggregator
 
 
+def _fedmlb_factory(params: Dict[str, Any]) -> FedMLB:
+    lambda1 = params.get('lambda1', 1.0)
+    lambda2 = params.get('lambda2', 1.0)
+    temperature = params.get('temperature', 1.0)
+    return FedMLB(lambda1=lambda1, lambda2=lambda2, temperature=temperature)
+
+
+def _fedmlb_client_factory(aggregator: FedMLB, _: Dict[str, Any]) -> FedMLB:
+    return aggregator
+
+
 STRATEGY_REGISTRY: Dict[str, StrategyConfig] = {
     'FedAvg': StrategyConfig(
         aggregator_factory=_fedavg_aggregator_factory,
@@ -119,6 +131,10 @@ STRATEGY_REGISTRY: Dict[str, StrategyConfig] = {
     'FLTrust': StrategyConfig(
         aggregator_factory=_fltrust_factory,
         client_factory=_fltrust_client_factory
+    ),
+    'FedMLB': StrategyConfig(
+        aggregator_factory=_fedmlb_factory,
+        client_factory=_fedmlb_client_factory
     )
 }
 

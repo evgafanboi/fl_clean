@@ -70,8 +70,3 @@ def create_fedprox_dense_model(input_dim, num_classes, batch_size, fedprox_strat
     from .dense import create_enhanced_dense_model
     base_model = create_enhanced_dense_model(input_dim, num_classes, batch_size)
     return FedProxModelWrapper(base_model, fedprox_strategy)
-
-def create_fedprox_gru_model(input_shape, num_classes, batch_size, fedprox_strategy):
-    from .gru import create_enhanced_gru_model
-    base_model = create_enhanced_gru_model(input_shape, num_classes, batch_size)
-    return FedProxModelWrapper(base_model, fedprox_strategy)

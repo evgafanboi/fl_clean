@@ -1,6 +1,6 @@
 from typing import Callable, Dict, Optional
 
-from models import dense, fedprox_wrapper, feddyn_wrapper
+from models import dense, fedprox_wrapper, feddyn_wrapper, fedmlb_wrapper
 
 from .aggregators import StrategyRuntime
 
@@ -21,6 +21,15 @@ def _dense_builder(
         return fedprox_wrapper.create_fedprox_dense_model(input_dim, num_classes, batch_size, strategy_runtime.client_strategy)
     if strategy_name == 'feddyn':
         return feddyn_wrapper.create_feddyn_dense_model(input_dim, num_classes, batch_size, strategy_runtime.client_strategy, client_id)
+    if strategy_name == 'fedmlb':
+        return fedmlb_wrapper.create_fedmlb_model(
+            input_dim,
+            num_classes,
+            batch_size,
+            lambda1=strategy_runtime.client_strategy.lambda1,
+            lambda2=strategy_runtime.client_strategy.lambda2,
+            temperature=strategy_runtime.client_strategy.temperature
+        )
     return dense.create_dense_model(input_dim, num_classes, batch_size)
 
 

@@ -1,6 +1,7 @@
 import tensorflow as tf
 import numpy as np
 
+# Discriminator for SSFL-IDS
 class DenseDiscriminator:
     def __init__(self, input_dim, learning_rate=0.0001):
         self.input_dim = input_dim

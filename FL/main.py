@@ -38,8 +38,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dkd_steps", type=int, default=3, help="DKD gradient steps per round (for FedDKD)")
     parser.add_argument("--dkd_lr", type=float, default=0.001, help="Learning rate for DKD SGD updates (for FedDKD)")
     parser.add_argument("--personalized_eval", action="store_true", help="Evaluate individual client models in addition to global model")
-    parser.add_argument("--poison", type=str, default=None, help="Poison config: <attack_type>-<ratio>, e.g., label_flip-0.3")
+    parser.add_argument(
+        "--poison",
+        nargs=3,
+        metavar=("attack", "value", "ratio"),
+        default=None,
+        help="Poison config: <attack> <value> <ratio>, e.g., gradient_scale 10 0.5",
+    )
     parser.add_argument("--root_iterations", type=int, default=1, help="Server training iterations on root dataset (for FLTrust)")
+    parser.add_argument("--lambda1", type=float, default=1.0, help="Weight for hybrid CE loss (for FedMLB)")
+    parser.add_argument("--lambda2", type=float, default=1.0, help="Weight for KL divergence loss (for FedMLB)")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for KL divergence (for FedMLB)")
     return parser
 
 
@@ -79,7 +88,7 @@ def main(argv=None):
             dkd_steps=args.dkd_steps,
             dkd_lr=args.dkd_lr,
             personalized_eval=args.personalized_eval,
-            poison=args.poison,
+            poison=" ".join(args.poison) if args.poison else None,
         )
         
         strategy = strategy_registry[args.strategy](config)
@@ -99,8 +108,12 @@ def main(argv=None):
             model=args.model,
             robust_epsilon=args.robust_epsilon,
             robust_tau=args.robust_tau,
-            poison=args.poison,
+            poison=" ".join(args.poison) if args.poison else None,
             root_iterations=args.root_iterations,
+            lambda1=args.lambda1,
+            lambda2=args.lambda2,
+            temperature=args.temperature,
+            personalized_eval=args.personalized_eval,
         )
         run_pipeline(config)
 
