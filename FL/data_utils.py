@@ -43,21 +43,34 @@ def setup_paths(client_id: str, partition_type: str, client_count: int) -> Dict[
 
 
 def restore_full_partition(paths: Dict[str, str]) -> bool:
+    """Merge public and private partitions IN MEMORY without modifying disk files"""
+    if not os.path.exists(paths['public_X']):
+        return False
+    
+    # Load private partition
     X_train = np.load(paths['train_X'], mmap_mode='r')
     y_train = np.load(paths['train_y'], mmap_mode='r')
-
-    if os.path.exists(paths['public_X']):
-        X_public = np.load(paths['public_X'])
-        y_public = np.load(paths['public_y'])
-
-        X_full = np.concatenate([np.array(X_train), X_public], axis=0)
-        y_full = np.concatenate([np.array(y_train), y_public], axis=0)
-
-        np.save(paths['train_X'], X_full)
-        np.save(paths['train_y'], y_full)
-        return True
-
-    return False
+    
+    # Load public partition
+    X_public = np.load(paths['public_X'], mmap_mode='r')
+    y_public = np.load(paths['public_y'], mmap_mode='r')
+    
+    # Create merged copies in memory (copy to avoid mmap issues)
+    X_full = np.concatenate([np.array(X_train), np.array(X_public)], axis=0)
+    y_full = np.concatenate([np.array(y_train), np.array(y_public)], axis=0)
+    
+    # Create temporary files with _merged suffix
+    merged_X_path = paths['train_X'].replace('_train.npy', '_merged.npy')
+    merged_y_path = paths['train_y'].replace('_train.npy', '_merged.npy')
+    
+    np.save(merged_X_path, X_full)
+    np.save(merged_y_path, y_full)
+    
+    # Update paths to point to merged files
+    paths['train_X'] = merged_X_path
+    paths['train_y'] = merged_y_path
+    
+    return True
 
 
 def create_client_dataset(
