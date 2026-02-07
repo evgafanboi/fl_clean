@@ -8,6 +8,9 @@ class FedMLB:
         self.lambda2 = lambda2
         self.temperature = temperature
     
+    def extra_log_tokens(self):
+        return {"lambda1": self.lambda1, "lambda2": self.lambda2, "temperature": self.temperature}
+    
     def aggregate(self, client_weights_list, sample_sizes=None):
         if not client_weights_list:
             raise ValueError("Cannot aggregate empty weights list")

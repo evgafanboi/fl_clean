@@ -65,13 +65,22 @@ def train_with_ssd_loss(
     m_max: float,
     num_classes: int,
     epochs: int,
+    pure_ssd: bool = True,
 ) -> None:
+    """
+    Train with selective self-distillation.
+    
+    Args:
+        pure_ssd: If True, only use SSD loss (no CE). For FedSSD1 variant.
+    """
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
     global_keras = global_model.model if hasattr(global_model, "model") else global_model
 
     optimizer = keras_model.optimizer or tf.keras.optimizers.Adam(learning_rate=0.001)
     keras_model.optimizer = optimizer
-    ce_loss_fn = keras_model.loss if hasattr(keras_model, "loss") else tf.keras.losses.CategoricalCrossentropy()
+    
+    if not pure_ssd:
+        ce_loss_fn = keras_model.loss if hasattr(keras_model, "loss") else tf.keras.losses.CategoricalCrossentropy()
 
     logits_layer = keras_model.get_layer("logits")
     logits_model = tf.keras.Model(inputs=keras_model.input, outputs=[logits_layer.output, keras_model.output])
@@ -85,8 +94,8 @@ def train_with_ssd_loss(
     def train_step(batch_X, batch_y):
         with tf.GradientTape() as tape:
             local_logits, predictions = logits_model(batch_X, training=True)
-            ce_loss = ce_loss_fn(batch_y, predictions)
-
+            
+            # Compute SSD loss
             global_logits = global_logits_model(batch_X, training=False)
             global_probs = tf.nn.softmax(global_logits)
 
@@ -97,19 +106,26 @@ def train_with_ssd_loss(
             p_g_k2 = tf.gather_nd(global_probs, indices)
             M_sample_expanded = tf.expand_dims(1.0 - tf.sqrt(tf.maximum(1.0 - p_g_k2, 0.0)), axis=1)
 
-            M = tf.nn.relu(m_max * M_class_expanded * M_sample_expanded - 0.1)
+            M = m_max * tf.nn.relu(M_class_expanded * M_sample_expanded - 0.1)
 
             logit_diff = M * (global_logits - local_logits)
             ssd_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logit_diff), axis=1))
 
-            total_loss = ce_loss + ssd_loss
+            # Total loss: CE + SSD or pure SSD
+            if pure_ssd:
+                total_loss = ssd_loss
+                ce_loss = tf.constant(0.0)
+            else:
+                ce_loss = ce_loss_fn(batch_y, predictions)
+                total_loss = ce_loss + ssd_loss
 
         gradients = tape.gradient(total_loss, keras_model.trainable_variables)
         optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
 
         return ce_loss, ssd_loss, total_loss
 
-    print(f"  Training with SSD loss (m_max={m_max:.2f}) for {epochs} epochs...")
+    mode_str = "pure SSD" if pure_ssd else "CE+SSD"
+    print(f"  Training with {mode_str} loss (m_max={m_max:.2f}) for {epochs} epochs...")
 
     for epoch in range(epochs):
         epoch_losses = tf.constant([0.0, 0.0, 0.0], dtype=tf.float32)
@@ -122,14 +138,20 @@ def train_with_ssd_loss(
 
         if num_batches > 0:
             avg_losses = epoch_losses / num_batches
-            print(
-                f"    Epoch {epoch + 1}/{epochs} - CE: {avg_losses[0]:.4f}, "
-                f"SSD: {avg_losses[1]:.4f}, Total: {avg_losses[2]:.4f}"
-            )
+            if pure_ssd:
+                print(f"    Epoch {epoch + 1}/{epochs} - SSD: {avg_losses[1]:.4f}")
+            else:
+                print(
+                    f"    Epoch {epoch + 1}/{epochs} - CE: {avg_losses[0]:.4f}, "
+                    f"SSD: {avg_losses[1]:.4f}, Total: {avg_losses[2]:.4f}"
+                )
 
 
 class FedSSD(DistillationStrategy):
     name = "FedSSD"
+
+    def extra_log_tokens(self) -> Dict[str, float]:
+        return {"m_max": self.config.m_max}
 
     def setup(self, context: PipelineContext) -> None:
         config = context.config
@@ -248,7 +270,7 @@ class FedSSD(DistillationStrategy):
             global_metrics["F1"],
             global_metrics["Precision"],
             global_metrics["Recall"],
-            global_metrics.get("Loss", 0.0),
+            global_metrics["Loss"],
         )
 
         round_metrics: Dict[int, Dict[str, float]] = {-1: global_metrics}
@@ -278,7 +300,7 @@ class FedSSD(DistillationStrategy):
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
         
         context.logger.info(
-            f"Round {round_number} summary - ClientLossAvg: 0.0000, GlobalLoss: {global_metrics.get('Loss', 0.0):.4f}"
+            f"Round {round_number} summary - GlobalLoss: {global_metrics['Loss']:.4f}"
         )
         log_timestamp(context.logger, f"--- Round {round_number} completed in {round_time:.2f}s ---")
         print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")

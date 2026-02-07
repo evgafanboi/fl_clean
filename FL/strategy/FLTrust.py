@@ -9,6 +9,9 @@ class FLTrust:
         self.requires_updates = True
         self.requires_root_dataset = True
     
+    def extra_log_tokens(self):
+        return {"root_iters": self.root_iterations}
+    
     def aggregate(self, client_updates_list, sample_sizes=None, global_update=None):
         g_0 = self._flatten_weights(global_update)
         client_updates_flat = [self._flatten_weights(g) for g in client_updates_list]

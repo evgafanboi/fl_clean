@@ -1,6 +1,6 @@
 from typing import Callable, Dict, Optional
 
-from models import dense, fedprox_wrapper, feddyn_wrapper, fedmlb_wrapper
+from models import dense, fedprox_wrapper, feddyn_wrapper, fedmlb_wrapper, lora_factory
 
 from .aggregators import StrategyRuntime
 
@@ -17,6 +17,8 @@ def _dense_builder(
 ):
     strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
 
+    if strategy_name == 'fedora':
+        return dense.create_dense_model(input_dim, num_classes, batch_size)
     if strategy_name == 'fedprox':
         return fedprox_wrapper.create_fedprox_dense_model(input_dim, num_classes, batch_size, strategy_runtime.client_strategy)
     if strategy_name == 'feddyn':

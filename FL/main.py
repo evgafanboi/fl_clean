@@ -1,43 +1,80 @@
 import argparse
+import os
+import warnings
+
+# Suppress all warnings before importing TensorFlow
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices=false'
+warnings.filterwarnings('ignore')
 
 from .pipeline import FLConfig, run_pipeline
 
 
-WEIGHT_AGGREGATION_STRATEGIES = {"FedAvg", "FedProx", "FedDyn", "FedCoMed", "RobustFilter", "DeepFed", "FLTrust"}
+WEIGHT_AGGREGATION_STRATEGIES = {"FedAvg", "FedProx", "FedDyn", "FedCoMed", "RobustFilter", "DeepFed", "FLTrust", "SecureAggregation", "FedKEESS", "FedSSD1", "FedSSDexp", "FedSSD2", "None"}
 DISTILLATION_STRATEGIES = {"FD", "FedDKD", "FedProto", "FedMD", "FedSSD", "SSFL-IDS"}
 ALL_STRATEGIES = sorted(WEIGHT_AGGREGATION_STRATEGIES | DISTILLATION_STRATEGIES)
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified Federated Learning Pipeline")
-    parser.add_argument("--n_clients", type=int, default=10, help="Number of clients to simulate")
-    parser.add_argument("--partition_type", type=str, default="iid-10", help="Partition descriptor, e.g., iid-10")
-    parser.add_argument("--rounds", type=int, default=10, help="Number of federated rounds")
     parser.add_argument(
         "--strategy",
         type=str,
         default="FedAvg",
         help=f"Strategy: {', '.join(ALL_STRATEGIES)}",
     )
+    
+    # feddyn
     parser.add_argument("--feddyn_alpha", type=float, default=0.1, help="FedDyn alpha (paper best at 0.1)")
+    # fedprox
+    parser.add_argument("--mu", type=float, default=0.01, help="FedProx proximal term")
+    # feddkd
+    parser.add_argument("--dkd_steps", type=int, default=3, help="DKD gradient steps per round (for FedDKD)")
+    parser.add_argument("--dkd_lr", type=float, default=0.001, help="Learning rate for DKD SGD updates (for FedDKD)")
+    # ssfl-ids
+    parser.add_argument("--dis_rounds", type=int, default=3, help="Discriminator rounds (SSFL-IDS)")
+    parser.add_argument("--dist_rounds", type=int, default=2, help="Distillation rounds (SSFL-IDS)")
+    # robust filter
+    parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (Byzantine ratio)")
+    parser.add_argument("--robust_tau", type=float, default=0.1, help="RobustFilter tau parameter")
+    # fedssd
+    parser.add_argument("--m_max", type=float, default=1.0, help="M_max value for FedSSD")
+    parser.add_argument("--support", action="store_true", help="Use support-weighted aggregation (FedSSD1/FedSSDexp)")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Voting threshold for FedSSD2 (0-1, votes/clients must exceed this), value should decrease along label skewness")
+    # fltrust
+    parser.add_argument("--root_iterations", type=int, default=1, help="Server training iterations on root dataset (for FLTrust)")
+    # fedmlb
+    parser.add_argument("--lambda1", type=float, default=1.0, help="Weight for hybrid CE loss (for FedMLB)")
+    parser.add_argument("--lambda2", type=float, default=1.0, help="Weight for KL divergence loss (for FedMLB)")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for KL divergence (for FedMLB)")
+    # fedora
+    parser.add_argument("--rank", type=int, default=8, help="LoRA rank (for FedoRA)")
+    # fedkeess
+    parser.add_argument("--k_clusters", type=int, default=3, help="Number of clusters/global models (for FedKEESS)")
+    parser.add_argument("--warmup_rounds", type=int, default=2, help="Warmup rounds before clustering (for FedKEESS)")
+
+
+    # distillation hyperparameters
+    parser.add_argument("--gamma", type=float, default=1.0, help="Distillation temperature / weighting factor (for FD, FedMD, FedProto)")
+    parser.add_argument("--data_calc", action="store_true", help="Enable extra data calculations (for distillation strategies)")
+
+    # global params
+    parser.add_argument("--n_clients", type=int, default=10, help="Number of clients to simulate")
+    parser.add_argument("--partition_type", type=str, default="iid-10", help="Partition descriptor, e.g., iid-10")
+    parser.add_argument("--rounds", type=int, default=10, help="Number of federated rounds")
+    parser.add_argument("--model", type=str, default="dense", help="Model architecture identifier (default: dense)")
+    parser.add_argument("--train_rounds", type=int, default=3, help="Training rounds for discriminator-based methods")
     parser.add_argument("--batch_size", type=int, default=8192, help="Minibatch size for local training")
     parser.add_argument("--epochs", type=int, default=5, help="Local epochs per round")
     parser.add_argument("--weights_cache_dir", type=str, default="temp_weights", help="Directory to cache client weights")
-    parser.add_argument("--mu", type=float, default=0.01, help="FedProx proximal term")
-    parser.add_argument("--adaptive_mu", action="store_true", help="Enable adaptive FedProx mu schedule")
-    parser.add_argument("--model", type=str, default="dense", help="Model architecture identifier (default: dense)")
-    parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (Byzantine ratio)")
-    parser.add_argument("--robust_tau", type=float, default=0.1, help="RobustFilter tau parameter")
-    parser.add_argument("--gamma", type=float, default=1.0, help="Distillation temperature / weighting factor (for distillation strategies)")
-    parser.add_argument("--data_calc", action="store_true", help="Enable extra data calculations (for distillation strategies)")
-    parser.add_argument("--m_max", type=float, default=1.0, help="Maximum momentum value for selective sampling")
-    parser.add_argument("--train_rounds", type=int, default=3, help="Training rounds for discriminator-based methods")
-    parser.add_argument("--dis_rounds", type=int, default=3, help="Discriminator rounds for SSFL-IDS")
-    parser.add_argument("--dist_rounds", type=int, default=2, help="Distillation rounds inside SSFL-IDS loop")
-    parser.add_argument("--theta", type=float, default=-1.0, help="Threshold parameter for selective sharing")
-    parser.add_argument("--dkd_steps", type=int, default=3, help="DKD gradient steps per round (for FedDKD)")
-    parser.add_argument("--dkd_lr", type=float, default=0.001, help="Learning rate for DKD SGD updates (for FedDKD)")
-    parser.add_argument("--personalized_eval", action="store_true", help="Evaluate individual client models in addition to global model")
+
+    # experimental info computation
+    parser.add_argument("--trust_score", action="store_true", help="Enable trust score logging (FLTrust cosine similarity) after local training")
+    parser.add_argument("--peer_trust", action="store_true", help="Enable peer trust score logging (cosine similarity with adjacent neighbors +-1)")
+    parser.add_argument("--personalized_eval", action="store_true", help="Evaluate individual client models in addition to global model (for FedMD, FD, FedProto)")
+    
+    # poisoning
     parser.add_argument(
         "--poison",
         nargs=3,
@@ -45,10 +82,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Poison config: <attack> <value> <ratio>, e.g., gradient_scale 10 0.5",
     )
-    parser.add_argument("--root_iterations", type=int, default=1, help="Server training iterations on root dataset (for FLTrust)")
-    parser.add_argument("--lambda1", type=float, default=1.0, help="Weight for hybrid CE loss (for FedMLB)")
-    parser.add_argument("--lambda2", type=float, default=1.0, help="Weight for KL divergence loss (for FedMLB)")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for KL divergence (for FedMLB)")
+
     return parser
 
 
@@ -84,7 +118,7 @@ def main(argv=None):
             train_rounds=args.train_rounds,
             dis_rounds=args.dis_rounds,
             dist_rounds=args.dist_rounds,
-            theta=args.theta,
+
             dkd_steps=args.dkd_steps,
             dkd_lr=args.dkd_lr,
             personalized_eval=args.personalized_eval,
@@ -104,7 +138,7 @@ def main(argv=None):
             epochs=args.epochs,
             weights_cache_dir=args.weights_cache_dir,
             mu=args.mu,
-            adaptive_mu=args.adaptive_mu,
+
             model=args.model,
             robust_epsilon=args.robust_epsilon,
             robust_tau=args.robust_tau,
@@ -113,7 +147,15 @@ def main(argv=None):
             lambda1=args.lambda1,
             lambda2=args.lambda2,
             temperature=args.temperature,
+            rank=args.rank,
             personalized_eval=args.personalized_eval,
+            trust_score=args.trust_score,
+            peer_trust=args.peer_trust,
+            k_clusters=args.k_clusters,
+            warmup_rounds=args.warmup_rounds,
+            m_max=args.m_max,
+            support=args.support,
+            threshold=args.threshold,
         )
         run_pipeline(config)
 

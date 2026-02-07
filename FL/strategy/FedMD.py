@@ -83,6 +83,9 @@ class FedMD(DistillationStrategy):
         self.revisit_epochs = config.epochs
         self.revisit_batch_fraction = 0.25
 
+    def extra_log_tokens(self) -> Dict[str, float]:
+        return {"gamma": self.config.gamma}
+
     def setup(self, context: PipelineContext) -> None:
         print(f"{COLORS.OKGREEN}Preparing FedMD with public data from client slices{COLORS.ENDC}")
         is_sequence = context.config.model_type.lower() == "gru"

@@ -26,6 +26,9 @@ class FedDyn(FedAvg):
         self.round_num = 0
         print(f"FedDyn initialized with alpha={self.alpha}")
 
+    def extra_log_tokens(self):
+        return {"alpha": self.alpha}
+
     def _zeros_like_weights(self, weights_list):
         return [np.zeros_like(w) for w in weights_list]
 

@@ -49,6 +49,9 @@ def evaluate_model(model: Any, test_dataset: tf.data.Dataset, reference_labels: 
     pred_labels = np.argmax(predictions, axis=1)
     true_labels = reference_labels[:len(pred_labels)]
     
+    y_true_onehot = tf.keras.utils.to_categorical(true_labels, predictions.shape[1])
+    loss = float(-np.mean(np.sum(y_true_onehot * np.log(np.clip(predictions, 1e-7, 1.0)), axis=1)))
+    
     accuracy = float(np.mean(pred_labels == true_labels))
     f1 = float(f1_score(true_labels, pred_labels, average="macro", zero_division=0))
     precision = float(precision_score(true_labels, pred_labels, average="macro", zero_division=0))
@@ -59,4 +62,5 @@ def evaluate_model(model: Any, test_dataset: tf.data.Dataset, reference_labels: 
         "F1": f1,
         "Precision": precision,
         "Recall": recall,
+        "Loss": loss,
     }

@@ -106,18 +106,20 @@ def distill_knowledge(
             batches += 1
         if batches > 0:
             print(f"    Distillation epoch {epoch + 1}/{epochs} - MAE {epoch_loss / batches:.4f}")
+    
+    del dataset
+    tf.keras.backend.clear_session()
 
 
 def train_discriminator(
     classify_model,
     discri_model,
     open_feature: np.ndarray,
-    theta: float,
     dis_rounds: int,
     batch_size: int,
     num_classes: int,
     private_X_path: str,
-) -> Tuple[bool, float]:
+) -> bool:
     logits_model = classify_model.get_logits_model() if hasattr(classify_model, "get_logits_model") else classify_model
 
     logits_batches: List[np.ndarray] = []
@@ -133,14 +135,13 @@ def train_discriminator(
     max_probs = np.max(dis_logits, axis=1)
     del logits_batches
 
-    if theta < 0:
-        theta = float(np.median(max_probs))
+    theta = float(np.median(max_probs))
 
     sure_unknown_mask = max_probs < theta
     sure_unknown_feature = open_feature[sure_unknown_mask]
 
     if sure_unknown_feature.size == 0:
-        return False, theta
+        return False
 
     X_mmap = np.load(private_X_path, mmap_mode="r")
     sure_known_feature = np.array(X_mmap[: len(sure_unknown_feature)], dtype=np.float32)
@@ -160,11 +161,14 @@ def train_discriminator(
     for _ in range(dis_rounds):
         discri_model.fit(dataset, epochs=1, verbose=0)
 
-    return True, theta
+    return True
 
 
 class SSFLIDS(DistillationStrategy):
     name = "SSFL-IDS"
+
+    def extra_log_tokens(self) -> Dict[str, float]:
+        return {"dis_rounds": self.config.dis_rounds, "dist_rounds": self.config.dist_rounds}
 
     def setup(self, context: PipelineContext) -> None:
         config = context.config
@@ -250,11 +254,10 @@ class SSFLIDS(DistillationStrategy):
                 aggressive_memory_cleanup()
                 continue
 
-            success, theta = train_discriminator(
+            success = train_discriminator(
                 state.model,
                 state.data["discriminator"],
                 open_feature,
-                config.theta,
                 config.dis_rounds,
                 config.batch_size,
                 context.num_classes,
@@ -305,6 +308,9 @@ class SSFLIDS(DistillationStrategy):
         print(f"\n{COLORS.HEADER}Round {round_number} Stage II{COLORS.ENDC}")
         global_labels = hard_label_vote(all_client_hard_labels, context.num_classes)
         global_logits = tf.keras.utils.to_categorical(global_labels, num_classes=context.num_classes).astype(np.float32)
+        
+        del all_client_hard_labels, global_labels
+        aggressive_memory_cleanup()
 
         for state in context.client_states:
             print(f"Client {state.client_id}: distillation on public data")
@@ -315,6 +321,7 @@ class SSFLIDS(DistillationStrategy):
                 config.dist_rounds,
                 config.batch_size,
             )
+            aggressive_memory_cleanup()
 
         print(f"Server distillation")
         distill_knowledge(
@@ -324,7 +331,8 @@ class SSFLIDS(DistillationStrategy):
             config.dist_rounds,
             config.batch_size,
         )
-
+        
+        del global_logits, open_feature
         aggressive_memory_cleanup()
 
         server_metrics = evaluate_model(server_model, context.test_dataset, context.test_labels)

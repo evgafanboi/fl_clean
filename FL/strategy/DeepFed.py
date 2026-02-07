@@ -14,6 +14,9 @@ class DeepFed:
         self.public_key, self.private_key = paillier.generate_paillier_keypair(n_length=key_length)
         print("Keypair generated and distributed to clients")
     
+    def extra_log_tokens(self):
+        return {"key_len": self.key_length}
+    
     def aggregate(self, model_weights_list, sample_sizes=None):
         if sample_sizes is None:
             sample_sizes = [1] * len(model_weights_list)

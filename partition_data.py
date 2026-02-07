@@ -16,8 +16,8 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--partition_type", type=str, choices=["iid", "label_skew"], 
                        default="iid", help="Partitioning strategy")
-    parser.add_argument("--alpha", type=float, default=0.5, help="Dirichlet alpha for label_skew")
-    parser.add_argument("--public_ratio", type=float, default=0.285, help="Fraction of training data as public dataset")
+    parser.add_argument("--alpha", type=float, default=0.1, help="Dirichlet alpha for label_skew")
+    parser.add_argument("--public_ratio", type=float, default=0.285, help="Fraction of training data as public dataset, at default, the total public set is 10% of the entire dataset")
     return parser.parse_args()
 
 def sample_dirichlet_counts(n_samples, n_clients, alpha, rng):
@@ -36,7 +36,7 @@ def sample_dirichlet_counts(n_samples, n_clients, alpha, rng):
 def main():
     args = parse_arguments()
     n_clients = args.n_clients
-    class_pkls = sorted(glob.glob(os.path.join("data/CIC23", "*_label*.pkl")))
+    class_pkls = sorted(glob.glob(os.path.join("data/CIC23", "*_label*.pkl"))) # folder containing class-wise data files, change for other dataset
     partition_type = args.partition_type
     
     if partition_type == "label_skew":

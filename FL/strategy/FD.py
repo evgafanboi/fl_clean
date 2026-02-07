@@ -199,6 +199,9 @@ def local_training_with_distillation(
 class FederatedDistillation(DistillationStrategy):
     name = "FD"
 
+    def extra_log_tokens(self) -> Dict[str, float]:
+        return {"gamma": self.config.gamma}
+
     def setup(self, context: PipelineContext) -> None:
         print(f"{COLORS.OKGREEN}Using FULL test set{COLORS.ENDC}")
 

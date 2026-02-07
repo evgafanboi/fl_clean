@@ -1,10 +1,22 @@
+import os
 import tensorflow as tf
 
 from .colors import COLORS
 
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices=false'
+tf.get_logger().setLevel('ERROR')
+tf.autograph.set_verbosity(0)
+
 
 def configure_gpu_memory() -> None:
     """Configure TensorFlow GPU memory growth if GPUs are available."""
+    import warnings
+    warnings.filterwarnings('ignore')
+    
     gpus = tf.config.experimental.list_physical_devices('GPU')
     if not gpus:
         return
