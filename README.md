@@ -85,7 +85,9 @@ python3 -m FL --n_clients 10 --partition_type label_skew-10 --strategy FedSSD
 
 ### Poisoning
 
-- To run **label flipping** poisoning, add `--poison label_flip-<ratio>` to the simulation, with `ratio` being `0.1` to `1.0` determining the proportion of clients to be poisoned. Selected clients for poisoning are randomized in the first run and their IDs are stored under `results/poison_history` for subsequent re-runs within the same partition type.
+- To run **label flipping** poisoning, add `--poison label_flip-<ratio>` to the simulation, with `ratio` being `0.1` to `1.0` determining the ratio of clients to be poisoned. 
+
+- Client selection for poisoning are randomized in the first run and the chosen IDs are stored under `results/poison_history` for reproducibility. For example, all simulation runs that use the partition type `label_skew_0.1`, `10 clients` share the same randomized poisoning client selection.
 
 ---
 
@@ -154,5 +156,7 @@ python -m FCIL --n_clients <> --partition_type <> --strategy <> --rounds <> --ci
 Part of this implementation are adapted from:
 - [GLFC](https://github.com/conditionWang/FCIL)
 - [FOSTER](https://github.com/G-U-N/ECCV22-FOSTER)
-- [FL papers repo](https://github.com/mwan0027/FederatedDistill)
+
+Paper compilation:
+- [Awesome-FL](https://youngfish42.github.io/Awesome-FL/)
 
