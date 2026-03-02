@@ -14,10 +14,18 @@ class FCILConfig:
     
     # CIL settings
     cil_method: str = "finetune"
-    ewc_lambda: float = 5000.0
+    ewc_lambda: float = 50.0
+    lwf_alpha: float = 0.5
+    lwf_temperature: float = 2.0
+    icarl_memory: int = 2000
+    icarl_bce: bool = False
+    foster_beta1: float = 0.97
+    foster_beta2: float = 0.97
+    foster_lambda_okd: float = 1.0
+    foster_compression_epochs: int = 50
     
     # Data settings
-    partition_type: str = "label_skew"
+    partition_type: str = "label_skew_0.1"
     partition_root: str = "data/partitions"
     task_order_file: str = ""
     
@@ -28,3 +36,13 @@ class FCILConfig:
     
     # Logging
     log_file: str = ""
+    
+    # BiC settings
+    bic_val_split: float = 0.1
+
+    # GLFC settings
+    glfc_encoder_epochs: int = 50
+    glfc_model_selection: bool = True
+
+    # SSD settings
+    m_max: float = 1.0

@@ -116,3 +116,51 @@ class EWC(CILMethod):
             "ewc_lambda": self.ewc_lambda,
             "protected_tasks": len(self.fisher_dict)
         }
+
+    def get_ssd_train_step(self, model, optimizer, loss_fn,
+                           global_logits_model, local_logits_model,
+                           M_class_tf, m_max_tf):
+        keras_model = model.model if hasattr(model, 'model') else model
+        ewc_lambda = self.ewc_lambda
+        fisher_dict = self.fisher_dict
+        optimal_weights = self.optimal_weights
+
+        @tf.function(reduce_retracing=True)
+        def train_step_ewc_ssd(batch_X, batch_y):
+            with tf.GradientTape() as tape:
+                predictions = keras_model(batch_X, training=True)
+                ce_loss = loss_fn(batch_y, predictions)
+
+                ewc_loss = 0.0
+                for task_id in fisher_dict:
+                    for i, var in enumerate(keras_model.trainable_variables):
+                        fisher = fisher_dict[task_id][i]
+                        optimal = optimal_weights[task_id][i]
+                        ewc_loss += tf.reduce_sum(
+                            tf.cast(fisher, tf.float32) * tf.square(var - optimal))
+
+                local_logits = local_logits_model(batch_X, training=True)
+                global_logits = global_logits_model(batch_X, training=False)
+                global_probs = tf.nn.softmax(global_logits)
+                true_labels = tf.cast(tf.argmax(batch_y, axis=1), tf.int32)
+                batch_size = tf.shape(batch_y)[0]
+                indices = tf.stack([tf.range(batch_size), true_labels], axis=1)
+                p_g_k2 = tf.gather_nd(global_probs, indices)
+                M_sample = tf.expand_dims(
+                    1.0 - tf.sqrt(tf.maximum(1.0 - p_g_k2, 0.0)), axis=1)
+                M = m_max_tf * tf.nn.relu(M_class_tf * M_sample - 0.1)
+                logit_diff = M * (global_logits - local_logits)
+                ssd_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logit_diff), axis=1))
+
+                total_loss = ce_loss + ewc_lambda * ewc_loss + ssd_loss
+            gradients = tape.gradient(total_loss, keras_model.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+            return ce_loss, ssd_loss, total_loss
+
+        if len(fisher_dict) == 0:
+            from .finetune import Finetune
+            ft = Finetune(num_classes=self.num_classes)
+            return ft.get_ssd_train_step(model, optimizer, loss_fn,
+                                         global_logits_model, local_logits_model,
+                                         M_class_tf, m_max_tf)
+        return train_step_ewc_ssd

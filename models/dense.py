@@ -1,7 +1,10 @@
+import gc
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras import backend as K
+from tensorflow.keras.utils import register_keras_serializable
 
+@register_keras_serializable()
 def recall_m(y_true, y_pred):
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
@@ -10,6 +13,7 @@ def recall_m(y_true, y_pred):
     recall = true_positives / (possible_positives + K.epsilon())
     return recall
 
+@register_keras_serializable()
 def precision_m(y_true, y_pred):
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
@@ -18,6 +22,7 @@ def precision_m(y_true, y_pred):
     precision = true_positives / (predicted_positives + K.epsilon())
     return precision
 
+@register_keras_serializable()
 def f1_m(y_true, y_pred):
     precision = precision_m(y_true, y_pred)
     recall = recall_m(y_true, y_pred)
@@ -42,6 +47,8 @@ class DenseModel:
         
         # Create the Dense model
         self.model = self._create_dense_model()
+        self._logits_model = None
+        self._feature_model = None
     
     def _create_dense_model(self):
         """Create dense model with architecture matching GRU principles"""
@@ -186,9 +193,38 @@ class DenseModel:
         self.model.set_weights(weights)
     
     def get_logits_model(self):
-        logits_layer = self.model.get_layer('logits')
-        logits_model = tf.keras.Model(inputs=self.model.input, outputs=logits_layer.output)
-        return logits_model
+        if self._logits_model is None:
+            logits_layer = self.model.get_layer('logits')
+            self._logits_model = tf.keras.Model(inputs=self.model.input, outputs=logits_layer.output)
+        return self._logits_model
+
+    def get_feature_model(self):
+        if self._feature_model is None:
+            feature_layer = self.model.get_layer('dense_3')
+            self._feature_model = tf.keras.Model(inputs=self.model.input, outputs=feature_layer.output)
+        return self._feature_model
+
+    def expand_classes(self, new_num_classes):
+        if new_num_classes <= self.num_classes:
+            return
+        old_model = self.model
+        old_num = self.num_classes
+        self.num_classes = new_num_classes
+        self.model = self._create_dense_model()
+        self._logits_model = None
+        self._feature_model = None
+        old_layers = {layer.name: layer for layer in old_model.layers}
+        for layer in self.model.layers:
+            if layer.name == 'logits':
+                old_kernel, old_bias = old_layers['logits'].get_weights()
+                new_kernel, new_bias = layer.get_weights()
+                new_kernel[:, :old_num] = old_kernel
+                new_bias[:old_num] = old_bias
+                layer.set_weights([new_kernel, new_bias])
+            elif layer.name in old_layers and layer.get_weights():
+                layer.set_weights(old_layers[layer.name].get_weights())
+        del old_model, old_layers
+        gc.collect()
 
 def create_enhanced_dense_model(input_dim, num_classes, batch_size=4096, learning_rate=None):
     """Create enhanced dense model that matches GRU performance"""

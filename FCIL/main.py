@@ -38,7 +38,7 @@ def main():
     
     # FL settings
     parser.add_argument('--strategy', type=str, default='FedAvg',
-                        choices=['FedAvg', 'Centralized', 'FedCoMed'],
+                        choices=['FedAvg', 'Centralized', 'FedCoMed', 'FedSSD'],
                         help='FL aggregation strategy')
     parser.add_argument('--n_clients', type=int, default=10,
                         help='Number of clients')
@@ -47,10 +47,32 @@ def main():
     
     # CIL settings
     parser.add_argument('--cil', type=str, default='finetune',
-                        choices=['finetune', 'ewc'],
+                        choices=['finetune', 'ewc', 'lwf', 'icarl', 'bic', 'foster', 'glfc'],
                         help='CIL method')
-    parser.add_argument('--ewc_lambda', type=float, default=1.0,
+    parser.add_argument('--ewc_lambda', type=float, default=10.0,
                         help='EWC regularization strength (normalized, typical range: 0.1-10)')
+    parser.add_argument('--lwf_alpha', type=float, default=0.5,
+                        help='LwF distillation weight')
+    parser.add_argument('--lwf_temperature', type=float, default=2.0,
+                        help='LwF distillation temperature')
+    parser.add_argument('--memory', type=int, default=200,
+                        help='iCaRL/BiC/FOSTER total memory budget K')
+    parser.add_argument('--bce', action='store_true',
+                        help='Use iCaRL BCE loss (paper default)')
+    parser.add_argument('--beta1', type=float, default=0.97,
+                        help='FOSTER beta1 for Stage 1 effective number')
+    parser.add_argument('--beta2', type=float, default=0.97,
+                        help='FOSTER beta2 for Stage 2 effective number')
+    parser.add_argument('--lambda_okd', type=float, default=1.0,
+                        help='FOSTER KD loss weight')
+    parser.add_argument('--compression_epochs', type=int, default=50,
+                        help='FOSTER Stage 2 compression epochs')
+    parser.add_argument('--bic_val_split', type=float, default=0.1,
+                        help='BiC fraction of each class reserved for bias correction validation')
+    parser.add_argument('--encoder_epochs', type=int, default=50,
+                        help='GLFC: perturbation optimisation epochs for proto samples')
+    parser.add_argument('--model_selection', action='store_true',
+                        help='GLFC: enable proxy-server model selection via DLG')
     
     # Data settings
     parser.add_argument('--partition_type', type=str, required=True,
@@ -65,9 +87,18 @@ def main():
                         help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=5,
                         help='Epochs per round')
+    parser.add_argument('--m_max', type=float, default=1.0,
+                        help='SSD maximum distillation weight (only used with --strategy FedSSD)')
     
     args = parser.parse_args()
-    
+
+    # GLFC is monolithic: warn and override incompatible strategies
+    if args.cil == 'glfc' and args.strategy != 'FedAvg':
+        from .colors import COLORS as _C
+        print(f"{_C.FAIL}Incompatible command for GLFC: --strategy {args.strategy}. "
+              f"GLFC is monolithic and uses its own FedAvg. Ignoring.{_C.ENDC}")
+        args.strategy = 'FedAvg'
+
     # Auto-detect task order file if not specified
     if not args.task_order:
         task_order_file = find_task_order_file(args.partition_type, args.n_clients)
@@ -88,6 +119,29 @@ def main():
     parts = [args.strategy, args.cil, f"{args.n_clients}client", args.partition_type, task_size_token]
     if args.cil == 'ewc':
         parts.append(f"lambda{args.ewc_lambda}")
+    if args.cil == 'lwf':
+        parts.append(f"alpha{args.lwf_alpha}")
+        parts.append(f"temp{args.lwf_temperature}")
+    if args.cil == 'icarl':
+        parts.append(f"mem{args.memory}")
+        parts.append(f"bce{int(args.bce)}")
+    if args.cil == 'bic':
+        parts.append(f"mem{args.memory}")
+        parts.append(f"alpha{args.lwf_alpha}")
+        parts.append(f"temp{args.lwf_temperature}")
+        parts.append(f"val{args.bic_val_split}")
+    if args.cil == 'foster':
+        parts.append(f"mem{args.memory}")
+        parts.append(f"b1_{args.beta1}")
+        parts.append(f"b2_{args.beta2}")
+        parts.append(f"okd{args.lambda_okd}")
+    if args.cil == 'glfc':
+        parts.append(f"mem{args.memory}")
+        parts.append(f"enc{args.encoder_epochs}")
+        if args.model_selection:
+            parts.append("msel")
+    if args.strategy == 'FedSSD':
+        parts.append(f"ssd{args.m_max}")
     log_file = f"results_cil/{'_'.join(parts)}.log"
     
     config = FCILConfig(
@@ -96,6 +150,16 @@ def main():
         rounds_per_task=args.rounds,
         cil_method=args.cil,
         ewc_lambda=args.ewc_lambda,
+        lwf_alpha=args.lwf_alpha,
+        lwf_temperature=args.lwf_temperature,
+        icarl_memory=args.memory,
+        icarl_bce=args.bce,
+        foster_beta1=args.beta1,
+        foster_beta2=args.beta2,
+        foster_lambda_okd=args.lambda_okd,
+        foster_compression_epochs=args.compression_epochs,
+        glfc_encoder_epochs=args.encoder_epochs,
+        glfc_model_selection=args.model_selection,
         partition_type=args.partition_type,
         partition_root=partition_root,
         task_order_file=task_order_file,
@@ -103,6 +167,8 @@ def main():
         batch_size=args.batch_size,
         epochs_per_round=args.epochs,
         log_file=log_file,
+        bic_val_split=args.bic_val_split,
+        m_max=args.m_max,
     )
     
     run_fcil_pipeline(config)

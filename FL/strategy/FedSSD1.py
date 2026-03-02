@@ -178,5 +178,4 @@ class FedSSD1:
             m_max=self.m_max,
             num_classes=num_classes,
             epochs=epochs,
-            pure_ssd=False,
         )
