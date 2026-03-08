@@ -15,6 +15,7 @@ class FCILConfig:
     # CIL settings
     cil_method: str = "finetune"
     ewc_lambda: float = 50.0
+    mas_lambda: float = 1.0
     lwf_alpha: float = 0.5
     lwf_temperature: float = 2.0
     icarl_memory: int = 2000
@@ -43,6 +44,7 @@ class FCILConfig:
     # GLFC settings
     glfc_encoder_epochs: int = 50
     glfc_model_selection: bool = True
+    glfc_grad_enc: str = "main"
 
     # SSD settings
     m_max: float = 1.0

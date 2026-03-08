@@ -42,16 +42,18 @@ def main():
                         help='FL aggregation strategy')
     parser.add_argument('--n_clients', type=int, default=10,
                         help='Number of clients')
-    parser.add_argument('--rounds', type=int, default=10,
+    parser.add_argument('--rounds', type=int, default=3,
                         help='Rounds per task')
     
     # CIL settings
     parser.add_argument('--cil', type=str, default='finetune',
-                        choices=['finetune', 'ewc', 'lwf', 'icarl', 'bic', 'foster', 'glfc'],
+                        choices=['finetune', 'ewc', 'mas', 'lwf', 'icarl', 'bic', 'foster', 'glfc'],
                         help='CIL method')
     parser.add_argument('--ewc_lambda', type=float, default=10.0,
                         help='EWC regularization strength (normalized, typical range: 0.1-10)')
-    parser.add_argument('--lwf_alpha', type=float, default=0.5,
+    parser.add_argument('--mas_lambda', type=float, default=1.0,
+                        help='MAS regularization strength')
+    parser.add_argument('--lwf_alpha', type=float, default=0.001,
                         help='LwF distillation weight')
     parser.add_argument('--lwf_temperature', type=float, default=2.0,
                         help='LwF distillation temperature')
@@ -67,12 +69,15 @@ def main():
                         help='FOSTER KD loss weight')
     parser.add_argument('--compression_epochs', type=int, default=50,
                         help='FOSTER Stage 2 compression epochs')
-    parser.add_argument('--bic_val_split', type=float, default=0.1,
+    parser.add_argument('--bic_val_split', type=float, default=0.4,
                         help='BiC fraction of each class reserved for bias correction validation')
     parser.add_argument('--encoder_epochs', type=int, default=50,
                         help='GLFC: perturbation optimisation epochs for proto samples')
     parser.add_argument('--model_selection', action='store_true',
                         help='GLFC: enable proxy-server model selection via DLG')
+    parser.add_argument('--grad_enc', type=str, default='small',
+                        choices=['small', 'medium', 'main'],
+                        help='GLFC: gradient encoder size (small=64, medium=128, main=mirror DenseModel)')
     
     # Data settings
     parser.add_argument('--partition_type', type=str, required=True,
@@ -109,16 +114,16 @@ def main():
             print(f"Error: Task order file not found: {task_order_file}")
             sys.exit(1)
     
-    # Partition root follows FL convention
     partition_root = "data/partitions"
     
     # Extract task size from task_order filename for logging
     task_size_token = Path(task_order_file).stem.split('_')[-2]  # e.g., "5.0" from "..._5.0_task"
     
-    # Build log filename similar to FL
     parts = [args.strategy, args.cil, f"{args.n_clients}client", args.partition_type, task_size_token]
     if args.cil == 'ewc':
         parts.append(f"lambda{args.ewc_lambda}")
+    if args.cil == 'mas':
+        parts.append(f"lambda{args.mas_lambda}")
     if args.cil == 'lwf':
         parts.append(f"alpha{args.lwf_alpha}")
         parts.append(f"temp{args.lwf_temperature}")
@@ -135,11 +140,13 @@ def main():
         parts.append(f"b1_{args.beta1}")
         parts.append(f"b2_{args.beta2}")
         parts.append(f"okd{args.lambda_okd}")
+        parts.append(f"ce{args.compression_epochs}")
     if args.cil == 'glfc':
         parts.append(f"mem{args.memory}")
         parts.append(f"enc{args.encoder_epochs}")
         if args.model_selection:
             parts.append("msel")
+            parts.append(f"ge_{args.grad_enc}")
     if args.strategy == 'FedSSD':
         parts.append(f"ssd{args.m_max}")
     log_file = f"results_cil/{'_'.join(parts)}.log"
@@ -150,6 +157,7 @@ def main():
         rounds_per_task=args.rounds,
         cil_method=args.cil,
         ewc_lambda=args.ewc_lambda,
+        mas_lambda=args.mas_lambda,
         lwf_alpha=args.lwf_alpha,
         lwf_temperature=args.lwf_temperature,
         icarl_memory=args.memory,
@@ -160,6 +168,7 @@ def main():
         foster_compression_epochs=args.compression_epochs,
         glfc_encoder_epochs=args.encoder_epochs,
         glfc_model_selection=args.model_selection,
+        glfc_grad_enc=args.grad_enc,
         partition_type=args.partition_type,
         partition_root=partition_root,
         task_order_file=task_order_file,

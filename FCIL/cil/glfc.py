@@ -18,21 +18,43 @@ def _batched_predict(model, X, batch_size=PRED_BATCH):
     return np.concatenate(parts, axis=0)
 
 
-class GradientEncoder:
-    """Small MLP encoder for gradient sharing (replaces LeNet for tabular).
-    input_dim -> 64 (sigmoid) -> 64 (sigmoid) -> num_classes.
-    Uniform init [-0.5, 0.5] matching original."""
+def _uniform_init(model):
+    for layer in model.layers:
+        w = layer.get_weights()
+        if w:
+            layer.set_weights([np.random.uniform(-0.5, 0.5, s.shape).astype(np.float32) for s in w])
 
-    def __init__(self, input_dim, num_classes):
+
+class GradientEncoder:
+    """Encoder for gradient sharing. Architecture set by `grad_enc`:
+      small  — input_dim -> 64 -> 64 -> num_classes  (sigmoid, uniform init)
+      medium — input_dim -> 128 -> 128 -> num_classes (sigmoid, uniform init)
+      main   — mirrors DenseModel backbone (LN+swish+dropout+residual)"""
+
+    def __init__(self, input_dim, num_classes, grad_enc="main"):
         inputs = tf.keras.layers.Input(shape=(input_dim,))
-        x = tf.keras.layers.Dense(64, activation='sigmoid', name='enc_1')(inputs)
-        x = tf.keras.layers.Dense(64, activation='sigmoid', name='enc_2')(x)
+        if grad_enc == "small":
+            x = tf.keras.layers.Dense(64, activation='sigmoid', name='enc_1')(inputs)
+            x = tf.keras.layers.Dense(64, activation='sigmoid', name='enc_2')(x)
+        elif grad_enc == "medium":
+            x = tf.keras.layers.Dense(128, activation='sigmoid', name='enc_1')(inputs)
+            x = tf.keras.layers.Dense(128, activation='sigmoid', name='enc_2')(x)
+        else:  # main — mirror DenseModel
+            x = tf.keras.layers.LayerNormalization()(inputs)
+            x = tf.keras.layers.Dense(128, activation='swish', name='enc_1')(x)
+            x = tf.keras.layers.LayerNormalization()(x)
+            x = tf.keras.layers.Dropout(0.15)(x)
+            residual = x
+            x = tf.keras.layers.Dense(128, activation='swish', name='enc_2')(x)
+            x = tf.keras.layers.LayerNormalization()(x)
+            x = tf.keras.layers.Dropout(0.2)(x)
+            x = tf.keras.layers.add([x, residual])
+            x = tf.keras.layers.Dense(64, activation='swish', name='enc_3')(x)
+            x = tf.keras.layers.LayerNormalization()(x)
+            x = tf.keras.layers.Dropout(0.15)(x)
         outputs = tf.keras.layers.Dense(num_classes, name='enc_out')(x)
         self.model = tf.keras.Model(inputs, outputs)
-        for layer in self.model.layers:
-            w = layer.get_weights()
-            if w:
-                layer.set_weights([np.random.uniform(-0.5, 0.5, s.shape).astype(np.float32) for s in w])
+        _uniform_init(self.model)
 
 
 class ProxyServer:
@@ -95,7 +117,7 @@ class ProxyServer:
                 [self.proto_labels, np.array(new_labels, dtype=np.int64)], axis=0)
         gc.collect()
 
-    def evaluate_model(self, model, label_map):
+    def evaluate_model(self, model):
         if self.proto_data.shape[0] == 0:
             return 0.0
         keras_model = model.model if hasattr(model, 'model') else model
@@ -104,15 +126,14 @@ class ProxyServer:
             chunk = self.proto_data[i:i+PRED_BATCH]
             labs = self.proto_labels[i:i+PRED_BATCH]
             preds = tf.argmax(keras_model(chunk, training=False), axis=1).numpy()
-            mapped = np.vectorize(lambda x: label_map.get(x, x))(labs) if label_map else labs
-            correct += np.sum(preds == mapped)
+            correct += np.sum(preds == labs)
             total += len(labs)
         return correct / total if total > 0 else 0.0
 
-    def update(self, global_model, pool_grad, label_map):
+    def update(self, global_model, pool_grad):
         if pool_grad:
             self.reconstruct(pool_grad)
-        perf = self.evaluate_model(global_model, label_map)
+        perf = self.evaluate_model(global_model)
         if perf >= self.best_perf:
             self.best_perf = perf
             self.best_model_weights = [w.copy() for w in global_model.get_weights()]
@@ -131,12 +152,14 @@ class GLFC(CILMethod):
     gradient-leaked proto samples (encoder + DLG reconstruction)."""
 
     def __init__(self, num_classes: int, memory: int = 2000,
-                 encoder_epochs: int = 50, model_selection: bool = True, **kwargs):
+                 encoder_epochs: int = 50, model_selection: bool = True,
+                 grad_enc: str = "main", **kwargs):
         super().__init__(num_classes)
         self.name = "GLFC"
         self.memory = memory
         self.encoder_epochs = encoder_epochs
         self.model_selection = model_selection
+        self.grad_enc = grad_enc
         self.class_order = []
         self.label_map = {}
         self.current_task_classes = []
@@ -185,7 +208,7 @@ class GLFC(CILMethod):
         if not self.model_selection or self.encoder is not None:
             return
         self.input_dim = input_dim
-        self.encoder = GradientEncoder(input_dim, self.num_classes)
+        self.encoder = GradientEncoder(input_dim, self.num_classes, self.grad_enc)
         self.proxy_server = ProxyServer(input_dim, self.num_classes, self.encoder)
 
     def map_labels_np(self, y):
@@ -312,7 +335,7 @@ class GLFC(CILMethod):
         if not self.model_selection or self.proxy_server is None or self.current_task == 0:
             self.proto_grad_pool = []
             return None
-        perf = self.proxy_server.update(global_model, self.proto_grad_pool, self.label_map)
+        perf = self.proxy_server.update(global_model, self.proto_grad_pool)
         self.proto_grad_pool = []
         return perf
 

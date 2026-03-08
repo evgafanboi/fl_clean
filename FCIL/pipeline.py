@@ -184,6 +184,9 @@ def run_fcil_pipeline(config: FCILConfig):
     elif config.cil_method == "ewc":
         from .cil.ewc import EWC
         cil_method = EWC(num_classes=num_classes, ewc_lambda=config.ewc_lambda)
+    elif config.cil_method == "mas":
+        from .cil.mas import MAS
+        cil_method = MAS(num_classes=num_classes, mas_lambda=config.mas_lambda)
     elif config.cil_method == "lwf":
         from .cil.lwf import LwF
         cil_method = LwF(num_classes=num_classes, alpha=config.lwf_alpha, temperature=config.lwf_temperature)
@@ -206,7 +209,8 @@ def run_fcil_pipeline(config: FCILConfig):
         from .cil.glfc import GLFC
         cil_method = GLFC(num_classes=num_classes, memory=config.icarl_memory,
                           encoder_epochs=config.glfc_encoder_epochs,
-                          model_selection=config.glfc_model_selection)
+                          model_selection=config.glfc_model_selection,
+                          grad_enc=config.glfc_grad_enc)
     
     # Initialize global model
     initial_classes = len(task_order[0]) if config.cil_method in ["lwf", "icarl", "bic", "foster", "glfc"] else num_classes
@@ -309,6 +313,19 @@ def run_fcil_pipeline(config: FCILConfig):
             for client_id in range(n_clients):
                 if hasattr(cil_method, "set_client"):
                     cil_method.set_client(client_id)
+
+                # EWC/MAS: per-client importance → rebuild train step each client
+                if config.cil_method in ("ewc", "mas"):
+                    if ssd_train_step is not None:
+                        local_logits_model = client_model.get_logits_model()
+                        active_train_step = cil_method.get_ssd_train_step(
+                            client_model, client_model.model.optimizer, client_model.model.loss,
+                            global_logits_model, local_logits_model,
+                            M_class_tf, m_max_tf)
+                    else:
+                        active_train_step = cil_method.get_train_step(
+                            client_model, client_model.model.optimizer, client_model.model.loss)
+
                 # Load task data
                 paths = get_task_files(
                     config.partition_root, config.partition_type,
@@ -332,6 +349,15 @@ def run_fcil_pipeline(config: FCILConfig):
                 
                 client_weights.append(client_model.get_weights())
                 sample_sizes.append(n_samples)
+
+                # EWC/MAS: compute per-client importance at last round of each task
+                if (config.cil_method in ("ewc", "mas")
+                        and round_num == config.rounds_per_task - 1
+                        and task_id < num_tasks - 1):
+                    imp_dataset, _ = create_dataset(
+                        paths['X'], paths['y'], config.batch_size, current_classes, label_map)
+                    cil_method.after_task(client_model, imp_dataset)
+                    del imp_dataset
 
                 # GLFC: collect proto gradients after client trains
                 if hasattr(cil_method, "collect_proto_gradients"):
@@ -462,16 +488,7 @@ def run_fcil_pipeline(config: FCILConfig):
         del client_model, cached_train_step
         gc.collect()
         
-        # After task: compute Fisher (for EWC)
-        if task_id < num_tasks - 1 and config.cil_method == "ewc":
-            paths = get_task_files(
-                config.partition_root, config.partition_type,
-                config.n_clients, 0, task_id, config.strategy
-            )
-            task_dataset, _ = create_dataset(paths['X'], paths['y'], config.batch_size, num_classes)
-            cil_method.after_task(global_model, task_dataset)
-            del task_dataset
-            gc.collect()
+        # EWC/MAS importance now computed per-client inside the client loop above
     
     log(f"{COLORS.OKGREEN}Pipeline completed!{COLORS.ENDC}", "Pipeline completed!")
     
