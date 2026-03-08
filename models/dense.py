@@ -29,7 +29,7 @@ def f1_m(y_true, y_pred):
     return 2*((precision*recall)/(precision+recall+K.epsilon()))
 
 class DenseModel:
-    """Enhanced Dense Model matching GRU's architectural principles"""
+    """Enhanced Dense Model (MLP)"""
     
     def __init__(self, input_dim, num_classes, batch_size=4096, learning_rate=None):
         self.input_dim = input_dim
@@ -51,22 +51,20 @@ class DenseModel:
         self._feature_model = None
     
     def _create_dense_model(self):
-        """Create dense model with architecture matching GRU principles"""
+        """Create dense model (MLP)"""
         inputs = tf.keras.layers.Input(shape=(self.input_dim,))
         
-        x = tf.keras.layers.LayerNormalization()(inputs)
+        x = tf.keras.layers.LayerNormalization(name='ln_input')(inputs)
         
-        # First dense block
         x = tf.keras.layers.Dense(
             128,
-            activation='swish',  # Same activation
+            activation='swish',
             kernel_regularizer=tf.keras.regularizers.l2(1e-4),
             name='dense_1'
         )(x)
-        x = tf.keras.layers.LayerNormalization()(x)
+        x = tf.keras.layers.LayerNormalization(name='ln_1')(x)
         x = tf.keras.layers.Dropout(0.15)(x)
         
-        # Second dense block
         residual = x
         x = tf.keras.layers.Dense(
             128,
@@ -74,20 +72,18 @@ class DenseModel:
             kernel_regularizer=tf.keras.regularizers.l2(1e-4),
             name='dense_2'
         )(x)
-        x = tf.keras.layers.LayerNormalization()(x)
+        x = tf.keras.layers.LayerNormalization(name='ln_2')(x)
         x = tf.keras.layers.Dropout(0.2)(x)
         
-        # Residual
         x = tf.keras.layers.add([x, residual])
         
-        # Third dense block
         x = tf.keras.layers.Dense(
             64, 
             activation='swish',
             kernel_regularizer=tf.keras.regularizers.l2(1e-4),
             name='dense_3'
         )(x)
-        x = tf.keras.layers.LayerNormalization()(x)
+        x = tf.keras.layers.LayerNormalization(name='ln_3')(x)
         x = tf.keras.layers.Dropout(0.15)(x)
         
         # Logits layer 
@@ -227,7 +223,7 @@ class DenseModel:
         gc.collect()
 
 def create_enhanced_dense_model(input_dim, num_classes, batch_size=4096, learning_rate=None):
-    """Create enhanced dense model that matches GRU performance"""
+    """Create enhanced dense model (MLP)"""
     return DenseModel(input_dim, num_classes, batch_size, learning_rate)
 
 def create_dense_model(input_dim, num_classes, batch_size=1024):

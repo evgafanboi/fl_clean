@@ -168,7 +168,7 @@ class FedSSD(DistillationStrategy):
         print(f"{COLORS.OKCYAN}Computing initial credibility matrix on auxiliary dataset{COLORS.ENDC}")
         M_class = compute_class_metrics(global_model, aux_dataset, context.num_classes)
         print(
-            f"  M_class statistics -> min: {M_class.min():.4f}, max: {M_class.max():.4f}, mean: {M_class.mean():.4f}"
+            f"  M_class statistics -> mean: {M_class.mean():.4f}, max: {M_class.max():.4f}"
         )
 
         sample_sizes: List[int] = []
@@ -203,7 +203,7 @@ class FedSSD(DistillationStrategy):
         print(f"\n{COLORS.OKCYAN}[STEP 1/2] Computing class metrics on auxiliary dataset{COLORS.ENDC}")
         M_class = compute_class_metrics(global_model, aux_dataset, context.num_classes)
         print(
-            f"  M_class statistics -> min: {M_class.min():.4f}, max: {M_class.max():.4f}, mean: {M_class.mean():.4f}"
+            f"  M_class statistics -> mean: {M_class.mean():.4f}, max: {M_class.max():.4f}"
         )
 
         print(f"\n{COLORS.OKCYAN}[STEP 2/2] Client selective soft distillation training{COLORS.ENDC}")

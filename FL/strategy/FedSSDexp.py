@@ -132,7 +132,7 @@ class FedSSDexp:
             train_X_path, train_y_path, input_dim, num_classes, batch_size
         )
         
-        print(f"  [FedSSDexp Stage 2] Training with M_class (min={self.M_class.min():.4f}, max={self.M_class.max():.4f})")
+        print(f"  [FedSSDexp Stage 2] Training with M_class (mean={self.M_class.mean():.4f}, max={self.M_class.max():.4f})")
         
         train_with_ssd_loss(
             model_wrapper=model,

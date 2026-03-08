@@ -11,7 +11,7 @@ warnings.filterwarnings('ignore')
 from .pipeline import FLConfig, run_pipeline
 
 
-WEIGHT_AGGREGATION_STRATEGIES = {"FedAvg", "FedProx", "FedDyn", "FedCoMed", "RobustFilter", "DeepFed", "FLTrust", "SecureAggregation", "FedKEESS", "FedSSD1", "FedSSDexp", "FedSSD2", "None"}
+WEIGHT_AGGREGATION_STRATEGIES = {"FedAvg", "FedProx", "FedDyn", "FedCoMed", "RobustFilter", "DeepFed", "FLTrust", "SecureAggregation", "FedSSD1", "FedSSDexp", "FedSSD2", "None"}
 DISTILLATION_STRATEGIES = {"FD", "FedDKD", "FedProto", "FedMD", "FedSSD", "SSFL-IDS"}
 ALL_STRATEGIES = sorted(WEIGHT_AGGREGATION_STRATEGIES | DISTILLATION_STRATEGIES)
 
@@ -50,9 +50,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for KL divergence (for FedMLB)")
     # fedora
     parser.add_argument("--rank", type=int, default=8, help="LoRA rank (for FedoRA)")
-    # fedkeess
-    parser.add_argument("--k_clusters", type=int, default=3, help="Number of clusters/global models (for FedKEESS)")
-    parser.add_argument("--warmup_rounds", type=int, default=2, help="Warmup rounds before clustering (for FedKEESS)")
 
 
     # distillation hyperparameters
@@ -151,8 +148,6 @@ def main(argv=None):
             personalized_eval=args.personalized_eval,
             trust_score=args.trust_score,
             peer_trust=args.peer_trust,
-            k_clusters=args.k_clusters,
-            warmup_rounds=args.warmup_rounds,
             m_max=args.m_max,
             support=args.support,
             threshold=args.threshold,

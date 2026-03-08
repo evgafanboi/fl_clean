@@ -12,7 +12,6 @@ from .strategy.FedMLB import FedMLB
 from .strategy.NoneStrategy import NoneStrategy
 from .strategy.FedoRA import FedoRA
 from .strategy.SecureAggregation import SecureAggregation
-from .strategy.FedKEESS import FedKEESS
 from .strategy.FedSSD1 import FedSSD1
 from .strategy.FedSSDexp import FedSSDexp
 from .strategy.FedSSD2 import FedSSD2
@@ -133,16 +132,6 @@ def _secagg_client_factory(aggregator: SecureAggregation, _: Dict[str, Any]) -> 
     return aggregator
 
 
-def _fedkeess_factory(params: Dict[str, Any]) -> FedKEESS:
-    k_clusters = params.get('k_clusters', 3)
-    warmup_rounds = params.get('warmup_rounds', 2)
-    m_max = params.get('m_max', 1.0)
-    return FedKEESS(k_clusters, warmup_rounds, m_max)
-
-
-def _fedkeess_client_factory(aggregator: FedKEESS, _: Dict[str, Any]) -> FedKEESS:
-    return aggregator
-
 
 def _fedssd1_factory(params: Dict[str, Any]) -> FedSSD1:
     m_max = params.get('m_max', 1.0)
@@ -215,10 +204,6 @@ STRATEGY_REGISTRY: Dict[str, StrategyConfig] = {
     'SecureAggregation': StrategyConfig(
         aggregator_factory=_secagg_factory,
         client_factory=_secagg_client_factory
-    ),
-    'FedKEESS': StrategyConfig(
-        aggregator_factory=_fedkeess_factory,
-        client_factory=_fedkeess_client_factory
     ),
     'FedSSD1': StrategyConfig(
         aggregator_factory=_fedssd1_factory,

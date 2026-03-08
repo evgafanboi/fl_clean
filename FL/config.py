@@ -18,6 +18,7 @@ class FDConfig:
     dist_rounds: int = 2
     dkd_steps: int = 3
     dkd_lr: float = 0.001
+    dkd_temp: float = 3.0
     personalized_eval: bool = False
     poison: str = None
 
@@ -37,5 +38,6 @@ class FDConfig:
             'dist_rounds': self.dist_rounds,
             'dkd_steps': self.dkd_steps,
             'dkd_lr': self.dkd_lr,
+            'dkd_temp': self.dkd_temp,
             'personalized_eval': self.personalized_eval,
         }

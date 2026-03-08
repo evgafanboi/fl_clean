@@ -77,38 +77,39 @@ def hard_label_vote(all_client_hard_labels: List[List[int]], num_classes: int) -
     return voted
 
 
-def distill_knowledge(
+def train_on_pseudo_labeled_public(
     model_wrapper,
-    target_logits: np.ndarray,
+    pseudo_labels: np.ndarray,
     X_data: np.ndarray,
     epochs: int,
     batch_size: int,
+    num_classes: int,
 ) -> None:
+    """Train model on pseudo-labeled public data using CE loss on hard labels."""
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
-    logits_model = model_wrapper.get_logits_model() if hasattr(model_wrapper, "get_logits_model") else keras_model
 
     optimizer = keras_model.optimizer or tf.keras.optimizers.Adam(learning_rate=0.001)
     keras_model.optimizer = optimizer
-    mae_loss = tf.keras.losses.MeanAbsoluteError()
+    ce_loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
 
-    dataset = tf.data.Dataset.from_tensor_slices((X_data, target_logits)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    one_hot_labels = tf.keras.utils.to_categorical(pseudo_labels, num_classes=num_classes).astype(np.float32)
+    dataset = tf.data.Dataset.from_tensor_slices((X_data, one_hot_labels)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
     for epoch in range(epochs):
         epoch_loss = 0.0
         batches = 0
-        for batch_X, batch_targets in dataset:
+        for batch_X, batch_y in dataset:
             with tf.GradientTape() as tape:
-                student_logits = logits_model(batch_X, training=True)
-                loss = mae_loss(batch_targets, student_logits)
+                predictions = keras_model(batch_X, training=True)
+                loss = ce_loss_fn(batch_y, predictions)
             gradients = tape.gradient(loss, keras_model.trainable_variables)
             optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
             epoch_loss += float(loss)
             batches += 1
         if batches > 0:
-            print(f"    Distillation epoch {epoch + 1}/{epochs} - MAE {epoch_loss / batches:.4f}")
+            print(f"    Public CE epoch {epoch + 1}/{epochs} - Loss {epoch_loss / batches:.4f}")
     
     del dataset
-    tf.keras.backend.clear_session()
 
 
 def train_discriminator(
@@ -187,17 +188,9 @@ class SSFLIDS(DistillationStrategy):
         )
         public_features = numpy_from_dataset(public_dataset)
 
-        server_model = create_model(
-            context.input_dim,
-            context.num_classes,
-            config.batch_size,
-            model_type=config.model_type,
-        )
-
         context.shared_state.update(
             {
                 "public_features": public_features,
-                "server_model": server_model,
                 "is_sequence": is_sequence,
                 "public_sample_count": total_public,
             }
@@ -225,7 +218,6 @@ class SSFLIDS(DistillationStrategy):
         round_start = time.time()
         config = context.config
         public_features = context.shared_state["public_features"]
-        server_model = context.shared_state["server_model"]
 
         permutation = np.random.permutation(public_features.shape[0])
         open_feature = public_features[permutation]
@@ -284,21 +276,20 @@ class SSFLIDS(DistillationStrategy):
             aggressive_memory_cleanup()
 
         if not all_client_hard_labels:
-            print(f"{COLORS.WARNING}No client provided confident predictions; skipping distillation{COLORS.ENDC}")
-            server_metrics = evaluate_model(server_model, context.test_dataset, context.test_labels)
-            context.logger.info(
-                "Round %s | Server | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
-                round_number,
-                server_metrics["Acc"],
-                server_metrics["F1"],
-                server_metrics["Precision"],
-                server_metrics["Recall"],
-            )
-            round_metrics = {-1: server_metrics}
-            if config.personalized_eval:
-                for state in context.client_states:
-                    metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
-                    round_metrics[state.client_id] = metrics
+            print(f"{COLORS.WARNING}No client provided confident predictions; skipping public training{COLORS.ENDC}")
+            all_client_metrics = []
+            round_metrics: Dict[int, Dict[str, float]] = {}
+            for state in context.client_states:
+                metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
+                all_client_metrics.append(metrics)
+                round_metrics[state.client_id] = metrics
+            avg_metrics = {
+                "Acc": np.mean([m["Acc"] for m in all_client_metrics]),
+                "F1": np.mean([m["F1"] for m in all_client_metrics]),
+                "Precision": np.mean([m["Precision"] for m in all_client_metrics]),
+                "Recall": np.mean([m["Recall"] for m in all_client_metrics]),
+            }
+            round_metrics[-1] = avg_metrics
             round_time = time.time() - round_start
             context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
             context.logger.info("Round %s completed in %.2fs", round_number, round_time)
@@ -307,67 +298,70 @@ class SSFLIDS(DistillationStrategy):
 
         print(f"\n{COLORS.HEADER}Round {round_number} Stage II{COLORS.ENDC}")
         global_labels = hard_label_vote(all_client_hard_labels, context.num_classes)
-        global_logits = tf.keras.utils.to_categorical(global_labels, num_classes=context.num_classes).astype(np.float32)
+        global_labels_np = np.array(global_labels, dtype=np.int32)
         
-        del all_client_hard_labels, global_labels
+        del all_client_hard_labels
         aggressive_memory_cleanup()
 
         for state in context.client_states:
-            print(f"Client {state.client_id}: distillation on public data")
-            distill_knowledge(
+            print(f"Client {state.client_id}: training on pseudo-labeled public data")
+            train_on_pseudo_labeled_public(
                 state.model,
-                global_logits,
+                global_labels_np,
                 open_feature,
                 config.dist_rounds,
                 config.batch_size,
+                context.num_classes,
             )
             aggressive_memory_cleanup()
 
-        print(f"Server distillation")
-        distill_knowledge(
-            server_model,
-            global_logits,
-            open_feature,
-            config.dist_rounds,
-            config.batch_size,
-        )
-        
-        del global_logits, open_feature
+        del global_labels_np, open_feature
         aggressive_memory_cleanup()
 
-        server_metrics = evaluate_model(server_model, context.test_dataset, context.test_labels)
-        context.logger.info(
-            "Round %s | Server | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
-            round_number,
-            server_metrics["Acc"],
-            server_metrics["F1"],
-            server_metrics["Precision"],
-            server_metrics["Recall"],
-        )
-        print(
-            f"{COLORS.OKGREEN}Server: Acc={server_metrics['Acc']:.4f}, F1={server_metrics['F1']:.4f}, "
-            f"Precision={server_metrics['Precision']:.4f}, Recall={server_metrics['Recall']:.4f}{COLORS.ENDC}"
-        )
+        print(f"\n{COLORS.HEADER}Evaluation{COLORS.ENDC}")
 
-        round_metrics: Dict[int, Dict[str, float]] = {-1: server_metrics}
-        
-        if config.personalized_eval:
-            for state in context.client_states:
-                metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
-                round_metrics[state.client_id] = metrics
-                context.logger.info(
-                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
-                    round_number,
-                    state.client_id,
-                    metrics["Acc"],
-                    metrics["F1"],
-                    metrics["Precision"],
-                    metrics["Recall"],
-                )
-                print(
-                    f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}{COLORS.ENDC}"
-                )
+        all_client_metrics = []
+        round_metrics: Dict[int, Dict[str, float]] = {}
+
+        for state in context.client_states:
+            metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
+            all_client_metrics.append(metrics)
+            round_metrics[state.client_id] = metrics
+            context.logger.info(
+                "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+                round_number,
+                state.client_id,
+                metrics["Acc"],
+                metrics["F1"],
+                metrics["Precision"],
+                metrics["Recall"],
+            )
+            print(
+                f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
+                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}{COLORS.ENDC}"
+            )
+
+        avg_metrics = {
+            "Acc": np.mean([m["Acc"] for m in all_client_metrics]),
+            "F1": np.mean([m["F1"] for m in all_client_metrics]),
+            "Precision": np.mean([m["Precision"] for m in all_client_metrics]),
+            "Recall": np.mean([m["Recall"] for m in all_client_metrics]),
+        }
+        round_metrics[-1] = avg_metrics
+
+        print(
+            f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
+            f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
+            f"Recall={avg_metrics['Recall']:.4f}{COLORS.ENDC}"
+        )
+        context.logger.info(
+            "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+            round_number,
+            avg_metrics["Acc"],
+            avg_metrics["F1"],
+            avg_metrics["Precision"],
+            avg_metrics["Recall"],
+        )
 
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time

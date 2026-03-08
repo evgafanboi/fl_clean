@@ -13,20 +13,36 @@ from .base import DistillationStrategy
 from .common import create_model, create_private_dataset
 
 
-def compute_dkd_gradient(expert_model, global_model, batch_X, batch_y):
+def compute_dkd_gradient(expert_model, global_model, train_dataset, temperature=3.0):
     expert_keras = expert_model.model if hasattr(expert_model, 'model') else expert_model
     global_keras = global_model.model if hasattr(global_model, 'model') else global_model
-    
-    expert_logits = expert_keras(batch_X, training=False)
-    
-    with tf.GradientTape() as tape:
-        global_logits = global_keras(batch_X, training=True)
-        loss = tf.keras.losses.categorical_crossentropy(expert_logits, global_logits, from_logits=False)
-        loss = tf.reduce_mean(loss)
-    
+
+    expert_logits_model = expert_model.get_logits_model() if hasattr(expert_model, 'get_logits_model') else expert_keras
+    global_logits_model = global_model.get_logits_model() if hasattr(global_model, 'get_logits_model') else global_keras
+
     trainable_vars = global_model.trainable_variables if hasattr(global_model, 'trainable_variables') else global_keras.trainable_variables
-    gradients = tape.gradient(loss, trainable_vars)
-    return gradients, loss.numpy()
+    accumulated_grads = [tf.zeros_like(v) for v in trainable_vars]
+    total_loss = 0.0
+    num_batches = 0
+
+    for batch_X, batch_y in train_dataset:
+        with tf.GradientTape() as tape:
+            expert_logits = expert_logits_model(batch_X, training=False)
+            global_logits = global_logits_model(batch_X, training=True)
+
+            soft_teacher = tf.nn.softmax(expert_logits / temperature)
+            soft_student = tf.nn.log_softmax(global_logits / temperature)
+            kl_loss = tf.reduce_mean(tf.reduce_sum(soft_teacher * (tf.math.log(soft_teacher + 1e-8) - soft_student), axis=1))
+            loss = (temperature ** 2) * kl_loss
+
+        gradients = tape.gradient(loss, trainable_vars)
+        accumulated_grads = [ag + g for ag, g in zip(accumulated_grads, gradients)]
+        total_loss += float(loss)
+        num_batches += 1
+
+    avg_grads = [g / num_batches for g in accumulated_grads]
+    avg_loss = total_loss / max(num_batches, 1)
+    return avg_grads, avg_loss
 
 
 def aggregate_gradients(client_gradients, client_weights):
@@ -64,11 +80,13 @@ class FedDKD(DistillationStrategy):
         self.expert_epochs = config.epochs
         self.dkd_steps = config.dkd_steps
         self.dkd_lr = config.dkd_lr
+        self.dkd_temp = getattr(config, 'dkd_temp', 3.0)
 
     def extra_log_tokens(self) -> Dict[str, str]:
         return {
             "dkd_steps": f"dkd{self.dkd_steps}",
             "dkd_lr": f"lr{self.dkd_lr}",
+            "dkd_temp": f"T{self.dkd_temp}",
         }
 
     def setup(self, context: PipelineContext) -> None:
@@ -186,15 +204,14 @@ class FedDKD(DistillationStrategy):
                     is_sequence=is_sequence,
                 )
                 
-                for batch_X, batch_y in train_dataset.take(1):
-                    grads, loss = compute_dkd_gradient(
-                        state.model,
-                        global_model,
-                        batch_X,
-                        batch_y,
-                    )
-                    client_grads.append(grads)
-                    step_losses.append(loss)
+                grads, loss = compute_dkd_gradient(
+                    state.model,
+                    global_model,
+                    train_dataset,
+                    temperature=self.dkd_temp,
+                )
+                client_grads.append(grads)
+                step_losses.append(loss)
                 
                 del train_dataset
             
