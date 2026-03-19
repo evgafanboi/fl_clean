@@ -74,6 +74,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=8192, help="Minibatch size for local training")
     parser.add_argument("--epochs", type=int, default=5, help="Local epochs per round")
     parser.add_argument("--weights_cache_dir", type=str, default="temp_weights", help="Directory to cache client weights")
+    parser.add_argument("--client_fraction", type=float, default=1.0, help="Fraction of clients to sample per round (0.0-1.0, default: 1.0 = all clients)")
 
     # experimental info computation
     parser.add_argument("--trust_score", action="store_true", help="Enable trust score logging (FLTrust cosine similarity) after local training")

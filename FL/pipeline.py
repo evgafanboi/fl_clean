@@ -49,6 +49,7 @@ class FLConfig:
     robust_tau: float = 0.1
     poison: Optional[str] = None
     personalized_eval: bool = False
+    client_fraction: float = 1.0
     root_iterations: int = 1
     lambda1: float = 1.0
     lambda2: float = 1.0
@@ -911,7 +912,16 @@ class FederatedLearningPipeline:
             # Only needed when stream=False
             client_results: List = [] if not stream else None
 
-            for client_idx in range(n_clients):
+            # Client sampling logic
+            if self.config.client_fraction < 1.0:
+                import random
+                n_selected = max(1, int(n_clients * self.config.client_fraction))
+                selected_clients = random.sample(range(n_clients), n_selected)
+                self.logger.info(f"📊 Round {current_round}: Sampling {n_selected}/{n_clients} clients ({self.config.client_fraction*100:.0f}%)")
+            else:
+                selected_clients = range(n_clients)
+
+            for client_idx in selected_clients:
                 result_data, sample_size, loss = self._train_single_client(
                     client_id=client_idx,
                     input_dim=input_dim,
