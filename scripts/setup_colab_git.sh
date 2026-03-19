@@ -70,7 +70,7 @@ create_pat_guidance() {
 read_pat_securely() {
     local pat=""
     
-    # Check if PAT is provided via environment variable (recommended for Colab)
+    # Check if PAT is provided via environment variable (REQUIRED for Colab)
     if [ -n "$GITHUB_PAT" ]; then
         print_info "Using PAT from environment variable"
         # Trim whitespace
@@ -79,30 +79,24 @@ read_pat_securely() {
         return 0
     fi
     
-    # Otherwise, prompt for input
-    # Note: In Colab, input won't be hidden. Use environment variable instead.
+    # If no environment variable, show clear error message
+    print_error "GITHUB_PAT environment variable not set"
     echo ""
-    echo "Paste your GitHub Personal Access Token:"
-    echo "(In Colab, the token will be visible. Press Enter after pasting)"
+    echo "=========================================="
+    echo "  SETUP FAILED - MISSING TOKEN"
+    echo "=========================================="
     echo ""
-    read -r pat
-    
-    # Trim whitespace from input
-    pat=$(echo "$pat" | xargs)
-    
-    if [ -z "$pat" ]; then
-        print_error "No token provided"
-        echo ""
-        echo "Alternative method for Colab:"
-        echo "  Run this in a Python cell first:"
-        echo "  import os"
-        echo "  os.environ['GITHUB_PAT'] = 'ghp_your_token_here'"
-        echo ""
-        echo "  Then run: !bash scripts/setup_colab_git.sh"
-        return 1
-    fi
-    
-    echo "$pat"
+    echo "In Google Colab, you MUST set the token as an environment variable."
+    echo ""
+    echo "Run this Python code first:"
+    echo ""
+    echo "  import os"
+    echo "  os.environ['GITHUB_PAT'] = 'ghp_your_token_here'"
+    echo "  !bash scripts/setup_colab_git.sh"
+    echo ""
+    echo "Replace 'ghp_your_token_here' with your actual GitHub token."
+    echo ""
+    return 1
 }
 
 validate_pat() {
