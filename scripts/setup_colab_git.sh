@@ -107,9 +107,22 @@ read_pat_securely() {
 validate_pat() {
     local pat="$1"
     
-    # Check format
-    if [[ ! "$pat" =~ ^(ghp_|github_pat_) ]]; then
+    # Debug: show first few characters (for troubleshooting)
+    local pat_preview="${pat:0:10}"
+    print_info "Validating token: ${pat_preview}..."
+    
+    # Check if token is empty
+    if [ -z "$pat" ]; then
+        print_error "Token is empty"
+        return 1
+    fi
+    
+    # Check format - token should start with ghp_ or github_pat_
+    if [[ "$pat" =~ ^ghp_ ]] || [[ "$pat" =~ ^github_pat_ ]]; then
+        print_success "Token format valid"
+    else
         print_error "Invalid PAT format. Must start with 'ghp_' or 'github_pat_'"
+        echo "  Received: ${pat:0:20}..." # Show first 20 chars for debugging
         return 1
     fi
     
