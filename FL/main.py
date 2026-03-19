@@ -37,7 +37,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dist_rounds", type=int, default=2, help="Distillation rounds (SSFL-IDS)")
     # robust filter
     parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (Byzantine ratio)")
-    parser.add_argument("--robust_tau", type=float, default=0.1, help="RobustFilter tau parameter")
     # cronus
     parser.add_argument("--remove_dis", action="store_true", help="Cronus: remove discriminator, use plain softmax predictions")
     # fedssd
