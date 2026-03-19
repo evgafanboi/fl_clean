@@ -1,7 +1,17 @@
 #!/bin/bash
 # Setup Colab Git Authentication with Google Drive persistence
 # Author: tungmv
-# Usage: bash scripts/setup_colab_git.sh
+# 
+# Usage (Method 1 - Environment Variable - Recommended for Colab):
+#   In Python cell:
+#     import os
+#     os.environ['GITHUB_PAT'] = 'ghp_your_token_here'
+#   Then run:
+#     !bash scripts/setup_colab_git.sh
+#
+# Usage (Method 2 - Interactive):
+#   !bash scripts/setup_colab_git.sh
+#   (Then paste token when prompted)
 
 set -e  # Exit on error
 
@@ -59,9 +69,33 @@ create_pat_guidance() {
 
 read_pat_securely() {
     local pat=""
-    print_info "Paste your GitHub Personal Access Token (hidden):"
-    read -s pat
-    echo ""  # New line after hidden input
+    
+    # Check if PAT is provided via environment variable (recommended for Colab)
+    if [ -n "$GITHUB_PAT" ]; then
+        print_info "Using PAT from environment variable"
+        echo "$GITHUB_PAT"
+        return 0
+    fi
+    
+    # Otherwise, prompt for input
+    # Note: In Colab, input won't be hidden. Use environment variable instead.
+    print_info "Paste your GitHub Personal Access Token:"
+    echo "  (In Colab, the token will be visible. Press Enter after pasting)"
+    echo ""
+    read pat
+    
+    if [ -z "$pat" ]; then
+        print_error "No token provided"
+        echo ""
+        echo "Alternative method for Colab:"
+        echo "  Run this in a Python cell first:"
+        echo "  import os"
+        echo "  os.environ['GITHUB_PAT'] = 'ghp_your_token_here'"
+        echo ""
+        echo "  Then run: !bash scripts/setup_colab_git.sh"
+        return 1
+    fi
+    
     echo "$pat"
 }
 

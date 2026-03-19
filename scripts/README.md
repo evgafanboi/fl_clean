@@ -18,14 +18,34 @@ Automated scripts to sync your GitHub repository with Google Colab using Google 
    %cd fl_clean
    ```
 
-3. **Run setup to configure authentication:**
-   ```bash
+3. **Create GitHub Personal Access Token:**
+   - Go to: https://github.com/settings/tokens/new
+   - Description: `Colab-FL-Sync`
+   - Scope: Select **`repo`** (Full control of private repositories)
+   - Click "Generate token"
+   - **Copy the token** (starts with `ghp_` or `github_pat_`)
+
+4. **Run setup (choose one method):**
+
+   **Method 1 (Recommended - More Secure):**
+   ```python
+   # Set PAT as environment variable
+   import os
+   os.environ['GITHUB_PAT'] = 'ghp_your_token_here'  # Paste your token
+   
+   # Run setup
    !bash scripts/setup_colab_git.sh
    ```
    
+   **Method 2 (Interactive):**
+   ```bash
+   !bash scripts/setup_colab_git.sh
+   # Paste token when prompted (will be visible in Colab)
+   ```
+   
    This will:
-   - Guide you to create a GitHub Personal Access Token (PAT)
-   - Save your credentials to Google Drive
+   - Validate your PAT
+   - Save credentials to Google Drive
    - Configure git authentication
 
 ### Every New Colab Session
@@ -62,15 +82,25 @@ To pull latest changes anytime:
 
 **Purpose:** One-time setup to create and store GitHub credentials
 
-**Usage:**
+**Usage Method 1 (Recommended - Environment Variable):**
+```python
+# In Python cell:
+import os
+os.environ['GITHUB_PAT'] = 'ghp_your_token_here'
+
+# Then run:
+!bash scripts/setup_colab_git.sh
+```
+
+**Usage Method 2 (Interactive):**
 ```bash
-bash scripts/setup_colab_git.sh
+!bash scripts/setup_colab_git.sh
+# Paste token when prompted
 ```
 
 **What it does:**
-- Opens GitHub PAT creation URL with pre-configured settings
-- Prompts you to paste your PAT
-- Validates PAT by testing connection
+- Reads PAT from environment variable or prompts for input
+- Validates PAT by testing connection to GitHub
 - Saves credentials to `/content/drive/MyDrive/.colab_git_credentials`
 - Configures git remote (converts SSH → HTTPS with PAT)
 - Configures git user (name and email)
@@ -79,6 +109,8 @@ bash scripts/setup_colab_git.sh
 - First time using the repo in Colab
 - When PAT expires or needs to be changed
 - When credentials are corrupted
+
+**Note:** In Colab notebooks, interactive input is visible (not hidden). Using the environment variable method is more secure.
 
 ---
 
