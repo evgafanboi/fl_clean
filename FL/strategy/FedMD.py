@@ -77,13 +77,14 @@ def digest_phase(
 
     optimizer = keras_model.optimizer or tf.keras.optimizers.Adam(learning_rate=0.001)
     keras_model.optimizer = optimizer
-    mae_loss_fn = tf.keras.losses.MeanAbsoluteError()
+
+    loss_fn = tf.keras.losses.get(keras_model.loss)
 
     @tf.function
     def train_step(batch_X, batch_consensus):
         with tf.GradientTape() as tape:
             student_logits = logits_model(batch_X, training=True)
-            loss = mae_loss_fn(batch_consensus, student_logits)
+            loss = loss_fn(batch_consensus, student_logits)
         gradients = tape.gradient(loss, keras_model.trainable_variables)
         optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
         return loss
@@ -121,7 +122,7 @@ class FedMD(DistillationStrategy):
         self.revisit_epochs = config.epochs
 
     def extra_log_tokens(self) -> Dict[str, float]:
-        return {"gamma": self.config.gamma}
+        return {}
 
     def setup(self, context: PipelineContext) -> None:
         print(f"{COLORS.OKGREEN}Preparing FedMD with public data from client slices{COLORS.ENDC}")

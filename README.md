@@ -46,37 +46,37 @@ python -m FL --n_clients <> --partition_type <> --strategy <> --rounds <>
 - `FedAvg`[4]: Standard federated averaging
 - `FedProx`[5]: Proximal term regularization (`--mu 0.01`)
 - `FedDyn`[6]: Dynamic regularization (`--feddyn_alpha 0.1`)
-- `RobustFilter`[7][8]: Byzantine-robust aggregation (`--robust_epsilon` controls the spectral filtering threshold $\epsilon$. Set it higher than the Byzantine ratio)
+- `RobustFilter`[7]: Byzantine-robust aggregation (`--robust_epsilon` controls the spectral filtering threshold $\epsilon$. Set it higher than the Byzantine ratio)
 - `FedCoMed`[9]: Coordinate-wise Median for Byzantine-robust FL
 - `DeepFed`[10]: FedAvg using Paillier Homomorphic Encryption (expect extremely long runtime)
 
 **Federated distillation**:
+- `Cronus`[8]: Byzantine-robust semi supervised federated distillation, `--robust_epsilon` with value higher than byzantine ratio. `--no_dis` to remove SSFL-IDS's discriminator, which worsen the quality but adhere to the original paper.
 - `FedDKD`[11]: Federated Decentralized Knowledge Distillation (deprecated)
-- `FedProto`[12]: FedProto
-- `FedSSD`[13]: Federated Selective Self Distillation
-- `SSFL-IDS`[14]: Semi-supervised Federated Learning
-- `FedMD`[15]: FedMD
-- `FD`[16]: FederatedDistillation
-- `FLTrust`[17]
+- `FedProto`[12]: FedProto `--gamma`, default `1.0`, controls the $\lambda$ in its loss function $\mathcal{L}=\mathcal{L}_S + \lambda\mathcal{L}_R$, where $\mathcal{L}_S$ is defined as the standard supervised loss (cross-entropy in our context) and $\mathcal{L}_R$ is the prototype-distance loss, the distance function is not specific and our code implement L1 distance.
+- `FedSSD`[13]: Federated Selective Self Distillation. `--m_max` controls $M_{max}$, as in $M(x)[k_1] M_{max} \cdot [M_{class}[k_1]M_{sample}(x)-0.1]^+$, where $M$ is the distillation weight in the $L_{SSD}$ loss function, $L_{SSD}=\mathbb{E}(||M\odot z^g - M \odot z||_2^2)$. Default `1.0`.
+- `SSFL-IDS`[14]: Semi-supervised Federated Learning. `--dis_rounds` controls how many epochs the discriminator is trained, default `3`. `--dist_rounds` controls how many epochs the clients learn the voted public dataset, default `2`.
+- `FedMD`[15]: Public dataset distillation.
+- `FD`[16]: FederatedDistillation, use `--gamma` to control distillation weight.
+- `FLTrust`[17]: Byzantine-robust FL with labeled public dataset (root dataset). `--root_iterations`, default `1`, controls how many iterations the server trains on the root dataset.
 
 **Examples**:
 ```sh
 # FedProx with proximal term
-python3 -m FL --n_clients 10 --partition_type label_skew-10 --strategy FedProx --mu 0.01
+python3 -m FL --n_clients 10 --partition_type label_skew_0.1-10 --strategy FedProx --mu 0.01
 
 # FedDyn with alpha
-python3 -m FL --n_clients 10 --partition_type label_skew-10 --strategy FedDyn --feddyn_alpha 0.1
+python3 -m FL --n_clients 10 --partition_type label_skew_0.01-100 --strategy FedDyn --feddyn_alpha 0.1
 
 # FedSSD
-python3 -m FL --n_clients 10 --partition_type label_skew-10 --strategy FedSSD
+python3 -m FL --n_clients 10 --partition_type iid-500 --strategy FedSSD 
 ```
 
-**Parameters**:
+**General parameters**:
 - `--batch_size`: Training batch size (default: 8192)
 - `--rounds`: Communication rounds (default: 10)
 - `--epochs`: Local epochs per round (default: 5)
-- `--mu`: FedProx proximal term (default: 0.01)
-- `--feddyn_alpha`: FedDyn regularization (default: 0.1, paper optimal)
+- `--model`: default `dense` (MLP), `{gru, dcblstm}` (RNN-GRU, DCNNBiLSTM).
 
 
 **Outputs**:

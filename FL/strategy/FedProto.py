@@ -101,7 +101,7 @@ def local_training_with_prototypes(
     feature_dim = int(dual_model.output[0].shape[-1])
 
     ce_loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
-    mse_loss_fn = tf.keras.losses.MeanSquaredError()
+    l1_loss_fn = tf.keras.losses.MeanAbsoluteError()
 
     if hasattr(keras_model, "optimizer") and keras_model.optimizer is not None:
         optimizer = keras_model.optimizer
@@ -131,7 +131,7 @@ def local_training_with_prototypes(
             mask = tf.gather(has_proto_tensor, labels)
             mask_expanded = tf.expand_dims(tf.cast(mask, tf.float32), -1)
             proto_new = mask_expanded * proto_targets + (1.0 - mask_expanded) * features
-            proto_loss = gamma_tf * mse_loss_fn(proto_new, features)
+            proto_loss = gamma_tf * l1_loss_fn(proto_new, features)
 
             loss = ce_loss + proto_loss
         gradients = tape.gradient(loss, keras_model.trainable_variables)
