@@ -81,10 +81,11 @@ read_pat_securely() {
     
     # Otherwise, prompt for input
     # Note: In Colab, input won't be hidden. Use environment variable instead.
-    print_info "Paste your GitHub Personal Access Token:"
-    echo "  (In Colab, the token will be visible. Press Enter after pasting)"
     echo ""
-    read pat
+    echo "Paste your GitHub Personal Access Token:"
+    echo "(In Colab, the token will be visible. Press Enter after pasting)"
+    echo ""
+    read -r pat
     
     # Trim whitespace from input
     pat=$(echo "$pat" | xargs)
