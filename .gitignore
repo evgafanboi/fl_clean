@@ -1,0 +1,54 @@
+# Colab credentials (sensitive)
+.colab_git_credentials
+scripts/.env
+scripts/.colab_*
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+FL/__pycache__/
+models/__pycache__/
+FCIL/__pycache__/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Weights and temporary files
+temp_weights/
+*.h5
+*.weights
+*.ckpt
+
+# Results and logs
+results/
+logs/
+*.log
+
+# Data (if large)
+# data/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
