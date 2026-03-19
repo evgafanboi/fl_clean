@@ -73,7 +73,9 @@ read_pat_securely() {
     # Check if PAT is provided via environment variable (recommended for Colab)
     if [ -n "$GITHUB_PAT" ]; then
         print_info "Using PAT from environment variable"
-        echo "$GITHUB_PAT"
+        # Trim whitespace
+        pat=$(echo "$GITHUB_PAT" | xargs)
+        echo "$pat"
         return 0
     fi
     
@@ -83,6 +85,9 @@ read_pat_securely() {
     echo "  (In Colab, the token will be visible. Press Enter after pasting)"
     echo ""
     read pat
+    
+    # Trim whitespace from input
+    pat=$(echo "$pat" | xargs)
     
     if [ -z "$pat" ]; then
         print_error "No token provided"
