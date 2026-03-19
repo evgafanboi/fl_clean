@@ -40,18 +40,17 @@ class RobustFilter:
             self.c2 = 0.1
             self.thres_multiplier = 10.0
     
-    def threshold(self, d: int) -> float:
-        """Threshold for spectral norm (Thres(ε))."""
-        return self.thres_multiplier * np.sqrt(d) * self.epsilon
-
-    def tail_bound(self, T: float) -> float:
-        """Adaptive tail bounding (exponential decay)."""
-        # Using tau as a scale factor ensures it affects the tail bound.
-        return self.c1 * np.exp(-self.c2 * T / (self.tau + 1e-12))
-
-    def slack_function(self, spectral_norm: float) -> float:
-        """Slack function δ(ε, s)."""
-        return self.epsilon * spectral_norm
+    def threshold(self, epsilon: float, d: int) -> float:
+        """Threshold for spectral norm (Thres(ε))"""
+        return self.thres_multiplier * np.sqrt(d) * epsilon
+    
+    def tail_bound(self, T: float, d: int, epsilon: float, delta: float, tau: float) -> float:
+        """Adaptive tail bounding (exponential decay)"""
+        return self.c1 * np.exp(-self.c2 * T)
+    
+    def slack_function(self, epsilon: float, spectral_norm: float) -> float:
+        """Slack function δ(ε, s)"""
+        return epsilon * spectral_norm
     
     def compute_robust_mean(
         self,
@@ -94,7 +93,7 @@ class RobustFilter:
         else:
             spectral_norm = np.linalg.norm(Sigma, ord=2)
         
-        threshold = self.threshold(d)
+        threshold = self.threshold(self.epsilon, d)
         
         if spectral_norm <= threshold:
             return mu_S
@@ -108,7 +107,7 @@ class RobustFilter:
         
         projections = np.dot(centered, v_star)
         
-        delta = self.slack_function(spectral_norm)
+        delta = self.slack_function(self.epsilon, spectral_norm)
         
         T = self._find_threshold(projections, weights, d, delta)
         
@@ -177,7 +176,7 @@ class RobustFilter:
             return mu_S, max_eigenvalue, []
 
         projections = np.dot(centered, v_star)
-        delta = self.slack_function(spectral_norm)
+        delta = self.slack_function(self.epsilon, spectral_norm)
         T = self._find_threshold(projections, w, d, delta)
 
         filtered_mask = np.abs(projections) <= (T + delta)
@@ -214,7 +213,7 @@ class RobustFilter:
         for i, T in enumerate(T_candidates):
             tail_mass = 1.0 - cumulative_weights[i]
             
-            target_tail = self.tail_bound(T)
+            target_tail = self.tail_bound(T, d, self.epsilon, delta, self.tau)
             
             if tail_mass <= target_tail:
                 return T
