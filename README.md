@@ -29,7 +29,7 @@ python partition_data.py --num-clients 10 --partition-type label_skew --alpha 0.
 
 - **Note:**
     - The partitioner will further split each partition into a public slice and private slice (train). For simulations that assume a public dataset (auxiliary dataset in `FedSSD`), public slices are concatenated at runtime and clients only use `*_train.npy` for their private dataset. For other simulations, both public and private slices are concatenated at runtime to form a larger set, which will be used for their private dataset. This happens separately between different partitioning runs.
-    - The default public slice ratio is `0.285`, with this the public set would be `20%` of the total CICIoT2023 dataset, with the test set being `20%` and the train set being `60%`. If simulations that use public dataset won't be used, best add `--public-ratio 0`.
+    - The default public slice ratio is randomized between `5%` to `20%` for each client, with this the public set would be `~14.5%` of the total CICIoT2023 dataset, with the test set being `20%` and the train set being `80% (minus the public slice in some FL cases)`.
     - It also sums the sample count per class for each clien into a table, available in `Markdown` and `Excel` format under the same directory as the partitions.
 
 ## Federated Learning
@@ -43,21 +43,21 @@ python -m FL --n_clients <> --partition_type <> --strategy <> --rounds <>
 ```
 
 **Strategies**:
-- `FedAvg`: Standard federated averaging
-- `FedProx`: Proximal term regularization (`--mu 0.01`)
-- `FedDyn`: Dynamic regularization (`--feddyn_alpha 0.1`)
-- `RobustFilter`: Byzantine-robust aggregation (ε=0.2)
-- `FedCoMed`: Coordinate-wise Median
-- `DeepFed`: FedAvg using Paillier Homomorphic Encryption
+- `FedAvg`[4]: Standard federated averaging
+- `FedProx`[5]: Proximal term regularization (`--mu 0.01`)
+- `FedDyn`[6]: Dynamic regularization (`--feddyn_alpha 0.1`)
+- `RobustFilter`[7][8]: Byzantine-robust aggregation (`--robust_epsilon` controls the spectral filtering threshold $\epsilon$. Set it higher than the Byzantine ratio)
+- `FedCoMed`[9]: Coordinate-wise Median for Byzantine-robust FL
+- `DeepFed`[10]: FedAvg using Paillier Homomorphic Encryption (expect extremely long runtime)
 
 **Federated distillation**:
-- `FedDKD`: Federated Decentralized Knowledge Distillation
-- `FedProto`: FedProto
-- `FedSSD`: Federated Selective Self Distillation
-- `SSFL-IDS`: Semi-supervised Federated Learning
-- `FedMD`: FedMD
-- `FD`: FederatedDistillation
-- `FLTrust`
+- `FedDKD`[11]: Federated Decentralized Knowledge Distillation (deprecated)
+- `FedProto`[12]: FedProto
+- `FedSSD`[13]: Federated Selective Self Distillation
+- `SSFL-IDS`[14]: Semi-supervised Federated Learning
+- `FedMD`[15]: FedMD
+- `FD`[16]: FederatedDistillation
+- `FLTrust`[17]
 
 **Examples**:
 ```sh
@@ -119,37 +119,28 @@ python -m FCIL --n_clients <> --partition_type <> --strategy <> --rounds <> --ci
 
 ### Citation
 
-#### [1] iCaRL (CVPR 2017)
-```bibtex
-@inproceedings{ rebuffi-cvpr2017,
-   author = { Sylvestre-Alvise Rebuffi and Alexander Kolesnikov and Georg Sperl and Christoph H. Lampert },
-   title = {{iCaRL:} Incremental Classifier and Representation Learning},
-   booktitle = CVPR,
-   year = 2017,
-}
-```
+[1] Rebuffi, Sylvestre-Alvise, et al. "icarl: Incremental classifier and representation learning." Proceedings of the IEEE conference on Computer Vision and Pattern Recognition. 2017.
+[2] Dong, Jiahua, et al. "Federated class-incremental learning." Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. 2022.
+[3] Wang, Fu-Yun, et al. "Foster: Feature boosting and compression for class-incremental learning." European conference on computer vision. Cham: Springer Nature Switzerland, 2022.
+[4] McMahan, Brendan, et al. "Communication-efficient learning of deep networks from decentralized data." Artificial intelligence and statistics. Pmlr, 2017.
+[5] Li, Tian, et al. "Federated optimization in heterogeneous networks." Proceedings of Machine learning and systems 2 (2020): 429-450.
+[6] Acar, Durmus Alp Emre, et al. "Federated learning based on dynamic regularization." arXiv preprint arXiv:2111.04263 (2021).
+[7] Chang, Hongyan, et al. "Cronus: Robust and heterogeneous collaborative learning with black-box knowledge transfer." arXiv preprint arXiv:1912.11279 (2019).
+[8] Diakonikolas, Ilias, et al. "Being robust (in high dimensions) can be practical." International Conference on Machine Learning. PMLR, 2017.
+[9] Yin, Dong, et al. "Byzantine-robust distributed learning: Towards optimal statistical rates." International conference on machine learning. Pmlr, 2018.
+[10] Li, Beibei, et al. "DeepFed: Federated deep learning for intrusion detection in industrial cyber–physical systems." IEEE Transactions on Industrial Informatics 17.8 (2020): 5615-5624.
+[11] Li, Xinjia, Boyu Chen, and Wenlian Lu. "FedDKD: Federated learning with decentralized knowledge distillation." Applied Intelligence 53.15 (2023): 18547-18563.
+[12] Tan, Yue, et al. "Fedproto: Federated prototype learning across heterogeneous clients." Proceedings of the AAAI conference on artificial intelligence. Vol. 36. No. 8. 2022.
+[13] He, Yuting, et al. "Learning critically: Selective self-distillation in federated learning on non-iid data." IEEE Transactions on Big Data 10.6 (2022): 789-800.
+[14] Zhao, Ruijie, et al. "Semisupervised federated-learning-based intrusion detection method for internet of things." IEEE Internet of Things Journal 10.10 (2022): 8645-8657.
+[15] Li, Daliang, and Junpu Wang. "Fedmd: Heterogenous federated learning via model distillation." arXiv preprint arXiv:1910.03581 (2019).
+[16] Jeong, Eunjeong, et al. "Communication-efficient on-device machine learning: Federated distillation and augmentation under non-iid private data." arXiv preprint arXiv:1811.11479 (2018).
+[17] Cao, Xiaoyu, et al. "Fltrust: Byzantine-robust federated learning via trust bootstrapping." arXiv preprint arXiv:2012.13995 (2020).
 
-#### [2] GLFC (CVPR 2022)
-```bibtex
-@InProceedings{dong2022federated,
-    author = {Dong, Jiahua and Wang, Lixu and Fang, Zhen and Sun, Gan and Xu, Shichao and Wang, Xiao and Zhu, Qi},
-    title = {Federated Class-Incremental Learning},
-    booktitle = {IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-    month = {June},
-    year = {2022},
-}
-```
+#### Classifer based on:
+- RNN-GRU: Kasongo, Sydney Mambwe. "A deep learning technique for intrusion detection system using a Recurrent Neural Networks based framework." Computer Communications 199 (2023): 113-125.
 
-#### [3] FOSTER (ECCV22)
-
-```bibtex
-@article{wang2022foster,
-  title={FOSTER: Feature Boosting and Compression for Class-Incremental Learning},
-  author={Wang, Fu-Yun and Zhou, Da-Wei and Ye, Han-Jia and Zhan, De-Chuan},
-  journal={arXiv preprint arXiv:2204.04662},
-  year={2022}
-}
-```
+- DCNNBiLSTM (dcblstm): Hnamte, Vanlalruata, and Jamal Hussain. "DCNNBiLSTM: An efficient hybrid deep learning-based intrusion detection system." Telematics and Informatics Reports 10 (2023): 100053.
 
 ### Acknowledgements
 
