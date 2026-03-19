@@ -77,7 +77,7 @@ This automatically:
 To pull latest changes anytime:
 
 ```bash
-%cd /content/fl_clean
+%cd /content/drive/MyDrive/fl_clean
 !bash scripts/sync.sh
 ```
 
@@ -187,7 +187,7 @@ bash scripts/colab_init.sh
 
 **What it does:**
 - Checks if Google Drive is mounted
-- Checks if repository exists at `/content/fl_clean`
+- Checks if repository exists at `/content/drive/MyDrive/fl_clean`
   - If not: clones from GitHub
   - If exists: navigates to it
 - Runs `sync.sh` to pull latest changes
@@ -198,7 +198,7 @@ bash scripts/colab_init.sh
 🚀 Initializing Colab environment...
 
 ✓ Drive mounted at /content/drive
-✓ Repository found: /content/fl_clean
+✓ Repository found: /content/drive/MyDrive/fl_clean
 ✓ Branch: modular
 
 🔄 Syncing from GitHub...
@@ -208,7 +208,7 @@ bash scripts/colab_init.sh
 
 📊 Environment:
    Python: 3.10.12
-   Directory: /content/fl_clean
+   Directory: /content/drive/MyDrive/fl_clean
    Branch: modular
    GPU: Tesla T4
 

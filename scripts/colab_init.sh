@@ -7,7 +7,7 @@ set -e  # Exit on error
 
 # Constants
 REPO_URL="https://github.com/tungmv/fl_clean.git"
-REPO_DIR="/content/fl_clean"
+REPO_DIR="/content/drive/MyDrive/fl_clean"
 BRANCH="modular"
 
 # Colors for output
