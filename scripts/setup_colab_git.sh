@@ -72,8 +72,7 @@ read_pat_securely() {
     
     # Check if PAT is provided via environment variable (REQUIRED for Colab)
     if [ -n "$GITHUB_PAT" ]; then
-        print_info "Using PAT from environment variable"
-        # Trim whitespace
+        # Don't print here - just return the PAT silently
         pat=$(echo "$GITHUB_PAT" | xargs)
         echo "$pat"
         return 0
@@ -185,19 +184,10 @@ main() {
     # Check if credentials already exist
     if [ -f "$DRIVE_CRED_FILE" ]; then
         echo ""
-        print_info "Credentials already exist in Drive"
-        read -p "   Overwrite? (y/N): " -n 1 -r
-        echo ""
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            echo "Setup cancelled."
-            exit 0
-        fi
+        print_info "Credentials already exist - overwriting with new token"
     fi
     
-    # Guide user to create PAT
-    create_pat_guidance
-    
-    # Read PAT from user
+    # Read PAT from environment variable
     PAT=$(read_pat_securely)
     
     # Validate PAT
