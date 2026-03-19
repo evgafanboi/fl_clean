@@ -35,6 +35,7 @@ def create_private_dataset(
     to_categorical: bool = True,
     is_sequence: bool = False,
     poison_loader=None,
+    cache: bool = True,
 ) -> tf.data.Dataset:
     def generator() -> Iterator[Tuple[np.ndarray, np.ndarray]]:
         X_mmap = np.load(X_path, mmap_mode="r")
@@ -69,6 +70,17 @@ def create_private_dataset(
     )
 
     dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
+
+    if cache:
+        import hashlib
+        import os
+
+        cache_dir = os.path.join('temp_weights', 'dataset_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_key = hashlib.sha1(f"{X_path}:{y_path}".encode('utf-8')).hexdigest()
+        cache_file = os.path.join(cache_dir, f"{cache_key}.cache")
+        dataset = dataset.cache(cache_file)
+
     return dataset.unbatch().batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 

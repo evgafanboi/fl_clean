@@ -349,6 +349,7 @@ class FederatedLearningPipeline:
                 input_dim,
                 num_classes,
                 self.config.batch_size,
+                cache=True,
             )
             
             print(f"Training for {total_epochs} epochs independently")
@@ -440,7 +441,8 @@ class FederatedLearningPipeline:
             input_dim,
             num_classes,
             self.config.batch_size,
-            poison_loader=poison_loader
+            poison_loader=poison_loader,
+            cache=True,
         )
 
         X_train_mmap = np.load(paths['train_X'], mmap_mode='r')

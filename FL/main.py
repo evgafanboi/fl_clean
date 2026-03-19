@@ -49,8 +49,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda1", type=float, default=1.0, help="Weight for hybrid CE loss (for FedMLB)")
     parser.add_argument("--lambda2", type=float, default=1.0, help="Weight for KL divergence loss (for FedMLB)")
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for KL divergence (for FedMLB)")
-    # fedora
-    parser.add_argument("--rank", type=int, default=8, help="LoRA rank (for FedoRA)")
 
 
     # exp1
@@ -164,13 +162,11 @@ def main(argv=None):
 
             model=args.model,
             robust_epsilon=args.robust_epsilon,
-            robust_tau=args.robust_tau,
             poison=" ".join(args.poison) if args.poison else None,
             root_iterations=args.root_iterations,
             lambda1=args.lambda1,
             lambda2=args.lambda2,
             temperature=args.temperature,
-            rank=args.rank,
             personalized_eval=args.personalized_eval,
             trust_score=args.trust_score,
             peer_trust=args.peer_trust,
