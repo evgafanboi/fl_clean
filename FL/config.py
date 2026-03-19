@@ -21,6 +21,15 @@ class FDConfig:
     dkd_temp: float = 3.0
     personalized_eval: bool = False
     poison: str = None
+    exp1_lambda: float = 1.0
+    exp1_temperature: float = 3.0
+    exp2_ekd_lambda: float = 1.0
+    exp2_kd: str = "ekd"
+    ab_alpha: float = 1.0
+    ab_beta: float = 0.0
+    exp2_temperature: float = 4.0
+    robust_epsilon: float = 0.2
+    remove_dis: bool = False
 
     def to_algorithm_params(self) -> dict:
         return {

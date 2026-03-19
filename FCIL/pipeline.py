@@ -211,9 +211,19 @@ def run_fcil_pipeline(config: FCILConfig):
                           encoder_epochs=config.glfc_encoder_epochs,
                           model_selection=config.glfc_model_selection,
                           grad_enc=config.glfc_grad_enc)
+    elif config.cil_method == "cbkd":
+        from .cil.cbkd import CBKD
+        cil_method = CBKD(num_classes=num_classes, lam=config.cbkd_lambda,
+                          alpha=config.cbkd_alpha, beta=config.cbkd_beta,
+                          proto_size=config.cbkd_proto_size)
+    elif config.cil_method == "pass":
+        from .cil.proto_pass import PASS
+        cil_method = PASS(num_classes=num_classes, lam=config.cbkd_lambda,
+                          gamma=config.pass_gamma,
+                          proto_size=config.cbkd_proto_size)
     
     # Initialize global model
-    initial_classes = len(task_order[0]) if config.cil_method in ["lwf", "icarl", "bic", "foster", "glfc"] else num_classes
+    initial_classes = len(task_order[0]) if config.cil_method in ["lwf", "icarl", "bic", "foster", "glfc", "cbkd", "pass"] else num_classes
     global_model = create_model(initial_classes, input_dim, config.batch_size)
     
     # Logging
@@ -232,6 +242,7 @@ def run_fcil_pipeline(config: FCILConfig):
             log_file.flush()
     
     label_map = None
+    old_classes = set()  # all classes seen in previous tasks
 
     # Main loop: iterate through tasks
     for task_id in range(num_tasks):
@@ -314,8 +325,8 @@ def run_fcil_pipeline(config: FCILConfig):
                 if hasattr(cil_method, "set_client"):
                     cil_method.set_client(client_id)
 
-                # EWC/MAS: per-client importance → rebuild train step each client
-                if config.cil_method in ("ewc", "mas"):
+                # EWC/MAS/CBKD: per-client importance/prototypes → rebuild train step each client
+                if config.cil_method in ("ewc", "mas", "cbkd", "pass"):
                     if ssd_train_step is not None:
                         local_logits_model = client_model.get_logits_model()
                         active_train_step = cil_method.get_ssd_train_step(
@@ -331,6 +342,16 @@ def run_fcil_pipeline(config: FCILConfig):
                     config.partition_root, config.partition_type,
                     config.n_clients, client_id, task_id, config.strategy
                 )
+
+                # Log new/old class counts this client sees
+                _y_raw = np.load(paths['y'])
+                _labels_raw = _y_raw if len(_y_raw.shape) == 1 else np.argmax(_y_raw, axis=1)
+                _client_cls = set(np.unique(_labels_raw).tolist())
+                _new_cnt = len(_client_cls & set(task_classes))
+                _old_cnt = len(_client_cls & old_classes)
+                del _y_raw, _labels_raw
+                log(f"{COLORS.WARNING}[Client {client_id}: {_new_cnt} new classes, {_old_cnt} old classes]{COLORS.ENDC}",
+                    f"[Client {client_id}: {_new_cnt} new classes, {_old_cnt} old classes]")
                 
                 if hasattr(cil_method, "build_dataset"):
                     dataset, n_samples = cil_method.build_dataset(
@@ -359,6 +380,12 @@ def run_fcil_pipeline(config: FCILConfig):
                     cil_method.after_task(client_model, imp_dataset)
                     del imp_dataset
 
+                # CBKD/PASS: compute per-client prototypes + variance at last round of each task
+                if (config.cil_method in ("cbkd", "pass")
+                        and round_num == config.rounds_per_task - 1
+                        and task_id < num_tasks - 1):
+                    cil_method.after_task(client_model, paths['X'], paths['y'])
+
                 # GLFC: collect proto gradients after client trains
                 if hasattr(cil_method, "collect_proto_gradients"):
                     cil_method.collect_proto_gradients(
@@ -372,6 +399,14 @@ def run_fcil_pipeline(config: FCILConfig):
                         f"{COLORS.WARNING}Client {client_id}: Loss={loss:.4f}{COLORS.ENDC}",
                         f"Client {client_id}: Loss={loss:.4f}"
                     )
+
+                # CBKD/PASS: log individual loss components
+                if config.cil_method == "cbkd" and task_id > 0:
+                    log(f"{COLORS.OKCYAN}  CBKD Client {client_id}: L_CE={cil_method._last_ce:.4f}, L_CFD={cil_method._last_cfd:.4f}, L_proto={cil_method._last_proto:.4f}{COLORS.ENDC}",
+                        f"  CBKD Client {client_id}: L_CE={cil_method._last_ce:.4f}, L_CFD={cil_method._last_cfd:.4f}, L_proto={cil_method._last_proto:.4f}")
+                if config.cil_method == "pass" and task_id > 0:
+                    log(f"{COLORS.OKCYAN}  PASS Client {client_id}: L_CE={cil_method._last_ce:.4f}, L_KD={cil_method._last_kd:.4f}, L_proto={cil_method._last_proto:.4f}{COLORS.ENDC}",
+                        f"  PASS Client {client_id}: L_CE={cil_method._last_ce:.4f}, L_KD={cil_method._last_kd:.4f}, L_proto={cil_method._last_proto:.4f}")
             
             # Aggregate
             global_weights = aggregator.aggregate(client_weights, sample_sizes)
@@ -483,6 +518,8 @@ def run_fcil_pipeline(config: FCILConfig):
                 del eval_mask
             del X_test_pc, y_test_pc
             gc.collect()
+
+        old_classes.update(task_classes)
 
         # Clean up reusable client model for this task
         del client_model, cached_train_step

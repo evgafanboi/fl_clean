@@ -17,7 +17,6 @@ def parse_arguments():
     parser.add_argument("--partition_type", type=str, choices=["iid", "label_skew"], 
                        default="iid", help="Partitioning strategy")
     parser.add_argument("--alpha", type=float, default=0.1, help="Dirichlet alpha for label_skew")
-    parser.add_argument("--public_ratio", type=float, default=0.285, help="Fraction of training data as public dataset, at default, the total public set is 10% of the entire dataset")
     return parser.parse_args()
 
 def sample_dirichlet_counts(n_samples, n_clients, alpha, rng):
@@ -153,11 +152,10 @@ def main():
     print(f"Step 4/4: Generating distribution tables...")
     generate_distribution_table(output_dir, num_classes)
     
-    if args.public_ratio > 0:
-        print(f"Carving public splits ({args.public_ratio:.1%} of data)...")
-        carve_public_splits(output_dir, n_clients, num_classes, args.public_ratio, partition_type, rng)
-        print(f"Regenerating distribution tables with public/private splits...")
-        generate_distribution_table(output_dir, num_classes)
+    print(f"Carving public splits (5-20% random per client)...")
+    carve_public_splits(output_dir, n_clients, rng)
+    print(f"Regenerating distribution tables with public/private splits...")
+    generate_distribution_table(output_dir, num_classes)
     
     print(f"Partitioning complete! Data saved to: {output_dir}")
 
@@ -261,104 +259,26 @@ def generate_distribution_table(output_dir, num_classes):
     df_out = pd.DataFrame(table, columns=header)
     df_out.to_excel(os.path.join(output_dir, f'{base_name}.xlsx'), index=False)
 
-def largest_remainder_method(target, shares):
-    contributions = np.floor(target * shares).astype(int)
-    remainder = int(target - contributions.sum())
-    
-    if remainder > 0:
-        fractional_parts = target * shares - contributions
-        top_indices = np.argsort(-fractional_parts)[:remainder]
-        contributions[top_indices] += 1
-    
-    return contributions
-
-def compute_client_class_distribution(output_dir, n_clients, num_classes):
-    distribution = np.zeros((n_clients, num_classes), dtype=np.int64)
-    
-    for client_id in range(n_clients):
-        y_path = os.path.join(output_dir, f"client_{client_id}_y_train.npy")
-        y = np.load(y_path, mmap_mode='r')
+def carve_public_splits(output_dir, n_clients, rng):
+    for client_id in tqdm(range(n_clients), desc="Carving public/private"):
+        public_ratio = rng.uniform(0.05, 0.20)
         
-        for class_id in range(num_classes):
-            distribution[client_id, class_id] = np.sum(y == class_id)
-    
-    return distribution
-
-def carve_public_splits(output_dir, n_clients, num_classes, public_ratio, partition_type, rng):
-    if partition_type == "iid":
-        total_public = 0
-        total_private = 0
+        X = np.load(os.path.join(output_dir, f"client_{client_id}_X_train.npy"))
+        y = np.load(os.path.join(output_dir, f"client_{client_id}_y_train.npy"))
         
-        for client_id in tqdm(range(n_clients), desc="Carving public/private"):
-            X = np.load(os.path.join(output_dir, f"client_{client_id}_X_train.npy"))
-            y = np.load(os.path.join(output_dir, f"client_{client_id}_y_train.npy"))
-            
-            n_samples = len(y)
-            n_public = int(np.floor(public_ratio * n_samples))
-            
-            indices = np.arange(n_samples)
-            rng.shuffle(indices)
-            
-            public_indices = indices[:n_public]
-            private_indices = indices[n_public:]
-            
-            X_public = X[public_indices]
-            y_public = y[public_indices]
-            X_private = X[private_indices]
-            y_private = y[private_indices]
-            
-            np.save(os.path.join(output_dir, f"client_{client_id}_X_public.npy"), X_public)
-            np.save(os.path.join(output_dir, f"client_{client_id}_y_public.npy"), y_public)
-            np.save(os.path.join(output_dir, f"client_{client_id}_X_train.npy"), X_private)
-            np.save(os.path.join(output_dir, f"client_{client_id}_y_train.npy"), y_private)
-            
-            total_public += len(X_public)
-            total_private += len(X_private)
-    
-    else:
-        distribution = compute_client_class_distribution(output_dir, n_clients, num_classes)
-        class_totals = distribution.sum(axis=0)
+        n_samples = len(y)
+        n_public = int(np.floor(public_ratio * n_samples))
         
-        client_contributions = {i: {} for i in range(n_clients)}
+        indices = np.arange(n_samples)
+        rng.shuffle(indices)
         
-        for class_id in range(num_classes):
-            total_class = class_totals[class_id]
-            target_public = int(np.floor(public_ratio * total_class))
-            
-            if total_class == 0:
-                continue
-            
-            client_shares = distribution[:, class_id] / total_class
-            contributions = largest_remainder_method(target_public, client_shares)
-            
-            for client_id in range(n_clients):
-                if contributions[client_id] > 0:
-                    client_contributions[client_id][class_id] = int(contributions[client_id])
+        public_indices = indices[:n_public]
+        private_indices = indices[n_public:]
         
-        for client_id in tqdm(range(n_clients), desc="Carving public/private"):
-            X = np.load(os.path.join(output_dir, f"client_{client_id}_X_train.npy"))
-            y = np.load(os.path.join(output_dir, f"client_{client_id}_y_train.npy"))
-            
-            public_indices = []
-            
-            for class_id, target_count in client_contributions[client_id].items():
-                class_indices = np.where(y == class_id)[0]
-                rng.shuffle(class_indices)
-                selected = class_indices[:target_count]
-                public_indices.extend(selected)
-            
-            public_indices = np.array(public_indices, dtype=np.int64)
-            private_indices = np.setdiff1d(np.arange(len(y)), public_indices)
-            
-            X_public = X[public_indices]
-            y_public = y[public_indices]
-            X_private = X[private_indices]
-            y_private = y[private_indices]
-            
-            np.save(os.path.join(output_dir, f"client_{client_id}_X_public.npy"), X_public)
-            np.save(os.path.join(output_dir, f"client_{client_id}_y_public.npy"), y_public)
-            np.save(os.path.join(output_dir, f"client_{client_id}_X_train.npy"), X_private)
-            np.save(os.path.join(output_dir, f"client_{client_id}_y_train.npy"), y_private)
+        np.save(os.path.join(output_dir, f"client_{client_id}_X_public.npy"), X[public_indices])
+        np.save(os.path.join(output_dir, f"client_{client_id}_y_public.npy"), y[public_indices])
+        np.save(os.path.join(output_dir, f"client_{client_id}_X_train.npy"), X[private_indices])
+        np.save(os.path.join(output_dir, f"client_{client_id}_y_train.npy"), y[private_indices])
 
 if __name__ == "__main__":
     main()

@@ -8,6 +8,7 @@ import tensorflow as tf
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
+from ..context import PipelineContext, evaluate_model
 from .base import DistillationStrategy
 from .common import create_model, create_private_dataset
 
@@ -206,8 +207,7 @@ class FederatedDistillation(DistillationStrategy):
         print(f"{COLORS.OKGREEN}Using FULL test set{COLORS.ENDC}")
 
         for client_id, paths in enumerate(context.paths):
-            model = create_model(context.input_dim, context.num_classes, context.config.batch_size)
-            context.add_client_state(client_id, model, paths)
+            context.add_client_state(client_id, None, paths)
 
         global_logits: Dict[int, Dict[int, np.ndarray]] = {
             state.client_id: {} for state in context.client_states
@@ -241,6 +241,11 @@ class FederatedDistillation(DistillationStrategy):
 
         print(f"\n{COLORS.OKCYAN}[STEP 1/3] Local training with distillation{COLORS.ENDC}")
         per_client_counts: Dict[int, Dict[int, int]] = {}
+        all_client_logits: Dict[int, Dict[int, np.ndarray]] = {}
+        all_client_counts_for_round: Dict[int, Dict[int, int]] = {}
+        all_client_metrics = []
+        round_metrics: Dict[int, Dict[str, float]] = {}
+        pool = context.model_pool
 
         for state in context.client_states:
             print(f"\n{COLORS.BOLD}Client {state.client_id}{COLORS.ENDC}")
@@ -275,8 +280,9 @@ class FederatedDistillation(DistillationStrategy):
 
             global_logits = global_logits_per_client.get(state.client_id, {})
 
-            state.model = local_training_with_distillation(
-                state.model,
+            model = pool.checkout(state.client_id)
+            model = local_training_with_distillation(
+                model,
                 private_dataset,
                 global_logits,
                 context.num_classes,
@@ -286,17 +292,8 @@ class FederatedDistillation(DistillationStrategy):
                 client_class_counts=client_counts,
             )
 
-            del private_dataset
-            aggressive_memory_cleanup()
-
-        print(f"\n{COLORS.OKCYAN}[STEP 2/3] Generating per-class logits from trained models{COLORS.ENDC}")
-        all_client_logits: Dict[int, Dict[int, np.ndarray]] = {}
-        all_client_counts_for_round: Dict[int, Dict[int, int]] = {}
-
-        for state in context.client_states:
-            print(f"\n{COLORS.BOLD}Client {state.client_id}{COLORS.ENDC}")
             logits, counts = generate_per_class_logits(
-                state.model,
+                model,
                 state.paths["train_X"],
                 state.paths["train_y"],
                 context.num_classes,
@@ -304,7 +301,30 @@ class FederatedDistillation(DistillationStrategy):
             all_client_logits[state.client_id] = logits
             all_client_counts_for_round[state.client_id] = counts
 
-        print(f"\n{COLORS.OKCYAN}[STEP 3/3] Aggregating logits per client{COLORS.ENDC}")
+            metrics = evaluate_model(model, context.test_dataset, context.test_labels)
+            pool.checkin(state.client_id, model)
+            all_client_metrics.append(metrics)
+            round_metrics[state.client_id] = metrics
+            context.logger.info(
+                "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                round_number,
+                state.client_id,
+                metrics["Acc"],
+                metrics["F1"],
+                metrics["Precision"],
+                metrics["Recall"],
+                metrics["Loss"],
+            )
+            print(
+                f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, "
+                f"F1={metrics['F1']:.4f}, Precision={metrics['Precision']:.4f}, "
+                f"Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+            )
+
+            del private_dataset
+            aggressive_memory_cleanup()
+
+        print(f"\n{COLORS.OKCYAN}[STEP 2/3] Aggregating logits per client{COLORS.ENDC}")
         new_global_logits: Dict[int, Dict[int, np.ndarray]] = {}
 
         for client_id in all_client_logits:
@@ -332,49 +352,28 @@ class FederatedDistillation(DistillationStrategy):
 
         context.shared_state["global_logits"] = new_global_logits
 
-        all_client_metrics = []
-        round_metrics: Dict[int, Dict[str, float]] = {}
-        
-        for state in context.client_states:
-            metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
-            all_client_metrics.append(metrics)
-            round_metrics[state.client_id] = metrics
-            if config.personalized_eval:
-                context.logger.info(
-                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
-                    round_number,
-                    state.client_id,
-                    metrics["Acc"],
-                    metrics["F1"],
-                    metrics["Precision"],
-                    metrics["Recall"],
-                )
-                print(
-                    f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, "
-                    f"F1={metrics['F1']:.4f}, Precision={metrics['Precision']:.4f}, "
-                    f"Recall={metrics['Recall']:.4f}{COLORS.ENDC}"
-                )
-        
         avg_metrics = {
             "Acc": np.mean([m["Acc"] for m in all_client_metrics]),
             "F1": np.mean([m["F1"] for m in all_client_metrics]),
             "Precision": np.mean([m["Precision"] for m in all_client_metrics]),
             "Recall": np.mean([m["Recall"] for m in all_client_metrics]),
+            "Loss": np.mean([m["Loss"] for m in all_client_metrics]),
         }
         round_metrics[-1] = avg_metrics
         
         print(
             f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
             f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
-            f"Recall={avg_metrics['Recall']:.4f}{COLORS.ENDC}"
+            f"Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
         )
         context.logger.info(
-            "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+            "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
             round_number,
             avg_metrics["Acc"],
             avg_metrics["F1"],
             avg_metrics["Precision"],
             avg_metrics["Recall"],
+            avg_metrics["Loss"],
         )
 
         round_time = time.time() - round_start

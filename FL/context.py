@@ -1,9 +1,45 @@
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 import numpy as np
 import tensorflow as tf
 from sklearn.metrics import f1_score, precision_score, recall_score
+
+MODEL_WEIGHTS_DIR = os.path.join("temp_weights", "model_weights")
+
+
+class ModelPool:
+    def __init__(self, pool_size, factory_fn, weights_dir=MODEL_WEIGHTS_DIR):
+        if os.path.isdir(weights_dir):
+            for f in os.listdir(weights_dir):
+                os.remove(os.path.join(weights_dir, f))
+        os.makedirs(weights_dir, exist_ok=True)
+        self.weights_dir = weights_dir
+        self._available = [factory_fn() for _ in range(pool_size)]
+        self._init_path = os.path.join(weights_dir, "_init.weights.h5")
+        self._available[0].model.save_weights(self._init_path)
+
+    def _path(self, client_id, tag=""):
+        suffix = f"_{tag}" if tag else ""
+        return os.path.join(self.weights_dir, f"c{client_id}{suffix}.weights.h5")
+
+    def checkout(self, client_id, tag=""):
+        model = self._available.pop()
+        path = self._path(client_id, tag)
+        weights_path = path if os.path.exists(path) else self._init_path
+        model.model.load_weights(weights_path)
+        return model
+
+    def checkin(self, client_id, model, tag=""):
+        model.model.save_weights(self._path(client_id, tag))
+        self._available.append(model)
+
+    def release(self, model):
+        self._available.append(model)
+
+    def save(self, client_id, model, tag=""):
+        model.model.save_weights(self._path(client_id, tag))
 
 
 @dataclass
@@ -34,6 +70,7 @@ class PipelineContext:
     shared_state: Dict[str, Any] = field(default_factory=dict)
     poisoned_clients: List[int] = field(default_factory=list)
     poison_loader: Any = None
+    model_pool: Any = None
 
     def add_client_state(self, client_id: int, model: Any, paths: Dict[str, str], **extras: Any) -> ClientState:
         state = ClientState(client_id=client_id, model=model, paths=paths, data=dict(extras))

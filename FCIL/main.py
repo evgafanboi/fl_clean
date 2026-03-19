@@ -47,7 +47,7 @@ def main():
     
     # CIL settings
     parser.add_argument('--cil', type=str, default='finetune',
-                        choices=['finetune', 'ewc', 'mas', 'lwf', 'icarl', 'bic', 'foster', 'glfc'],
+                        choices=['finetune', 'ewc', 'mas', 'lwf', 'icarl', 'bic', 'foster', 'glfc', 'cbkd', 'pass'],
                         help='CIL method')
     parser.add_argument('--ewc_lambda', type=float, default=10.0,
                         help='EWC regularization strength (normalized, typical range: 0.1-10)')
@@ -71,6 +71,16 @@ def main():
                         help='FOSTER Stage 2 compression epochs')
     parser.add_argument('--bic_val_split', type=float, default=0.4,
                         help='BiC fraction of each class reserved for bias correction validation')
+    parser.add_argument('--cbkd_lambda', type=float, default=10.0,
+                        help='CBKD prototype loss weight')
+    parser.add_argument('--cbkd_alpha', type=float, default=10.0,
+                        help='CBKD inter-class CFD weight')
+    parser.add_argument('--cbkd_beta', type=float, default=10.0,
+                        help='CBKD intra-class CFD weight')
+    parser.add_argument('--proto_size', type=int, default=50,
+                        help='CBKD/PASS augmented prototypes per class')
+    parser.add_argument('--pass_gamma', type=float, default=10.0,
+                        help='PASS feature KD weight (gamma)')
     parser.add_argument('--encoder_epochs', type=int, default=50,
                         help='GLFC: perturbation optimisation epochs for proto samples')
     parser.add_argument('--model_selection', action='store_true',
@@ -147,6 +157,15 @@ def main():
         if args.model_selection:
             parts.append("msel")
             parts.append(f"ge_{args.grad_enc}")
+    if args.cil == 'cbkd':
+        parts.append(f"lam{args.cbkd_lambda}")
+        parts.append(f"a{args.cbkd_alpha}")
+        parts.append(f"b{args.cbkd_beta}")
+        parts.append(f"ps{args.proto_size}")
+    if args.cil == 'pass':
+        parts.append(f"lam{args.cbkd_lambda}")
+        parts.append(f"g{args.pass_gamma}")
+        parts.append(f"ps{args.proto_size}")
     if args.strategy == 'FedSSD':
         parts.append(f"ssd{args.m_max}")
     log_file = f"results_cil/{'_'.join(parts)}.log"
@@ -169,6 +188,11 @@ def main():
         glfc_encoder_epochs=args.encoder_epochs,
         glfc_model_selection=args.model_selection,
         glfc_grad_enc=args.grad_enc,
+        cbkd_lambda=args.cbkd_lambda,
+        cbkd_alpha=args.cbkd_alpha,
+        cbkd_beta=args.cbkd_beta,
+        cbkd_proto_size=args.proto_size,
+        pass_gamma=args.pass_gamma,
         partition_type=args.partition_type,
         partition_root=partition_root,
         task_order_file=task_order_file,

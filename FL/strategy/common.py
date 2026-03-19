@@ -20,7 +20,7 @@ def create_model(input_dim: int, num_classes: int, batch_size: int, model_type: 
     if model_type_normalized == "gru":
         if gru is None:
             raise ValueError("GRU model requested but models.gru is unavailable")
-        return gru.create_enhanced_gru_model((1, input_dim), num_classes, batch_size)
+        return gru.create_gru_model(input_dim, num_classes, batch_size)
     raise ValueError(f"Unknown model type: {model_type}")
 
 
@@ -83,12 +83,15 @@ def load_public_dataset_from_clients(
 ) -> Tuple[tf.data.Dataset, int]:
     chunk_size = 10000
     public_files = []
+    feature_dim = None
     
     for paths in paths_iterable:
         public_X = paths.get("public_X")
         public_y = paths.get("public_y")
         if public_X and tf.io.gfile.exists(public_X):
             X_mmap = np.load(public_X, mmap_mode='r')
+            if feature_dim is None:
+                feature_dim = int(X_mmap.shape[1]) if X_mmap.ndim > 1 else int(X_mmap.shape[0])
             if return_labels:
                 if not public_y or not tf.io.gfile.exists(public_y):
                     raise ValueError("Public labels requested but missing")
@@ -139,21 +142,21 @@ def load_public_dataset_from_clients(
         
         if is_sequence:
             output_signature = (
-                tf.TensorSpec(shape=(None, 1, None), dtype=tf.float32),
+                tf.TensorSpec(shape=(None, 1, feature_dim), dtype=tf.float32),
                 tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32)
             )
         else:
             output_signature = (
-                tf.TensorSpec(shape=(None, None), dtype=tf.float32),
+                tf.TensorSpec(shape=(None, feature_dim), dtype=tf.float32),
                 tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32)
             )
         
         dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
     else:
         if is_sequence:
-            output_signature = tf.TensorSpec(shape=(None, 1, None), dtype=tf.float32)
+            output_signature = tf.TensorSpec(shape=(None, 1, feature_dim), dtype=tf.float32)
         else:
-            output_signature = tf.TensorSpec(shape=(None, None), dtype=tf.float32)
+            output_signature = tf.TensorSpec(shape=(None, feature_dim), dtype=tf.float32)
         
         dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
     
@@ -161,11 +164,6 @@ def load_public_dataset_from_clients(
         dataset = dataset.shuffle(buffer_size=min(10000, total_samples))
     
     return dataset.unbatch().batch(batch_size).prefetch(tf.data.AUTOTUNE), total_samples
-    
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=min(10000, total_samples))
-    
-    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE), total_samples
 
 
 def numpy_from_dataset(dataset: tf.data.Dataset) -> np.ndarray:

@@ -123,7 +123,75 @@ class RobustFilter:
         robust_mean = np.average(filtered_samples, axis=0, weights=filtered_weights)
         
         return robust_mean
-    
+
+    def compute_robust_mean_debug(
+        self,
+        samples: List[np.ndarray],
+        weights: Optional[List[float]] = None,
+    ) -> Tuple[np.ndarray, Optional[float], List[int]]:
+        """
+        Like compute_robust_mean but also returns debug information.
+
+        Returns:
+            (robust_mean, max_eigenvalue, removed_indices)
+            max_eigenvalue: largest absolute eigenvalue of the covariance matrix,
+                            or None when spectral norm was below threshold.
+            removed_indices: 0-based indices of samples filtered out (empty list
+                             when nothing was removed).
+        """
+        if len(samples) == 0:
+            raise ValueError("Empty sample list")
+
+        if len(samples) == 1:
+            return samples[0], None, []
+
+        n = len(samples)
+        d = samples[0].shape[0]
+
+        S = np.vstack(samples)
+
+        if weights is None:
+            w = np.ones(n) / n
+        else:
+            w = np.array(weights) / np.sum(weights)
+
+        mu_S = np.average(S, axis=0, weights=w)
+        centered = S - mu_S
+        Sigma = np.cov(centered.T, aweights=w)
+
+        if d == 1:
+            spectral_norm = np.abs(Sigma)
+            max_eigenvalue = float(spectral_norm)
+            v_star = np.array([1.0])
+        else:
+            eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
+            max_eigenvalue_idx = np.argmax(np.abs(eigenvalues))
+            max_eigenvalue = float(np.abs(eigenvalues[max_eigenvalue_idx]))
+            spectral_norm = np.linalg.norm(Sigma, ord=2)
+            v_star = eigenvectors[:, max_eigenvalue_idx]
+
+        threshold = self.threshold(self.epsilon, d)
+
+        if spectral_norm <= threshold:
+            return mu_S, max_eigenvalue, []
+
+        projections = np.dot(centered, v_star)
+        delta = self.slack_function(self.epsilon, spectral_norm)
+        T = self._find_threshold(projections, w, d, delta)
+
+        filtered_mask = np.abs(projections) <= (T + delta)
+        removed_indices = list(np.where(~filtered_mask)[0])
+
+        if np.sum(filtered_mask) == 0:
+            return mu_S, max_eigenvalue, removed_indices
+
+        filtered_samples = S[filtered_mask]
+        filtered_weights = w[filtered_mask]
+        filtered_weights = filtered_weights / np.sum(filtered_weights)
+        robust_mean = np.average(filtered_samples, axis=0, weights=filtered_weights)
+
+        return robust_mean, max_eigenvalue, removed_indices
+
     def _find_threshold(
         self,
         projections: np.ndarray,

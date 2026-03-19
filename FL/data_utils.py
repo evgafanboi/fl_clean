@@ -8,6 +8,8 @@ from .colors import COLORS
 
 _TestDatasetCache = Optional[Tuple[np.ndarray, np.ndarray]]
 _test_dataset_cache: _TestDatasetCache = None
+_test_tf_dataset_cache = None
+_test_tf_dataset_batch_size = None
 
 
 def parse_partition_type(partition_type: str) -> Tuple[str, int]:
@@ -112,7 +114,7 @@ def create_client_dataset(
 
 
 def load_test_dataset(batch_size: int, num_classes: int) -> tf.data.Dataset:
-    global _test_dataset_cache
+    global _test_dataset_cache, _test_tf_dataset_cache, _test_tf_dataset_batch_size
 
     if _test_dataset_cache is None:
         X_test = np.load("data/X_test.npy")
@@ -124,6 +126,10 @@ def load_test_dataset(batch_size: int, num_classes: int) -> tf.data.Dataset:
         _test_dataset_cache = (X_test, y_test)
         print(f"{COLORS.OKGREEN}Test dataset cached ({X_test.shape[0]} samples){COLORS.ENDC}")
 
-    X_test, y_test = _test_dataset_cache
-    dataset = tf.data.Dataset.from_tensor_slices((X_test, y_test))
-    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    if _test_tf_dataset_cache is None or _test_tf_dataset_batch_size != batch_size:
+        X_test, y_test = _test_dataset_cache
+        dataset = tf.data.Dataset.from_tensor_slices((X_test, y_test))
+        _test_tf_dataset_cache = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        _test_tf_dataset_batch_size = batch_size
+
+    return _test_tf_dataset_cache

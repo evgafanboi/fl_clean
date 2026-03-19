@@ -4,10 +4,15 @@ import time
 import tensorflow as tf
 
 
-def aggressive_memory_cleanup(sleep_seconds: float = 0.1) -> None:
+def aggressive_memory_cleanup(sleep_seconds: float = 0.0) -> None:
+    gc.collect()
+    gc.collect()
+    if sleep_seconds > 0:
+        time.sleep(sleep_seconds)
+
+
+def clear_tf_session_and_gc() -> None:
+    """Full TF reset — only call when truly switching model architecture."""
     tf.keras.backend.clear_session()
-    tf.compat.v1.reset_default_graph()
     gc.collect()
     gc.collect()
-    gc.collect()
-    time.sleep(sleep_seconds)

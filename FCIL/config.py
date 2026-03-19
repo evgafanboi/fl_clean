@@ -46,5 +46,14 @@ class FCILConfig:
     glfc_model_selection: bool = True
     glfc_grad_enc: str = "main"
 
+    # CBKD settings
+    cbkd_lambda: float = 10.0
+    cbkd_alpha: float = 10.0
+    cbkd_beta: float = 10.0
+    cbkd_proto_size: int = 50
+
+    # PASS settings (reuses cbkd_lambda, cbkd_proto_size)
+    pass_gamma: float = 10.0
+
     # SSD settings
     m_max: float = 1.0

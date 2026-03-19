@@ -47,6 +47,30 @@ def apply_label_flip_poison(y, num_classes):
     return y_poisoned
 
 
+def apply_gaussian_noise_scale(model, scale):
+    """Gaussian noise model poisoning for federated distillation (no global model).
+
+    Computes the variance *v* of the entire flattened weight vector, then
+    for every weight tensor *w*:
+        w' = w + N(0,1) * v          (noisy weights)
+        w_fin = scale * (w' - w) + w  (scaled update, same as standard FL)
+             = w + scale * N(0,1) * v
+    """
+    keras_model = model.model if hasattr(model, "model") else model
+    weights = keras_model.get_weights()
+
+    all_params = np.concatenate([w.flatten() for w in weights])
+    v = float(np.var(all_params))
+
+    poisoned_weights = []
+    for w in weights:
+        noise = np.random.normal(0.0, 1.0, size=w.shape).astype(w.dtype)
+        w_fin = w + scale * noise * v
+        poisoned_weights.append(w_fin)
+
+    keras_model.set_weights(poisoned_weights)
+
+
 class PoisonedDataLoader:
     
     def __init__(self, attack_type, num_classes):

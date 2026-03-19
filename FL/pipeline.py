@@ -25,6 +25,10 @@ from .gpu import configure_gpu_memory
 from .logging_utils import log_timestamp, setup_logger
 from .memory import aggressive_memory_cleanup
 from .model_factory import create_model
+from .decentralized import (
+    braintorrent_select_server, log_braintorrent_selection,
+    compute_model_similarity_scores, select_model_similarity_server, log_model_similarity_selection,
+)
 from .poison_utils import parse_poison_config, get_or_create_poisoned_clients, PoisonedDataLoader
 
 
@@ -58,6 +62,7 @@ class FLConfig:
     m_max: float = 1.0
     support: bool = False
     threshold: float = 0.3
+    decentralized: Optional[str] = None
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -371,7 +376,7 @@ class FederatedLearningPipeline:
                 partition_type=self.partition_label,
                 collect_details=False,
             )
-            test_loss, accuracy, f1, precision, recall, _, _, _, _ = metrics
+            test_loss, accuracy, f1, precision, recall, _, _, _ = metrics
             
             self.logger.info(
                 f"Client {client_idx} | PERSONALIZED | Acc: {accuracy:.4f} | F1: {f1:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f} | Loss: {test_loss:.4f}"
@@ -386,6 +391,8 @@ class FederatedLearningPipeline:
         log_timestamp(self.logger, "Independent learning completed")
         print(f"{COLORS.OKGREEN}Independent learning completed!{COLORS.ENDC}")
 
+    _WRAPPER_STRATEGIES = frozenset({'fedprox', 'feddyn', 'fedmlb', 'fedora'})
+
     def _train_single_client(
         self,
         client_id: int,
@@ -393,79 +400,17 @@ class FederatedLearningPipeline:
         num_classes: int,
         latest_weights,
         paths,
+        reuse_model=None,
     ):
-        tf.keras.backend.clear_session()
         print(f"\n{COLORS.BOLD}Client {client_id}{COLORS.ENDC}")
 
         client_start_time = time.time()
         log_timestamp(self.logger, f"Client {client_id} training started")
 
-        # FedKEESS: After warmup, use SSD wrapper with k teachers (excluding own bin)
-        if self.config.strategy == "FedKEESS" and self.current_round > self.config.warmup_rounds:
-            if hasattr(self, 'fedkeess_models') and self.fedkeess_models is not None:
-                from models.fedkeess_wrapper import FedKEESSModel
-                
-                # Get client's bin assignment
-                client_bin = self.fedkeess_bin_assignments[client_id]
-                k = len(self.fedkeess_models)
-                
-                # Count clients per bin
-                bin_sizes = {}
-                for cid, bid in enumerate(self.fedkeess_bin_assignments):
-                    bin_sizes[bid] = bin_sizes.get(bid, 0) + 1
-                
-                client_bin_size = bin_sizes[client_bin]
-                
-                # Teacher selection: exclude own bin ONLY if singleton
-                if client_bin_size == 1:
-                    # Singleton: can't distill from self
-                    teacher_indices = [i for i in range(k) if i != client_bin]
-                    print(f"  Client {client_id} in singleton bin {client_bin}, distilling from {len(teacher_indices)} other bins")
-                else:
-                    # Multi-client: distill from all bins (including own, since aggregation differs)
-                    teacher_indices = list(range(k))
-                    print(f"  Client {client_id} in bin {client_bin} (size={client_bin_size}), distilling from all {len(teacher_indices)} bins")
-                
-                teacher_models = [self.fedkeess_models[i] for i in teacher_indices]
-                teacher_M_class = [self.fedkeess_M_class[i] for i in teacher_indices]
-                
-                # Create base model
-                base_model = create_model(
-                    architecture=self.config.model,
-                    input_dim=input_dim,
-                    num_classes=num_classes,
-                    batch_size=self.config.batch_size,
-                    strategy_runtime=None,
-                    client_id=None,
-                )
-                
-                # Wrap with FedKEESS SSD (k-1 teachers, excluding own bin)
-                model = FedKEESSModel(
-                    base_model=base_model,
-                    k_teachers=len(teacher_models),
-                    num_classes=num_classes,
-                    m_max=self.config.m_max,
-                )
-                
-                # Set teachers (all OTHER bins' models + their M_class)
-                if len(teacher_models) > 0:
-                    model.set_teachers(
-                        teacher_weights_list=teacher_models,
-                        M_class_list=teacher_M_class,
-                    )
-                
-                # Initialize client's model with its assigned bin's model
-                model.set_weights(self.fedkeess_models[client_bin])
-            else:
-                model = create_model(
-                    architecture=self.config.model,
-                    input_dim=input_dim,
-                    num_classes=num_classes,
-                    batch_size=self.config.batch_size,
-                    strategy_runtime=self.strategy_runtime,
-                    client_id=client_id,
-                )
+        if reuse_model is not None:
+            model = reuse_model
         else:
+            tf.keras.backend.clear_session()
             model = create_model(
                 architecture=self.config.model,
                 input_dim=input_dim,
@@ -504,7 +449,7 @@ class FederatedLearningPipeline:
 
         print(f"Training client {client_id} for {self.config.epochs} epochs")
         
-        if self.config.strategy in ["FedSSD1", "FedSSDexp", "FedSSD2"] and self.strategy_runtime and hasattr(self.strategy_runtime.client_strategy, 'train'):
+        if self.config.strategy in ["FedSSDexp"] and self.strategy_runtime and hasattr(self.strategy_runtime.client_strategy, 'train'):
             if latest_weights is not None:
                 global_model = create_model(
                     architecture=self.config.model,
@@ -528,6 +473,7 @@ class FederatedLearningPipeline:
                 batch_size=self.config.batch_size,
                 epochs=self.config.epochs,
             )
+            del global_model
             loss = 0.0
             history = None
         else:
@@ -564,40 +510,29 @@ class FederatedLearningPipeline:
         trained_weights = model.get_weights()
         poisoned_weights = self._apply_poison_to_weights(trained_weights, latest_weights, client_id)
 
-        # Apply Secure Aggregation masking if enabled
         if self.config.strategy == "SecureAggregation":
-            poisoned_weights = self._apply_secure_aggregation_mask(
-                client_id,
-                poisoned_weights
-            )
+            poisoned_weights = self._apply_secure_aggregation_mask(client_id, poisoned_weights)
 
-        weights_file = os.path.join(
-            self.config.weights_cache_dir,
-            f"client_{client_id}_round_{self.current_round}_weights.pkl"
-        )
-
-        # For FLTrust, save model update (new_weights - old_weights)
         if self.config.strategy == "FLTrust":
             if latest_weights is None:
-                update = poisoned_weights
+                result_data = poisoned_weights
             else:
-                update = [new_w - old_w for new_w, old_w in zip(poisoned_weights, latest_weights)]
-            with open(weights_file, 'wb') as file_handler:
-                pickle.dump(update, file_handler)
+                result_data = [new_w - old_w for new_w, old_w in zip(poisoned_weights, latest_weights)]
         elif self.config.strategy == "FedDyn":
             feddyn_data = model.get_feddyn_update()
             if 'weights' in feddyn_data:
                 feddyn_data['weights'] = poisoned_weights
-            with open(weights_file, 'wb') as file_handler:
-                pickle.dump(feddyn_data, file_handler)
+            result_data = feddyn_data
         else:
-            with open(weights_file, 'wb') as file_handler:
-                pickle.dump(poisoned_weights, file_handler)
+            result_data = poisoned_weights
 
-        del model, train_dataset, history
+        del train_dataset, trained_weights
+        if reuse_model is None:
+            del model
+        del history
         aggressive_memory_cleanup()
 
-        return weights_file, sample_size, loss
+        return result_data, sample_size, loss
 
     def _load_client_weights(self, weights_files: List[str]):
         weights_list = []
@@ -610,20 +545,24 @@ class FederatedLearningPipeline:
                     weights_list.append(saved_data)
         return weights_list
 
+    _NEEDS_ALL_WEIGHTS = frozenset({'feddyn', 'fltrust', 'fedcomed', 'robustfilter'})
+
+    def _can_stream_aggregate(self) -> bool:
+        """Check if strategy supports incremental (streaming) aggregation."""
+        strategy_name = getattr(self.strategy_runtime.client_strategy, 'name', '').lower()
+        if strategy_name in self._NEEDS_ALL_WEIGHTS:
+            return False
+        if self.config.peer_trust:
+            return False
+        if self.config.decentralized == "ModelSimilarity":
+            return False
+        return True
+
     def _aggregate(self, weights_list, sample_sizes, participating_clients, global_update=None, models=None):
         aggregator = self.strategy_runtime.aggregator
         
-        # FedoRA requires weight_matrices extraction from Dense layers
-        if self.config.strategy == "FedoRA":
-            weight_matrices_list = [self._extract_weight_matrices(model) for model in models]
-            aggregated_weights, global_weight_matrices = aggregator.aggregate(
-                weights_list, 
-                sample_sizes, 
-                delta_weights_list=weight_matrices_list  # Reuse parameter name for compatibility
-            )
-            return aggregated_weights, global_weight_matrices
         # FLTrust requires global_update parameter
-        elif self.config.strategy == "FLTrust":
+        if self.config.strategy == "FLTrust":
             return aggregator.aggregate(weights_list, sample_sizes, global_update=global_update)
         elif self.strategy_runtime.requires_participant_ids:
             return aggregator.aggregate(weights_list, sample_sizes, participating_clients)
@@ -720,17 +659,20 @@ class FederatedLearningPipeline:
         num_classes,
         class_names,
         round_num,
-        partition_label
+        partition_label,
+        eval_model=None,
     ):
-        tf.keras.backend.clear_session()
-        eval_model = create_model(
-            architecture=self.config.model,
-            input_dim=input_dim,
-            num_classes=num_classes,
-            batch_size=self.config.batch_size,
-            strategy_runtime=self.strategy_runtime,
-            client_id=None,
-        )
+        created_model = eval_model is None
+        if created_model:
+            tf.keras.backend.clear_session()
+            eval_model = create_model(
+                architecture=self.config.model,
+                input_dim=input_dim,
+                num_classes=num_classes,
+                batch_size=self.config.batch_size,
+                strategy_runtime=self.strategy_runtime,
+                client_id=None,
+            )
         eval_model.set_weights(aggregated_weights)
 
         test_dataset = self._get_test_dataset(num_classes)
@@ -764,7 +706,8 @@ class FederatedLearningPipeline:
         if class_report and self.detailed_logger is not None:
             self.detailed_logger.info(f"Round {round_num}\n{class_report}")
 
-        del eval_model, test_dataset
+        if created_model:
+            del eval_model
         aggressive_memory_cleanup()
 
         return test_loss, accuracy, f1_score_value, precision, recall, per_class_metrics, confusion_mat
@@ -788,11 +731,15 @@ class FederatedLearningPipeline:
 
         extra_log_tokens = self.strategy_runtime.extra_log_tokens() if hasattr(self.strategy_runtime, 'extra_log_tokens') else {}
 
+        extra_tokens = list(extra_log_tokens.values())
+        if self.config.decentralized:
+            extra_tokens.append(self.config.decentralized)
+
         self.logger, self.log_filename, self.detailed_logger = setup_logger(
             n_clients,
             partition_label,
             strategy_name=self.config.strategy,
-            extra_tokens=list(extra_log_tokens.values()),
+            extra_tokens=extra_tokens,
             poison_suffix=poison_suffix,
         )
         excel_filename = self.log_filename.replace('.log', '.xlsx')
@@ -806,7 +753,7 @@ class FederatedLearningPipeline:
         paths_list = self._prepare_paths(n_clients, partition_label, client_count)
         
         # Skip partition restoration for strategies that need separate public/validation data
-        if self.config.strategy not in ["FLTrust", "FedSSD1", "FedSSD2"]:
+        if self.config.strategy not in ["FLTrust"]:
             self._restore_partitions(paths_list)
         
         self.n_clients = n_clients
@@ -830,108 +777,43 @@ class FederatedLearningPipeline:
 
         # Initialize Secure Aggregation DH keys if needed
         self._init_secure_aggregation_keys(n_clients)
-        
-        # Initialize FedKEESS state
-        self.fedkeess_models = None
-        self.fedkeess_M_class = None
-        self.fedkeess_bin_assignments = None
+
+        ms_prev_scores = None
 
         latest_weights = None
         pipeline_start_time = time.time()
         log_timestamp(self.logger, "=== FL PIPELINE STARTED ===")
         log_timestamp(self.logger, f"Strategy: {self.config.strategy}, Clients: {n_clients}, Rounds: {self.config.rounds}")
         round_times: List[float] = []
-        
+
         # Special handling for None strategy (independent learning)
         if self.config.strategy == "None":
             self._run_independent_learning(n_clients, input_dim, num_classes, paths_list)
             return
-        
-        if self.config.strategy == "FedMLB":
-            print(f"\n{COLORS.OKCYAN}Initializing FedMLB server model{COLORS.ENDC}")
-            log_timestamp(self.logger, "Initializing server model")
-            init_model = create_model(
-                architecture=self.config.model,
-                input_dim=input_dim,
-                num_classes=num_classes,
-                batch_size=self.config.batch_size,
-                strategy_runtime=self.strategy_runtime,
-                client_id=None,
-            )
-            latest_weights = init_model.get_weights()
-            del init_model
+
+        # Initialize global server model — reuse across clients if strategy allows
+        print(f"\n{COLORS.OKCYAN}Initializing global server model{COLORS.ENDC}")
+        log_timestamp(self.logger, "Initializing server model")
+        reusable_model = create_model(
+            architecture=self.config.model,
+            input_dim=input_dim,
+            num_classes=num_classes,
+            batch_size=self.config.batch_size,
+            strategy_runtime=self.strategy_runtime,
+            client_id=None,
+        )
+        latest_weights = reusable_model.get_weights()
+        _strategy_key = getattr(self.strategy_runtime.client_strategy, 'name', '').lower()
+        can_reuse = _strategy_key not in self._WRAPPER_STRATEGIES
+        if not can_reuse:
+            del reusable_model
+            reusable_model = None
             aggressive_memory_cleanup()
-            print(f"{COLORS.OKGREEN}Server model initialized with random weights{COLORS.ENDC}")
-        
-        if self.config.strategy == "FedSSD1":
-            print(f"\n{COLORS.OKCYAN}Initializing FedSSD1 server model{COLORS.ENDC}")
-            log_timestamp(self.logger, "Initializing server model")
-            init_model = create_model(
-                architecture=self.config.model,
-                input_dim=input_dim,
-                num_classes=num_classes,
-                batch_size=self.config.batch_size,
-                strategy_runtime=self.strategy_runtime,
-                client_id=None,
-            )
-            latest_weights = init_model.get_weights()
-            del init_model
-            aggressive_memory_cleanup()
-            print(f"{COLORS.OKGREEN}Server model initialized with random weights{COLORS.ENDC}")
-            
-            # Initialize M_class (will be updated before using)
-            self.strategy_runtime.aggregator.M_class = np.ones(num_classes, dtype=np.float32)
-            print(f"{COLORS.OKCYAN}M_class initialized to ones (will be computed from CMs in each round){COLORS.ENDC}")
+        print(f"{COLORS.OKGREEN}Server model initialized (reuse={can_reuse}){COLORS.ENDC}")
 
         if self.config.strategy == "FedSSDexp":
-            print(f"\n{COLORS.OKCYAN}Initializing FedSSDexp server model{COLORS.ENDC}")
-            log_timestamp(self.logger, "Initializing server model")
-            init_model = create_model(
-                architecture=self.config.model,
-                input_dim=input_dim,
-                num_classes=num_classes,
-                batch_size=self.config.batch_size,
-                strategy_runtime=self.strategy_runtime,
-                client_id=None,
-            )
-            latest_weights = init_model.get_weights()
-            del init_model
-            aggressive_memory_cleanup()
-            print(f"{COLORS.OKGREEN}Server model initialized with random weights{COLORS.ENDC}")
-            
             self.strategy_runtime.aggregator.M_class = np.ones(num_classes, dtype=np.float32)
             print(f"{COLORS.OKCYAN}M_class initialized to ones (will be computed from full training data in each round){COLORS.ENDC}")
-
-        if self.config.strategy == "FedSSD2":
-            print(f"\n{COLORS.OKCYAN}Initializing FedSSD2 server model{COLORS.ENDC}")
-            log_timestamp(self.logger, "Initializing server model")
-            init_model = create_model(
-                architecture=self.config.model,
-                input_dim=input_dim,
-                num_classes=num_classes,
-                batch_size=self.config.batch_size,
-                strategy_runtime=self.strategy_runtime,
-                client_id=None,
-            )
-            latest_weights = init_model.get_weights()
-            del init_model
-            aggressive_memory_cleanup()
-            print(f"{COLORS.OKGREEN}Server model initialized with random weights{COLORS.ENDC}")
-            
-            self.strategy_runtime.aggregator.M_class = np.ones(num_classes, dtype=np.float32)
-            print(f"{COLORS.OKCYAN}M_class initialized to ones (will be computed from pseudo-CM in each round){COLORS.ENDC}")
-            
-            # Load public unlabeled dataset
-            partition_path = os.path.join("data", "partitions", f"{n_clients}_client", partition_label)
-            all_public_X = []
-            for client_idx in range(n_clients):
-                public_X = np.load(os.path.join(partition_path, f"client_{client_idx}_X_public.npy"))
-                all_public_X.append(public_X)
-            
-            self.fedssd2_public_X = np.concatenate(all_public_X, axis=0).astype(np.float32)
-            print(f"{COLORS.OKGREEN}Loaded public unlabeled dataset ({self.fedssd2_public_X.shape[0]:,} samples){COLORS.ENDC}")
-            del all_public_X
-            aggressive_memory_cleanup()
 
         for round_num in range(1, self.config.rounds + 1):
             self.current_round = round_num
@@ -941,82 +823,15 @@ class FederatedLearningPipeline:
             print(f"\n{COLORS.HEADER}Round {round_num}/{self.config.rounds}{COLORS.ENDC}")
             log_timestamp(self.logger, f"--- Round {round_num} started ---")
 
-            # FedSSD1: Stage 1 - Collect confusion matrices before training
-            if self.config.strategy == "FedSSD1" and latest_weights is not None:
-                print(f"\n{COLORS.OKCYAN}[FedSSD1 Stage 1] Collecting confusion matrices from clients{COLORS.ENDC}")
-                log_timestamp(self.logger, "FedSSD1 Stage 1: Confusion matrix collection")
-                
-                global_model_for_cm = create_model(
-                    architecture=self.config.model,
-                    input_dim=input_dim,
-                    num_classes=num_classes,
-                    batch_size=self.config.batch_size,
-                    strategy_runtime=self.strategy_runtime,
-                    client_id=-1,
-                )
-                global_model_for_cm.set_weights(latest_weights)
-                
-                # Extract Keras model if wrapped
-                keras_model = global_model_for_cm.model if hasattr(global_model_for_cm, 'model') else global_model_for_cm
-                
-                confusion_matrices = []
-                support_counts_list = []
-                
-                for client_idx in range(n_clients):
-                    # Load client public slice (validation set representing local distribution)
-                    val_dataset = create_client_dataset(
-                        paths_list[client_idx]['public_X'],
-                        paths_list[client_idx]['public_y'],
-                        input_dim,
-                        num_classes,
-                        self.config.batch_size,
-                    )
-                    
-                    # Compute confusion matrix incrementally
-                    cm = np.zeros((num_classes, num_classes), dtype=np.int32)
-                    class_counts = np.zeros(num_classes, dtype=np.int32)
-                    
-                    for batch_X, batch_y in val_dataset:
-                        predictions = keras_model(batch_X, training=False)
-                        pred_labels = tf.argmax(predictions, axis=1).numpy()
-                        true_labels = tf.argmax(batch_y, axis=1).numpy() if batch_y.shape.ndims > 1 else batch_y.numpy()
-                        
-                        # Update confusion matrix incrementally
-                        for true_label, pred_label in zip(true_labels, pred_labels):
-                            cm[true_label, pred_label] += 1
-                            class_counts[true_label] += 1
-                    
-                    # Normalize to proportions
-                    cm_normalized = np.zeros_like(cm, dtype=np.float32)
-                    for k in range(num_classes):
-                        row_sum = cm[k, :].sum()
-                        if row_sum > 0:
-                            cm_normalized[k, :] = cm[k, :].astype(np.float32) / row_sum
-                    
-                    confusion_matrices.append(cm_normalized)
-                    support_counts_list.append(class_counts)
-                    
-                    print(f"  Client {client_idx}: CM shape={cm.shape}, support={class_counts.sum()}")
-                
-                del global_model_for_cm, val_dataset
-                aggressive_memory_cleanup()
-                
-                # Aggregate confusion matrices
-                print(f"{COLORS.OKCYAN}[FedSSD1 Stage 1] Aggregating confusion matrices{COLORS.ENDC}")
-                aggregated_cm = self.strategy_runtime.aggregator.aggregate_confusion_matrices(
-                    confusion_matrices=confusion_matrices,
-                    support_counts=support_counts_list if self.config.support else None,
-                    num_classes=num_classes,
-                )
-                
-                # Compute M_class
-                M_class = self.strategy_runtime.aggregator.compute_M_class(
-                    confusion_matrix=aggregated_cm,
-                    num_classes=num_classes,
-                )
-                
-                print(f"{COLORS.OKGREEN}  M_class computed: min={M_class.min():.4f}, max={M_class.max():.4f}, mean={M_class.mean():.4f}{COLORS.ENDC}")
-                log_timestamp(self.logger, f"FedSSD1 M_class: min={M_class.min():.4f}, max={M_class.max():.4f}, mean={M_class.mean():.4f}")
+            # BrainTorrent: select server before each round
+            if self.config.decentralized == "braintorrent":
+                selected_server = braintorrent_select_server(latest_weights, n_clients)
+                log_braintorrent_selection(round_num, selected_server, n_clients, self.logger)
+
+            # ModelSimilarity: log server selection from previous round's scores
+            if self.config.decentralized == "ModelSimilarity" and ms_prev_scores is not None:
+                ms_server = select_model_similarity_server(ms_prev_scores)
+                log_model_similarity_selection(round_num, ms_prev_scores, ms_server, self.logger)
 
             # FedSSDexp: Stage 1 - Compute M_class from full training data
             if self.config.strategy == "FedSSDexp" and latest_weights is not None:
@@ -1082,144 +897,60 @@ class FederatedLearningPipeline:
                 print(f"{COLORS.OKGREEN}  M_class aggregated: min={M_class.min():.4f}, max={M_class.max():.4f}, mean={M_class.mean():.4f}{COLORS.ENDC}")
                 log_timestamp(self.logger, f"FedSSDexp M_class: min={M_class.min():.4f}, max={M_class.max():.4f}, mean={M_class.mean():.4f}")
 
-            # FedSSD2: Stage 1 - Pseudo-labeling and pseudo-CM computation
-            if self.config.strategy == "FedSSD2" and latest_weights is not None:
-                print(f"\n{COLORS.OKCYAN}[FedSSD2 Stage 1] Collecting client predictions on public data{COLORS.ENDC}")
-                log_timestamp(self.logger, "FedSSD2 Stage 1: Pseudo-labeling")
-                
-                prediction_files = []
-                
-                for client_idx in range(n_clients):
-                    model = create_model(
-                        architecture=self.config.model,
-                        input_dim=input_dim,
-                        num_classes=num_classes,
-                        batch_size=self.config.batch_size,
-                        strategy_runtime=self.strategy_runtime,
-                        client_id=client_idx,
-                    )
-                    model.set_weights(latest_weights)
-                    
-                    keras_model = model.model if hasattr(model, 'model') else model
-                    
-                    predictions = []
-                    for start_idx in range(0, len(self.fedssd2_public_X), self.config.batch_size):
-                        end_idx = min(start_idx + self.config.batch_size, len(self.fedssd2_public_X))
-                        batch_X = self.fedssd2_public_X[start_idx:end_idx]
-                        batch_pred = keras_model(batch_X, training=False).numpy()
-                        predictions.append(batch_pred)
-                    
-                    client_predictions = np.vstack(predictions)
-                    
-                    # Save predictions to disk
-                    pred_file = os.path.join('temp_weights', f'fedssd2_pred_client_{client_idx}.npy')
-                    np.save(pred_file, client_predictions)
-                    prediction_files.append(pred_file)
-                    
-                    print(f"  Client {client_idx}: Predicted {client_predictions.shape[0]} public samples (saved to disk)")
-                    
-                    del model, keras_model, predictions, client_predictions
-                    aggressive_memory_cleanup()
-                
-                # Load predictions and vote for pseudo-labels
-                print(f"{COLORS.OKCYAN}[FedSSD2 Stage 1] Voting for pseudo-labels (threshold={self.config.threshold}){COLORS.ENDC}")
-                all_client_predictions = [np.load(f) for f in prediction_files]
-                pseudo_labels = self.strategy_runtime.aggregator.hard_label_vote(
-                    all_client_predictions,
-                    num_classes,
-                    threshold=self.config.threshold
-                )
-                del all_client_predictions
-                aggressive_memory_cleanup()
-                
-                # Filter out unlabeled samples (marked as num_classes)
-                labeled_mask = pseudo_labels < num_classes
-                n_labeled = labeled_mask.sum()
-                n_unlabeled = len(pseudo_labels) - n_labeled
-                
-                print(f"  Pseudo-labels: {n_labeled:,} labeled, {n_unlabeled:,} unlabeled (kept unlabeled)")
-                log_timestamp(self.logger, f"FedSSD2 pseudo-labeling: {n_labeled}/{len(pseudo_labels)} samples labeled")
-                
-                if n_labeled == 0:
-                    print(f"{COLORS.WARNING}No samples exceeded voting threshold - skipping Stage 1{COLORS.ENDC}")
-                    log_timestamp(self.logger, "FedSSD2 Stage 1 skipped: no confident pseudo-labels")
-                else:
-                    # Use only labeled samples
-                    X_public_labeled = self.fedssd2_public_X[labeled_mask]
-                    pseudo_labels_filtered = pseudo_labels[labeled_mask]
-                    
-                    # Train global model on pseudo-labeled public data
-                    print(f"{COLORS.OKCYAN}[FedSSD2 Stage 1] Training global model on {n_labeled:,} pseudo-labeled samples{COLORS.ENDC}")
-                    global_model_for_pseudo = create_model(
-                        architecture=self.config.model,
-                        input_dim=input_dim,
-                        num_classes=num_classes,
-                        batch_size=self.config.batch_size,
-                        strategy_runtime=self.strategy_runtime,
-                        client_id=-1,
-                    )
-                    global_model_for_pseudo.set_weights(latest_weights)
-                    
-                    pseudo_y_onehot = tf.keras.utils.to_categorical(pseudo_labels_filtered, num_classes).astype(np.float32)
-                    pseudo_dataset = tf.data.Dataset.from_tensor_slices((X_public_labeled, pseudo_y_onehot))
-                    pseudo_dataset = pseudo_dataset.batch(self.config.batch_size).prefetch(tf.data.AUTOTUNE)
-                    
-                    global_model_for_pseudo.fit(pseudo_dataset, epochs=1, verbose=0)
-                    
-                    # Compute pseudo-confusion matrix (using only labeled samples)
-                    print(f"{COLORS.OKCYAN}[FedSSD2 Stage 1] Computing pseudo-confusion matrix{COLORS.ENDC}")
-                    pseudo_cm = self.strategy_runtime.aggregator.compute_pseudo_confusion_matrix(
-                        model=global_model_for_pseudo,
-                        X_public=X_public_labeled,
-                        pseudo_labels=pseudo_labels_filtered,
-                        num_classes=num_classes,
-                        batch_size=self.config.batch_size,
-                    )
-                    
-                    # Compute M_class from pseudo-CM
-                    M_class = self.strategy_runtime.aggregator.compute_M_class_from_cm(
-                        confusion_matrix=pseudo_cm,
-                        num_classes=num_classes,
-                    )
-                    
-                    print(f"{COLORS.OKGREEN}  Pseudo-CM computed, M_class: min={M_class.min():.4f}, max={M_class.max():.4f}, mean={M_class.mean():.4f}{COLORS.ENDC}")
-                    log_timestamp(self.logger, f"FedSSD2 M_class: min={M_class.min():.4f}, max={M_class.max():.4f}, mean={M_class.mean():.4f}")
-                    
-                    del global_model_for_pseudo, pseudo_dataset, pseudo_y_onehot, X_public_labeled, pseudo_labels_filtered, pseudo_cm, M_class
-                
-                # Clean up temporary prediction files
-                for pred_file in prediction_files:
-                    if os.path.exists(pred_file):
-                        os.remove(pred_file)
-                
-                del pseudo_labels, labeled_mask, prediction_files
-                aggressive_memory_cleanup()
-
-            weights_files = []
+            stream = self._can_stream_aggregate()
             sample_sizes: List[int] = []
             client_losses: List[float] = []
             participating_clients: List[int] = []
 
+            # Streaming aggregation accumulators (only used when stream=True)
+            running_agg = None
+            total_samples_seen = 0
+
+            # Only needed when stream=False
+            client_results: List = [] if not stream else None
+
             for client_idx in range(n_clients):
-                weights_file, sample_size, loss = self._train_single_client(
+                result_data, sample_size, loss = self._train_single_client(
                     client_id=client_idx,
                     input_dim=input_dim,
                     num_classes=num_classes,
                     latest_weights=latest_weights,
                     paths=paths_list[client_idx],
+                    reuse_model=reusable_model,
                 )
-                weights_files.append(weights_file)
                 sample_sizes.append(sample_size)
                 client_losses.append(loss)
                 participating_clients.append(client_idx)
 
+                if stream:
+                    w = result_data['weights'] if isinstance(result_data, dict) and 'weights' in result_data else result_data
+                    if running_agg is None:
+                        running_agg = [layer_w.astype(np.float64) * sample_size for layer_w in w]
+                    else:
+                        for j, layer_w in enumerate(w):
+                            running_agg[j] += layer_w.astype(np.float64) * sample_size
+                    total_samples_seen += sample_size
+                    del result_data, w
+                else:
+                    client_results.append(result_data)
+
             if not participating_clients:
                 break
 
-            weights_list = self._load_client_weights(weights_files)
+            if stream:
+                latest_weights = [
+                    (layer / total_samples_seen).astype(np.float32)
+                    for layer in running_agg
+                ]
+                del running_agg
+            else:
+                weights_list = [
+                    d['weights'] if isinstance(d, dict) and 'weights' in d else d
+                    for d in client_results
+                ]
             
-            # Compute peer trust scores if enabled
-            if self.config.peer_trust:
+            # Compute peer trust scores if enabled (requires non-streamed weights_list)
+            if not stream and self.config.peer_trust:
                 peer_scores = self._compute_peer_trust_scores(weights_list, participating_clients)
                 self.logger.info(f"\n=== Peer Trust Scores (Round {round_num}) ===")
                 for client_id in participating_clients:
@@ -1229,185 +960,34 @@ class FederatedLearningPipeline:
                     self.logger.info(f"Client {client_id}: Left={left_str}, Right={right_str}")
                     print(f"{COLORS.OKCYAN}Client {client_id} PeerTrust: Left={left_str}, Right={right_str}{COLORS.ENDC}")
             
-            # For FedoRA, reload models to extract weight matrices from Dense layers
-            models_list = None
-            if self.config.strategy == "FedoRA":
-                models_list = []
-                model_arch = self.config.model
-                batch_size = self.config.batch_size
-                strategy_runtime = self.strategy_runtime
-                for weights_file in weights_files:
-                    model = create_model(model_arch, input_dim, num_classes, batch_size, strategy_runtime, client_id=None)
-                    saved_data = np.load(weights_file, allow_pickle=True)
-                    model.set_weights(saved_data)
-                    models_list.append(model)
-            
-            # For FLTrust, compute server update on root dataset
-            global_update = None
-            if self.config.strategy == "FLTrust":
-                print(f"\n{COLORS.OKBLUE}Training server on root dataset{COLORS.ENDC}")
-                global_update = self._train_server_on_root_dataset(latest_weights, input_dim, num_classes)
-            
-            print(f"\n{COLORS.OKBLUE}Aggregating updates ({self.config.strategy}){COLORS.ENDC}")
-            
-            # FedKEESS: Handle clustering and multi-model aggregation
-            if self.config.strategy == "FedKEESS" and round_num > self.config.warmup_rounds:
+            if not stream:
+                models_list = None
+                
+                # For FLTrust, compute server update on root dataset
+                global_update = None
+                if self.config.strategy == "FLTrust":
+                    print(f"\n{COLORS.OKBLUE}Training server on root dataset{COLORS.ENDC}")
+                    global_update = self._train_server_on_root_dataset(latest_weights, input_dim, num_classes)
+                
+                print(f"\n{COLORS.OKBLUE}Aggregating updates ({self.config.strategy}){COLORS.ENDC}")
+                
                 aggregated_result = self._aggregate(weights_list, sample_sizes, participating_clients, global_update, models_list)
                 
-                # Extract k global models and bin assignments
-                global_models_list = aggregated_result['global_models']
-                bin_assignments = aggregated_result['bin_assignments']
-                k = len(global_models_list)
-                
-                print(f"{COLORS.OKCYAN}FedKEESS: {k} clusters generated{COLORS.ENDC}")
-                log_timestamp(self.logger, f"FedKEESS: Clustered into {k} bins")
-                
-                # Log bin distribution
-                bin_counts = {}
-                for client_id, bin_id in enumerate(bin_assignments):
-                    bin_counts[bin_id] = bin_counts.get(bin_id, 0) + 1
-                bin_dist = ", ".join([f"Bin {i}: {bin_counts.get(i, 0)} clients" for i in range(k)])
-                print(f"{COLORS.OKCYAN}  Distribution: {bin_dist}{COLORS.ENDC}")
-                log_timestamp(self.logger, f"Bin distribution: {bin_dist}")
-                
-                # Log detailed bin assignments
-                bin_members = {i: [] for i in range(k)}
-                for client_id, bin_id in enumerate(bin_assignments):
-                    bin_members[bin_id].append(client_id)
-                for bin_id in range(k):
-                    members_str = ", ".join([str(cid) for cid in bin_members[bin_id]])
-                    print(f"{COLORS.OKCYAN}  Bin {bin_id}: clients [{members_str}]{COLORS.ENDC}")
-                    log_timestamp(self.logger, f"Bin {bin_id} members: [{members_str}]")
-                
-                # Collect confusion matrices from each client for all k models
-                model_arch = self.config.model
-                batch_size = self.config.batch_size
-                strategy_runtime = self.strategy_runtime
-                
-                confusion_matrices_per_client = []
-                for client_idx in range(n_clients):
-                    client_confusion_matrices = []
-                    for model_idx, global_model_weights in enumerate(global_models_list):
-                        # Create temp model and set weights
-                        temp_model = create_model(
-                            architecture=model_arch,
-                            input_dim=input_dim,
-                            num_classes=num_classes,
-                            batch_size=batch_size,
-                            strategy_runtime=strategy_runtime,
-                            client_id=client_idx,
-                        )
-                        temp_model.set_weights(global_model_weights)
-                        
-                        # Load client's private dataset
-                        test_dataset = create_client_dataset(
-                            paths_list[client_idx]['train_X'],
-                            paths_list[client_idx]['train_y'],
-                            input_dim,
-                            num_classes,
-                            batch_size,
-                        )
-                        
-                        # Compute confusion matrix
-                        y_true = []
-                        y_pred = []
-                        for batch_X, batch_y in test_dataset:
-                            predictions = temp_model.predict(batch_X, verbose=0)
-                            y_pred.extend(np.argmax(predictions, axis=1))
-                            y_true.extend(np.argmax(batch_y.numpy(), axis=1) if batch_y.numpy().ndim > 1 else batch_y.numpy())
-                        
-                        from sklearn.metrics import confusion_matrix
-                        cm = confusion_matrix(y_true, y_pred, labels=range(num_classes))
-                        client_confusion_matrices.append(cm)
-                        del temp_model
-                    
-                    confusion_matrices_per_client.append(client_confusion_matrices)
-                    aggressive_memory_cleanup()
-                
-                # Aggregate confusion matrices per bin
-                aggregated_confusion_matrices = self.strategy_runtime.aggregate_confusion_matrices(
-                    confusion_matrices_per_client,
-                    bin_assignments,
-                    k,
-                    num_classes,
-                )
-                
-                # Compute M_class per bin from aggregated confusion matrices
-                M_class_per_bin = []
-                for bin_idx in range(k):
-                    cm = aggregated_confusion_matrices[bin_idx]
-                    M_class = self.strategy_runtime.compute_ssd_weights(cm, num_classes)
-                    M_class_per_bin.append(M_class)
-                
-                # Store for next round (clients will use these k models and M_class values for SSD)
-                self.fedkeess_models = global_models_list
-                self.fedkeess_M_class = M_class_per_bin
-                self.fedkeess_bin_assignments = bin_assignments
-                
-                # Evaluate all k global models
-                print(f"\n{COLORS.OKBLUE}Evaluating {k} global models{COLORS.ENDC}")
-                log_timestamp(self.logger, f"Evaluating {k} FedKEESS global models")
-                
-                bin_metrics = []
-                for bin_idx, bin_weights in enumerate(global_models_list):
-                    print(f"{COLORS.OKCYAN}  Evaluating Bin {bin_idx} model...{COLORS.ENDC}")
-                    metrics = self._evaluate_global_model(
-                        bin_weights,
-                        input_dim,
-                        num_classes,
-                        class_names,
-                        round_num,
-                        partition_label,
-                    )
-                    test_loss, accuracy, f1_value, precision, recall, _, _ = metrics
-                    bin_metrics.append({
-                        'loss': test_loss,
-                        'accuracy': accuracy,
-                        'f1': f1_value,
-                        'precision': precision,
-                        'recall': recall,
-                    })
-                    print(f"{COLORS.OKGREEN}  Bin {bin_idx}: Loss={test_loss:.4f}, Acc={accuracy:.4f}, F1={f1_value:.4f}{COLORS.ENDC}")
-                    log_timestamp(self.logger, f"Bin {bin_idx}: Loss={test_loss:.4f}, Acc={accuracy:.4f}, F1={f1_value:.4f}")
-                
-                # Compute weighted average based on bin sizes
-                total_clients = sum(bin_counts.values())
-                avg_loss = sum(bin_metrics[i]['loss'] * bin_counts.get(i, 0) for i in range(k)) / total_clients
-                avg_accuracy = sum(bin_metrics[i]['accuracy'] * bin_counts.get(i, 0) for i in range(k)) / total_clients
-                avg_f1 = sum(bin_metrics[i]['f1'] * bin_counts.get(i, 0) for i in range(k)) / total_clients
-                
-                print(f"{COLORS.HEADER}Weighted Average: Loss={avg_loss:.4f}, Acc={avg_accuracy:.4f}, F1={avg_f1:.4f}{COLORS.ENDC}")
-                log_timestamp(self.logger, f"FedKEESS Weighted Avg: Loss={avg_loss:.4f}, Acc={avg_accuracy:.4f}, F1={avg_f1:.4f}")
-                
-                # Use first bin for Excel reporting (legacy compatibility)
-                latest_weights = global_models_list[0]
-                # Store bin metrics for potential multi-model Excel export
-                self.fedkeess_bin_metrics = bin_metrics
-                
-            else:
-                aggregated_result = self._aggregate(weights_list, sample_sizes, participating_clients, global_update, models_list)
-            
-            # For FedoRA, handle special return format (weights, weight_matrices)
-            if self.config.strategy == "FedoRA":
-                latest_weights, global_weight_matrices = aggregated_result
-                # Apply global weight_matrices to model (will be broadcast to clients)
-                temp_model = create_model(self.config.model, input_dim, num_classes, self.config.batch_size, self.strategy_runtime, client_id=None)
-                temp_model.set_weights(latest_weights)
-                self._set_weight_matrices(temp_model, global_weight_matrices)
-                latest_weights = temp_model.get_weights()
-                del temp_model, models_list
-                aggressive_memory_cleanup()
-            # For FLTrust, apply update to get new weights
-            elif self.config.strategy == "FLTrust":
-                if latest_weights is None:
-                    latest_weights = aggregated_result
+                # For FLTrust, apply update to get new weights
+                if self.config.strategy == "FLTrust":
+                    if latest_weights is None:
+                        latest_weights = aggregated_result
+                    else:
+                        latest_weights = [old_w + update for old_w, update in zip(latest_weights, aggregated_result)]
                 else:
-                    # Apply update: w_new = w_old + aggregated_update
-                    latest_weights = [old_w + update for old_w, update in zip(latest_weights, aggregated_result)]
-            else:
-                latest_weights = aggregated_result
+                    latest_weights = aggregated_result
 
-            del weights_list
+                # ModelSimilarity: compute cosine similarity of each client's model vs global for next round
+                if self.config.decentralized == "ModelSimilarity":
+                    ms_prev_scores = compute_model_similarity_scores(weights_list, latest_weights, participating_clients)
+
+                del weights_list, client_results
+
             aggressive_memory_cleanup()
 
             eval_start_time = time.time()
@@ -1418,6 +998,7 @@ class FederatedLearningPipeline:
                 class_names,
                 round_num,
                 partition_label,
+                eval_model=reusable_model,
             )
             test_loss, accuracy, f1_value, precision, recall, per_class_metrics, confusion_mat = metrics
 
@@ -1458,12 +1039,7 @@ class FederatedLearningPipeline:
             round_times.append(round_time)
             log_timestamp(self.logger, f"--- Round {round_num} completed in {round_time:.2f}s ---")
 
-            for weights_file in weights_files:
-                if round_num != self.config.rounds and os.path.exists(weights_file):
-                    os.remove(weights_file)
-
             aggressive_memory_cleanup()
-            time.sleep(1)
 
         pipeline_end_time = time.time()
         total_time = pipeline_end_time - pipeline_start_time
@@ -1487,7 +1063,8 @@ def run_pipeline(config: FLConfig) -> None:
 
 def run_distillation_pipeline(config, strategy) -> None:
     from .config import FDConfig
-    from .context import evaluate_model
+    from .context import evaluate_model, ModelPool
+    from .strategy.common import create_model as create_strategy_model
     
     partition_label, client_count = parse_partition_type(config.partition_type)
     n_clients = min(config.n_clients, client_count)
@@ -1518,7 +1095,7 @@ def run_distillation_pipeline(config, strategy) -> None:
     paths_list = [setup_paths(str(i), partition_label, client_count) for i in range(n_clients)]
     
     # Restore partitions for strategies that DON'T use public dataset
-    strategies_without_public = ["FD", "FedProto", "FedDKD"]
+    strategies_without_public = ["FD", "FedProto", "FedDKD", "Exp1"]
     if strategy.name in strategies_without_public:
         from .data_utils import restore_full_partition
         restored_count = sum(restore_full_partition(paths) for paths in paths_list)
@@ -1527,6 +1104,12 @@ def run_distillation_pipeline(config, strategy) -> None:
     
     test_dataset = load_test_dataset(config.batch_size, num_classes)
     test_labels = _extract_labels(test_dataset, num_classes)
+
+    model_type = getattr(config, "model_type", "dense")
+    model_pool = ModelPool(
+        pool_size=min(10, n_clients),
+        factory_fn=lambda: create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type),
+    )
     
     poisoned_clients = []
     poison_loader = None
@@ -1557,6 +1140,7 @@ def run_distillation_pipeline(config, strategy) -> None:
         shared_state={"extra_log_tokens": extra_log_tokens},
         poisoned_clients=poisoned_clients,
         poison_loader=poison_loader,
+        model_pool=model_pool,
     )
     
     log_timestamp(logger, "SIMULATION STARTED")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Dict, List
 
@@ -17,15 +18,51 @@ from .common import (
     numpy_from_dataset,
 )
 
+LOGITS_CACHE_DIR = os.path.join("temp_weights", "fedmd_logits")
 
-def generate_public_logits(model_wrapper, public_features: np.ndarray, batch_size: int) -> np.ndarray:
+
+def generate_public_logits_to_file(model_wrapper, public_features: np.ndarray, batch_size: int, output_path: str) -> tuple:
     logits_model = model_wrapper.get_logits_model() if hasattr(model_wrapper, "get_logits_model") else model_wrapper
-    dataset = tf.data.Dataset.from_tensor_slices(public_features).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    logits: List[np.ndarray] = []
-    for batch in dataset:
-        outputs = logits_model(batch, training=False)
-        logits.append(outputs.numpy())
-    return np.concatenate(logits, axis=0)
+
+    chunk_size = 500_000
+    total_rows = 0
+    num_classes = None
+
+    with open(output_path, "wb") as fp:
+        for start in range(0, len(public_features), chunk_size):
+            chunk = public_features[start : start + chunk_size]
+            logits = logits_model.predict(chunk, batch_size=batch_size, verbose=0)
+            if num_classes is None:
+                num_classes = logits.shape[1]
+            fp.write(logits.astype(np.float32).tobytes())
+            total_rows += logits.shape[0]
+            del logits, chunk
+
+    return output_path, (total_rows, num_classes)
+
+
+def compute_consensus_from_files(logit_files: List[str], shape: tuple) -> np.ndarray:
+    """Stream-average logits from multiple files without loading all into RAM."""
+    n_clients = len(logit_files)
+    n_samples, n_classes = shape
+    consensus = np.zeros(shape, dtype=np.float32)
+
+    chunk_rows = 100000
+    row_bytes = n_classes * 4
+
+    for fpath in logit_files:
+        with open(fpath, "rb") as f:
+            offset = 0
+            while offset < n_samples:
+                rows = min(chunk_rows, n_samples - offset)
+                raw = f.read(rows * row_bytes)
+                chunk = np.frombuffer(raw, dtype=np.float32).reshape(rows, n_classes)
+                consensus[offset:offset + rows] += chunk
+                offset += rows
+                del chunk
+
+    consensus /= n_clients
+    return consensus
 
 
 def digest_phase(
@@ -40,25 +77,26 @@ def digest_phase(
 
     optimizer = keras_model.optimizer or tf.keras.optimizers.Adam(learning_rate=0.001)
     keras_model.optimizer = optimizer
-    mae_loss = tf.keras.losses.MeanAbsoluteError()
+    mae_loss_fn = tf.keras.losses.MeanAbsoluteError()
 
-    dataset = (
-        tf.data.Dataset.from_tensor_slices((public_features, consensus_logits))
-        .batch(batch_size)
-        .prefetch(tf.data.AUTOTUNE)
-    )
+    @tf.function
+    def train_step(batch_X, batch_consensus):
+        with tf.GradientTape() as tape:
+            student_logits = logits_model(batch_X, training=True)
+            loss = mae_loss_fn(batch_consensus, student_logits)
+        gradients = tape.gradient(loss, keras_model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+        return loss
 
+    n_samples = len(public_features)
     for epoch in range(epochs):
+        perm = np.random.permutation(n_samples)
         epoch_loss = 0.0
         batches = 0
-        for batch_X, batch_consensus in dataset:
-            with tf.GradientTape() as tape:
-                student_logits = logits_model(batch_X, training=True)
-                loss = mae_loss(batch_consensus, student_logits)
-
-            gradients = tape.gradient(loss, keras_model.trainable_variables)
-            optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
-
+        for start in range(0, n_samples, batch_size):
+            end = min(start + batch_size, n_samples)
+            idx = perm[start:end]
+            loss = train_step(public_features[idx], consensus_logits[idx])
             epoch_loss += float(loss)
             batches += 1
 
@@ -81,7 +119,6 @@ class FedMD(DistillationStrategy):
         self.digest_epochs = 1
         self.transfer_epochs = config.epochs
         self.revisit_epochs = config.epochs
-        self.revisit_batch_fraction = 0.25
 
     def extra_log_tokens(self) -> Dict[str, float]:
         return {"gamma": self.config.gamma}
@@ -99,6 +136,12 @@ class FedMD(DistillationStrategy):
             is_sequence=is_sequence,
         )
         public_features = numpy_from_dataset(public_unlabeled_ds)
+        del public_unlabeled_ds
+
+        os.makedirs(LOGITS_CACHE_DIR, exist_ok=True)
+        pub_path = os.path.join(LOGITS_CACHE_DIR, "public_features.npy")
+        np.save(pub_path, public_features)
+        del public_features
 
         public_labeled_ds, _ = load_public_dataset_from_clients(
             context.paths,
@@ -111,7 +154,7 @@ class FedMD(DistillationStrategy):
 
         context.shared_state.update(
             {
-                "public_features": public_features,
+                "public_features_path": pub_path,
                 "public_sample_count": total_public,
                 "public_dataset_labeled": public_labeled_ds,
                 "is_sequence": is_sequence,
@@ -121,15 +164,10 @@ class FedMD(DistillationStrategy):
         print(f"{COLORS.OKGREEN}Using FULL test set{COLORS.ENDC}")
 
         for client_id, paths in enumerate(context.paths):
-            model = create_model(
-                context.input_dim,
-                context.num_classes,
-                context.config.batch_size,
-                model_type=context.config.model_type,
-            )
-            state = context.add_client_state(client_id, model, paths)
+            state = context.add_client_state(client_id, None, paths)
+            model = context.model_pool.checkout(client_id)
             print(f"Client {state.client_id}: initial transfer learning")
-            state.model.fit(public_labeled_ds, epochs=self.transfer_epochs, verbose=1)
+            model.fit(public_labeled_ds, epochs=self.transfer_epochs, verbose=1)
 
             private_dataset = create_private_dataset(
                 paths["train_X"],
@@ -139,88 +177,108 @@ class FedMD(DistillationStrategy):
                 context.config.batch_size,
                 is_sequence=is_sequence,
             )
-            state.model.fit(private_dataset, epochs=self.revisit_epochs, verbose=1)
+            model.fit(private_dataset, epochs=self.revisit_epochs, verbose=1)
+            context.model_pool.checkin(client_id, model)
             del private_dataset
             aggressive_memory_cleanup()
 
     def run_round(self, context: PipelineContext, round_number: int) -> Dict[int, Dict[str, float]]:
         round_start = time.time()
         config = context.config
-        public_features: np.ndarray = context.shared_state["public_features"]
-        public_dataset_labeled: tf.data.Dataset = context.shared_state["public_dataset_labeled"]
+        public_features = np.load(context.shared_state["public_features_path"], mmap_mode="r")
+
+        os.makedirs(LOGITS_CACHE_DIR, exist_ok=True)
 
         print(f"\n{COLORS.OKCYAN}[STEP 1/3] Generating public logits{COLORS.ENDC}")
-        all_logits = []
+        logit_files = []
+        logit_shape = None
+        pool = context.model_pool
         for state in context.client_states:
-            logits = generate_public_logits(state.model, public_features, config.batch_size)
-            print(f"  Client {state.client_id}: logits shape {logits.shape}")
-            all_logits.append(logits)
+            fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{state.client_id}.bin")
+            model = pool.checkout(state.client_id)
+            _, shape = generate_public_logits_to_file(model, public_features, config.batch_size, fpath)
+            pool.release(model)
+            logit_files.append(fpath)
+            logit_shape = shape
+            print(f"  Client {state.client_id}: logits {shape} -> {fpath}")
+            aggressive_memory_cleanup()
 
         print(f"\n{COLORS.OKCYAN}[STEP 2/3] Computing consensus logits{COLORS.ENDC}")
-        consensus_logits = np.mean(all_logits, axis=0)
+        consensus_logits = compute_consensus_from_files(logit_files, logit_shape)
         print(f"  Consensus shape: {consensus_logits.shape}")
 
+        for fpath in logit_files:
+            os.remove(fpath)
+
         print(f"\n{COLORS.OKCYAN}[STEP 3/3] Digest and revisit phases{COLORS.ENDC}")
-        revisit_batch_size = max(1, int(config.batch_size * self.revisit_batch_fraction))
 
         for state in context.client_states:
             print(f"\n{COLORS.BOLD}Client {state.client_id}{COLORS.ENDC}")
-            digest_phase(state.model, consensus_logits, public_features, config.batch_size, self.digest_epochs)
+            model = pool.checkout(state.client_id)
+            digest_phase(model, consensus_logits, public_features, config.batch_size, self.digest_epochs)
 
             private_dataset = create_private_dataset(
                 state.paths["train_X"],
                 state.paths["train_y"],
                 context.input_dim,
                 context.num_classes,
-                revisit_batch_size,
+                config.batch_size,
                 is_sequence=context.shared_state["is_sequence"],
             )
-            revisit_phase(state.model, private_dataset, self.revisit_epochs)
+            revisit_phase(model, private_dataset, self.revisit_epochs)
+            pool.checkin(state.client_id, model)
             del private_dataset
             aggressive_memory_cleanup()
+
+        del consensus_logits, public_features
+        aggressive_memory_cleanup()
 
         all_client_metrics = []
         round_metrics: Dict[int, Dict[str, float]] = {}
         
         for state in context.client_states:
-            metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
+            model = pool.checkout(state.client_id)
+            metrics = evaluate_model(model, context.test_dataset, context.test_labels)
+            pool.release(model)
             all_client_metrics.append(metrics)
             round_metrics[state.client_id] = metrics
-            if config.personalized_eval:
-                context.logger.info(
-                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
-                    round_number,
-                    state.client_id,
-                    metrics["Acc"],
-                    metrics["F1"],
-                    metrics["Precision"],
-                    metrics["Recall"],
-                )
-                print(
-                    f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}{COLORS.ENDC}"
-                )
+            context.logger.info(
+                "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                round_number,
+                state.client_id,
+                metrics["Acc"],
+                metrics["F1"],
+                metrics["Precision"],
+                metrics["Recall"],
+                metrics["Loss"],
+            )
+            print(
+                f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
+                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+            )
         
         avg_metrics = {
             "Acc": np.mean([m["Acc"] for m in all_client_metrics]),
             "F1": np.mean([m["F1"] for m in all_client_metrics]),
             "Precision": np.mean([m["Precision"] for m in all_client_metrics]),
             "Recall": np.mean([m["Recall"] for m in all_client_metrics]),
+            "Loss": np.mean([m["Loss"] for m in all_client_metrics]),
         }
         round_metrics[-1] = avg_metrics
         
         print(
             f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
             f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
-            f"Recall={avg_metrics['Recall']:.4f}{COLORS.ENDC}"
+            f"Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
         )
         context.logger.info(
-            "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+            "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
             round_number,
             avg_metrics["Acc"],
             avg_metrics["F1"],
             avg_metrics["Precision"],
             avg_metrics["Recall"],
+            avg_metrics["Loss"],
         )
 
         round_time = time.time() - round_start

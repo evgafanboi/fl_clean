@@ -24,19 +24,22 @@ def compute_dkd_gradient(expert_model, global_model, train_dataset, temperature=
     accumulated_grads = [tf.zeros_like(v) for v in trainable_vars]
     total_loss = 0.0
     num_batches = 0
+    temp_tf = tf.constant(temperature, dtype=tf.float32)
 
-    for batch_X, batch_y in train_dataset:
+    @tf.function
+    def kl_step(batch_X):
         with tf.GradientTape() as tape:
             expert_logits = expert_logits_model(batch_X, training=False)
             global_logits = global_logits_model(batch_X, training=True)
-
-            soft_teacher = tf.nn.softmax(expert_logits / temperature)
-            soft_student = tf.nn.log_softmax(global_logits / temperature)
+            soft_teacher = tf.nn.softmax(expert_logits / temp_tf)
+            soft_student = tf.nn.log_softmax(global_logits / temp_tf)
             kl_loss = tf.reduce_mean(tf.reduce_sum(soft_teacher * (tf.math.log(soft_teacher + 1e-8) - soft_student), axis=1))
-            loss = (temperature ** 2) * kl_loss
+            loss = (temp_tf ** 2) * kl_loss
+        return tape.gradient(loss, trainable_vars), loss
 
-        gradients = tape.gradient(loss, trainable_vars)
-        accumulated_grads = [ag + g for ag, g in zip(accumulated_grads, gradients)]
+    for batch_X, batch_y in train_dataset:
+        grads, loss = kl_step(batch_X)
+        accumulated_grads = [ag + g for ag, g in zip(accumulated_grads, grads)]
         total_loss += float(loss)
         num_batches += 1
 
@@ -95,17 +98,11 @@ class FedDKD(DistillationStrategy):
         context.shared_state["is_sequence"] = is_sequence
         
         sample_sizes = []
+        pool = context.model_pool
         
         print(f"\n{COLORS.HEADER}Training Initial Local Experts{COLORS.ENDC}")
         for client_id, paths in enumerate(context.paths):
             print(f"\n{COLORS.BOLD}Training Expert {client_id}{COLORS.ENDC}")
-            
-            model = create_model(
-                context.input_dim,
-                context.num_classes,
-                context.config.batch_size,
-                model_type=context.config.model_type,
-            )
             
             train_dataset = create_private_dataset(
                 paths["train_X"],
@@ -121,9 +118,11 @@ class FedDKD(DistillationStrategy):
             sample_sizes.append(sample_size)
             del X_train_mmap
             
+            model = pool.checkout(client_id)
             model.fit(train_dataset, epochs=self.expert_epochs, verbose=1)
+            pool.checkin(client_id, model)
             
-            context.add_client_state(client_id, model, paths)
+            context.add_client_state(client_id, None, paths)
             
             del train_dataset
             aggressive_memory_cleanup()
@@ -142,7 +141,11 @@ class FedDKD(DistillationStrategy):
             model_type=context.config.model_type,
         )
         
-        expert_weights = [state.model.get_weights() for state in context.client_states]
+        expert_weights = []
+        for state in context.client_states:
+            m = pool.checkout(state.client_id)
+            expert_weights.append(m.get_weights())
+            pool.release(m)
         
         global_weights = []
         for layer_idx in range(len(expert_weights[0])):
@@ -151,7 +154,7 @@ class FedDKD(DistillationStrategy):
             global_weights.append(layer_avg)
         
         global_model.set_weights(global_weights)
-        del global_weights
+        del global_weights, expert_weights
         
         context.shared_state["global_model"] = global_model
         
@@ -167,10 +170,12 @@ class FedDKD(DistillationStrategy):
         print(f"\n{COLORS.PURPLE}[LOCAL TRAINING] Updating expert models from global{COLORS.ENDC}")
         
         global_weights = global_model.get_weights()
+        pool = context.model_pool
         
         for state in context.client_states:
             print(f"\n{COLORS.BOLD}Training Expert {state.client_id}{COLORS.ENDC}")
-            state.model.set_weights(global_weights)
+            model = pool.checkout(state.client_id)
+            model.set_weights(global_weights)
             
             train_dataset = create_private_dataset(
                 state.paths["train_X"],
@@ -181,7 +186,8 @@ class FedDKD(DistillationStrategy):
                 is_sequence=is_sequence,
             )
             
-            state.model.fit(train_dataset, epochs=self.expert_epochs, verbose=1)
+            model.fit(train_dataset, epochs=self.expert_epochs, verbose=1)
+            pool.checkin(state.client_id, model)
             
             del train_dataset
             aggressive_memory_cleanup()
@@ -190,41 +196,46 @@ class FedDKD(DistillationStrategy):
         
         print(f"\n{COLORS.PURPLE}[DKD DISTILLATION] Running {self.dkd_steps} gradient steps{COLORS.ENDC}")
         
+        client_datasets = {
+            state.client_id: create_private_dataset(
+                state.paths["train_X"],
+                state.paths["train_y"],
+                context.input_dim,
+                context.num_classes,
+                config.batch_size,
+                is_sequence=is_sequence,
+            )
+            for state in context.client_states
+        }
+
         for dkd_step in range(self.dkd_steps):
             client_grads = []
             step_losses = []
             
             for state in context.client_states:
-                train_dataset = create_private_dataset(
-                    state.paths["train_X"],
-                    state.paths["train_y"],
-                    context.input_dim,
-                    context.num_classes,
-                    config.batch_size,
-                    is_sequence=is_sequence,
-                )
-                
+                model = pool.checkout(state.client_id)
                 grads, loss = compute_dkd_gradient(
-                    state.model,
+                    model,
                     global_model,
-                    train_dataset,
+                    client_datasets[state.client_id],
                     temperature=self.dkd_temp,
                 )
+                pool.release(model)
                 client_grads.append(grads)
                 step_losses.append(loss)
-                
-                del train_dataset
             
             aggregated_grads = aggregate_gradients(client_grads, sample_sizes)
             
             apply_gradient_update(global_model, aggregated_grads, self.dkd_lr)
             
             del client_grads, aggregated_grads
-            aggressive_memory_cleanup()
             
             if (dkd_step + 1) % 10 == 0:
                 avg_loss = np.mean(step_losses)
                 print(f"  DKD step {dkd_step + 1}/{self.dkd_steps}: Avg distillation loss={avg_loss:.4f}")
+        
+        del client_datasets
+        aggressive_memory_cleanup()
         
         context.logger.info(f"Completed {self.dkd_steps} DKD steps")
         
@@ -235,16 +246,17 @@ class FedDKD(DistillationStrategy):
         print(
             f"{COLORS.OKGREEN}[GLOBAL MODEL] Acc={global_metrics['Acc']:.4f}, "
             f"F1={global_metrics['F1']:.4f}, Precision={global_metrics['Precision']:.4f}, "
-            f"Recall={global_metrics['Recall']:.4f}{COLORS.ENDC}"
+            f"Recall={global_metrics['Recall']:.4f}, Loss={global_metrics['Loss']:.4f}{COLORS.ENDC}"
         )
         
         context.logger.info(
-            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
             round_number,
             global_metrics["Acc"],
             global_metrics["F1"],
             global_metrics["Precision"],
             global_metrics["Recall"],
+            global_metrics["Loss"],
         )
         
         round_metrics: Dict[int, Dict[str, float]] = {-1: global_metrics}

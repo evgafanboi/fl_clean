@@ -173,14 +173,7 @@ class FedSSD(DistillationStrategy):
 
         sample_sizes: List[int] = []
         for client_id, paths in enumerate(context.paths):
-            model = create_model(
-                context.input_dim,
-                context.num_classes,
-                config.batch_size,
-                model_type=config.model_type,
-            )
-            model.set_weights(global_model.get_weights())
-            state = context.add_client_state(client_id, model, paths)
+            context.add_client_state(client_id, None, paths)
 
             y_mmap = np.load(paths["train_y"], mmap_mode="r")
             sample_sizes.append(int(y_mmap.shape[0]))
@@ -208,10 +201,12 @@ class FedSSD(DistillationStrategy):
 
         print(f"\n{COLORS.OKCYAN}[STEP 2/2] Client selective soft distillation training{COLORS.ENDC}")
         client_weights: List[List[np.ndarray]] = []
+        pool = context.model_pool
 
         for idx, state in enumerate(context.client_states):
             print(f"\n{COLORS.BOLD}Client {state.client_id}{COLORS.ENDC}")
-            state.model.set_weights(global_model.get_weights())
+            model = pool.checkout(state.client_id)
+            model.set_weights(global_model.get_weights())
 
             train_dataset = create_private_dataset(
                 state.paths["train_X"],
@@ -223,7 +218,7 @@ class FedSSD(DistillationStrategy):
             )
 
             train_with_ssd_loss(
-                state.model,
+                model,
                 train_dataset,
                 global_model,
                 M_class,
@@ -232,7 +227,8 @@ class FedSSD(DistillationStrategy):
                 config.epochs,
             )
 
-            client_weights.append(state.model.get_weights())
+            client_weights.append(model.get_weights())
+            pool.checkin(state.client_id, model)
             del train_dataset
             aggressive_memory_cleanup()
 
@@ -245,7 +241,7 @@ class FedSSD(DistillationStrategy):
         print(
             f"{COLORS.OKGREEN}Round {round_number} - Global Acc={global_metrics['Acc']:.4f}, "
             f"F1={global_metrics['F1']:.4f}, Precision={global_metrics['Precision']:.4f}, "
-            f"Recall={global_metrics['Recall']:.4f}{COLORS.ENDC}"
+            f"Recall={global_metrics['Recall']:.4f}, Loss={global_metrics['Loss']:.4f}{COLORS.ENDC}"
         )
         context.logger.info(
             "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
@@ -261,24 +257,24 @@ class FedSSD(DistillationStrategy):
         
         if config.personalized_eval:
             for state in context.client_states:
-                metrics = evaluate_model(state.model, context.test_dataset, context.test_labels)
+                model = pool.checkout(state.client_id)
+                metrics = evaluate_model(model, context.test_dataset, context.test_labels)
+                pool.release(model)
                 round_metrics[state.client_id] = metrics
                 context.logger.info(
-                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f",
+                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
                     round_number,
                     state.client_id,
                     metrics["Acc"],
                     metrics["F1"],
                     metrics["Precision"],
                     metrics["Recall"],
+                    metrics["Loss"],
                 )
                 print(
                     f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}{COLORS.ENDC}"
+                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
                 )
-
-        for state in context.client_states:
-            state.model.set_weights(global_model.get_weights())
 
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time

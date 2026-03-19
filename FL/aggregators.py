@@ -10,11 +10,8 @@ from .strategy.DeepFed import DeepFed
 from .strategy.FLTrust import FLTrust
 from .strategy.FedMLB import FedMLB
 from .strategy.NoneStrategy import NoneStrategy
-from .strategy.FedoRA import FedoRA
 from .strategy.SecureAggregation import SecureAggregation
-from .strategy.FedSSD1 import FedSSD1
 from .strategy.FedSSDexp import FedSSDexp
-from .strategy.FedSSD2 import FedSSD2
 
 
 @dataclass
@@ -115,15 +112,6 @@ def _none_client_factory(aggregator: NoneStrategy, _: Dict[str, Any]) -> NoneStr
     return aggregator
 
 
-def _fedora_factory(params: Dict[str, Any]) -> FedoRA:
-    rank = params.get('rank', 8)
-    return FedoRA(rank=rank)
-
-
-def _fedora_client_factory(aggregator: FedoRA, _: Dict[str, Any]) -> FedoRA:
-    return aggregator
-
-
 def _secagg_factory(_: Dict[str, Any]) -> SecureAggregation:
     return SecureAggregation()
 
@@ -133,16 +121,6 @@ def _secagg_client_factory(aggregator: SecureAggregation, _: Dict[str, Any]) -> 
 
 
 
-def _fedssd1_factory(params: Dict[str, Any]) -> FedSSD1:
-    m_max = params.get('m_max', 1.0)
-    use_support = params.get('support', False)
-    return FedSSD1(m_max, use_support)
-
-
-def _fedssd1_client_factory(aggregator: FedSSD1, _: Dict[str, Any]) -> FedSSD1:
-    return aggregator
-
-
 def _fedssdexp_factory(params: Dict[str, Any]) -> FedSSDexp:
     m_max = params.get('m_max', 1.0)
     use_support = params.get('support', False)
@@ -150,16 +128,6 @@ def _fedssdexp_factory(params: Dict[str, Any]) -> FedSSDexp:
 
 
 def _fedssdexp_client_factory(aggregator: FedSSDexp, _: Dict[str, Any]) -> FedSSDexp:
-    return aggregator
-
-
-def _fedssd2_factory(params: Dict[str, Any]) -> FedSSD2:
-    m_max = params.get('m_max', 1.0)
-    threshold = params.get('threshold', 0.3)
-    return FedSSD2(m_max, threshold=threshold)
-
-
-def _fedssd2_client_factory(aggregator: FedSSD2, _: Dict[str, Any]) -> FedSSD2:
     return aggregator
 
 
@@ -193,10 +161,6 @@ STRATEGY_REGISTRY: Dict[str, StrategyConfig] = {
         aggregator_factory=_fltrust_factory,
         client_factory=_fltrust_client_factory
     ),
-    'FedoRA': StrategyConfig(
-        aggregator_factory=_fedora_factory,
-        client_factory=_fedora_client_factory
-    ),
     'FedMLB': StrategyConfig(
         aggregator_factory=_fedmlb_factory,
         client_factory=_fedmlb_client_factory
@@ -205,17 +169,9 @@ STRATEGY_REGISTRY: Dict[str, StrategyConfig] = {
         aggregator_factory=_secagg_factory,
         client_factory=_secagg_client_factory
     ),
-    'FedSSD1': StrategyConfig(
-        aggregator_factory=_fedssd1_factory,
-        client_factory=_fedssd1_client_factory
-    ),
     'FedSSDexp': StrategyConfig(
         aggregator_factory=_fedssdexp_factory,
         client_factory=_fedssdexp_client_factory
-    ),
-    'FedSSD2': StrategyConfig(
-        aggregator_factory=_fedssd2_factory,
-        client_factory=_fedssd2_client_factory
     ),
     'None': StrategyConfig(
         aggregator_factory=_none_factory,

@@ -12,7 +12,7 @@ from .pipeline import FLConfig, run_pipeline
 
 
 WEIGHT_AGGREGATION_STRATEGIES = {"FedAvg", "FedProx", "FedDyn", "FedCoMed", "RobustFilter", "DeepFed", "FLTrust", "SecureAggregation", "FedSSD1", "FedSSDexp", "FedSSD2", "None"}
-DISTILLATION_STRATEGIES = {"FD", "FedDKD", "FedProto", "FedMD", "FedSSD", "SSFL-IDS"}
+DISTILLATION_STRATEGIES = {"FD", "FedDKD", "FedProto", "FedMD", "FedSSD", "SSFL-IDS", "Exp1", "Exp2", "Cronus"}
 ALL_STRATEGIES = sorted(WEIGHT_AGGREGATION_STRATEGIES | DISTILLATION_STRATEGIES)
 
 
@@ -38,6 +38,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # robust filter
     parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (Byzantine ratio)")
     parser.add_argument("--robust_tau", type=float, default=0.1, help="RobustFilter tau parameter")
+    # cronus
+    parser.add_argument("--remove_dis", action="store_true", help="Cronus: remove discriminator, use plain softmax predictions")
     # fedssd
     parser.add_argument("--m_max", type=float, default=1.0, help="M_max value for FedSSD")
     parser.add_argument("--support", action="store_true", help="Use support-weighted aggregation (FedSSD1/FedSSDexp)")
@@ -51,6 +53,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # fedora
     parser.add_argument("--rank", type=int, default=8, help="LoRA rank (for FedoRA)")
 
+
+    # exp1
+    parser.add_argument("--exp1_lambda", type=float, default=1.0, help="Lambda for KLD loss in Exp1 (L = CE + lambda * KLD)")
+    parser.add_argument("--exp1_temperature", type=float, default=3.0, help="Temperature for KL divergence in Exp1")
+    # exp2
+    parser.add_argument("--exp2_ekd_lambda", type=float, default=1.0, help="Lambda weighting L_2nd in EKD (Exp2)")
+    parser.add_argument("--kd", type=str, default="ekd", choices=["ekd", "abkd"], help="KD method for Exp2 (ekd or abkd)")
+    parser.add_argument("--ab_alpha", type=float, default=1.0, help="Alpha for ABKD divergence")
+    parser.add_argument("--ab_beta", type=float, default=0.0, help="Beta for ABKD divergence")
+    parser.add_argument("--exp2_temperature", type=float, default=4.0, help="Temperature for ABKD softmax scaling")
 
     # distillation hyperparameters
     parser.add_argument("--gamma", type=float, default=1.0, help="Distillation temperature / weighting factor (for FD, FedMD, FedProto)")
@@ -80,6 +92,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Poison config: <attack> <value> <ratio>, e.g., gradient_scale 10 0.5",
     )
 
+    # decentralized
+    parser.add_argument("--decentralized", type=str, default=None, help="Decentralized topology simulation (e.g. braintorrent)")
+
     return parser
 
 
@@ -88,7 +103,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.strategy in DISTILLATION_STRATEGIES:
-        from .strategy import FD, FedDKD, FedProto, FedMD, FedSSD, SSFLIDS
+        from .strategy import FD, FedDKD, FedProto, FedMD, FedSSD, SSFLIDS, Exp1, Exp2, Cronus
         from .config import FDConfig
         from .pipeline import run_distillation_pipeline
         
@@ -99,6 +114,9 @@ def main(argv=None):
             "FedMD": FedMD.FedMD,
             "FedSSD": FedSSD.FedSSD,
             "SSFL-IDS": SSFLIDS.SSFLIDS,
+            "Exp1": Exp1.Exp1,
+            "Exp2": Exp2.Exp2,
+            "Cronus": Cronus.Cronus,
         }
         
         config = FDConfig(
@@ -120,6 +138,15 @@ def main(argv=None):
             dkd_lr=args.dkd_lr,
             personalized_eval=args.personalized_eval,
             poison=" ".join(args.poison) if args.poison else None,
+            exp1_lambda=args.exp1_lambda,
+            exp1_temperature=args.exp1_temperature,
+            exp2_ekd_lambda=args.exp2_ekd_lambda,
+            exp2_kd=args.kd,
+            ab_alpha=args.ab_alpha,
+            ab_beta=args.ab_beta,
+            exp2_temperature=args.exp2_temperature,
+            robust_epsilon=args.robust_epsilon,
+            remove_dis=args.remove_dis,
         )
         
         strategy = strategy_registry[args.strategy](config)
@@ -151,6 +178,7 @@ def main(argv=None):
             m_max=args.m_max,
             support=args.support,
             threshold=args.threshold,
+            decentralized=args.decentralized,
         )
         run_pipeline(config)
 
