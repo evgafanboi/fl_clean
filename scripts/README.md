@@ -25,22 +25,29 @@ Automated scripts to sync your GitHub repository with Google Colab using Google 
    - Click "Generate token"
    - **Copy the token** (starts with `ghp_` or `github_pat_`)
 
-4. **Run setup (choose one method):**
+4. **Run setup:**
 
-   **Method 1 (Recommended - More Secure):**
+   **⚠️ IMPORTANT: Use environment variable method in Colab**
+   
    ```python
-   # Set PAT as environment variable
+   # Set PAT as environment variable (paste your actual token here)
    import os
-   os.environ['GITHUB_PAT'] = 'ghp_your_token_here'  # Paste your token
+   os.environ['GITHUB_PAT'] = 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'  # Replace with your real token
    
    # Run setup
    !bash scripts/setup_colab_git.sh
    ```
    
-   **Method 2 (Interactive):**
+   **Why this method?**
+   - ✅ Most reliable in Colab notebooks
+   - ✅ Token not visible in output
+   - ✅ No copy-paste issues
+   
+   **Alternative (if environment variable doesn't work):**
    ```bash
    !bash scripts/setup_colab_git.sh
-   # Paste token when prompted (will be visible in Colab)
+   # When prompted, paste token and press Enter
+   # Note: Token will be visible in output
    ```
    
    This will:
