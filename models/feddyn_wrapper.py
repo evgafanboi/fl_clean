@@ -1,6 +1,8 @@
 import tensorflow as tf
 import numpy as np
 
+from .gru import precision_m, recall_m, f1_m
+
 
 class FedDynModelWrapper:
     """
@@ -71,7 +73,11 @@ class FedDynModelWrapper:
             return ce - lin_penalty + (alpha / 2.0) * quad_penalty
 
         optimizer = tf.keras.optimizers.SGD(learning_rate=0.01, clipnorm=0.5)
-        self.model.compile(optimizer=optimizer, loss=feddyn_loss, metrics=['accuracy'])
+        self.model.compile(
+            optimizer=optimizer,
+            loss=feddyn_loss,
+            metrics=['accuracy', precision_m, recall_m, f1_m],
+        )
         self._compiled = True
 
     def set_weights(self, weights):
