@@ -32,7 +32,6 @@ def configure_gpu_memory() -> None:
         config.gpu_options.allow_growth = True
         tf.compat.v1.keras.backend.set_session(tf.compat.v1.Session(config=config))
         tf.keras.mixed_precision.set_global_policy('mixed_float16')
-        tf.config.optimizer.set_jit(True)
-        print(f"{COLORS.OKCYAN}GPU memory growth enabled + mixed precision + XLA JIT enabled{COLORS.ENDC}")
+        print(f"{COLORS.OKCYAN}GPU memory growth enabled + mixed precision enabled{COLORS.ENDC}")
     except Exception as exc:
         print(f"GPU configuration error: {exc}")
