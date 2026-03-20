@@ -26,16 +26,27 @@ def compute_dkd_gradient(expert_model, global_model, train_dataset, temperature=
     num_batches = 0
     temp_tf = tf.constant(temperature, dtype=tf.float32)
 
-    @tf.function
-    def kl_step(batch_X):
-        with tf.GradientTape() as tape:
-            expert_logits = expert_logits_model(batch_X, training=False)
-            global_logits = global_logits_model(batch_X, training=True)
-            soft_teacher = tf.nn.softmax(expert_logits / temp_tf)
-            soft_student = tf.nn.log_softmax(global_logits / temp_tf)
-            kl_loss = tf.reduce_mean(tf.reduce_sum(soft_teacher * (tf.math.log(soft_teacher + 1e-8) - soft_student), axis=1))
-            loss = (temp_tf ** 2) * kl_loss
-        return tape.gradient(loss, trainable_vars), loss
+    # Cache the compiled kl_step on the global_model to avoid recompilation each call
+    if not hasattr(global_model, '_dkd_kl_step'):
+        @tf.function
+        def kl_step(batch_X):
+            with tf.GradientTape() as tape:
+                expert_logits = expert_logits_model(batch_X, training=False)
+                global_logits = global_logits_model(batch_X, training=True)
+                soft_teacher = tf.nn.softmax(expert_logits / temp_tf)
+                soft_student = tf.nn.log_softmax(global_logits / temp_tf)
+                kl_loss = tf.reduce_mean(
+                    tf.reduce_sum(
+                        soft_teacher * (tf.math.log(soft_teacher + 1e-8) - soft_student),
+                        axis=1,
+                    )
+                )
+                loss = (temp_tf ** 2) * kl_loss
+            return tape.gradient(loss, trainable_vars), loss
+
+        global_model._dkd_kl_step = kl_step
+
+    kl_step = global_model._dkd_kl_step
 
     for batch_X, batch_y in train_dataset:
         grads, loss = kl_step(batch_X)

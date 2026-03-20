@@ -81,7 +81,6 @@ def create_client_dataset(
     input_dim: int,
     num_classes: int,
     batch_size: int,
-    chunk_size: int = 10000,
     poison_loader=None,
     cache: bool = True,
 ) -> tf.data.Dataset:
@@ -89,40 +88,30 @@ def create_client_dataset(
         X_mmap = np.load(X_path, mmap_mode='r')
         y_mmap = np.load(y_path, mmap_mode='r')
         total_samples = X_mmap.shape[0]
+        indices = np.random.permutation(total_samples)
 
-        for start_idx in range(0, total_samples, chunk_size):
-            end_idx = min(start_idx + chunk_size, total_samples)
-            X_chunk = np.array(X_mmap[start_idx:end_idx], dtype=np.float32)
-            y_chunk = np.array(y_mmap[start_idx:end_idx], dtype=np.int32)
-            
+        for start_idx in range(0, total_samples, batch_size):
+            end_idx = min(start_idx + batch_size, total_samples)
+            idx = indices[start_idx:end_idx]
+            X_chunk = np.array(X_mmap[idx], dtype=np.float32)
+            y_chunk = np.array(y_mmap[idx], dtype=np.int32)
+
             if poison_loader is not None:
                 y_chunk = poison_loader.poison_labels(y_chunk)
-            
+
             if len(y_chunk.shape) == 1 or y_chunk.shape[1] == 1:
                 y_chunk = tf.keras.utils.to_categorical(
                     y_chunk.astype(np.int32),
                     num_classes=num_classes
                 ).astype(np.float32)
             yield X_chunk, y_chunk
-            del X_chunk, y_chunk
 
     output_signature = (
         tf.TensorSpec(shape=(None, input_dim), dtype=tf.float32),
         tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32)
     )
     dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
-
-    if cache:
-        import hashlib
-        import os
-
-        cache_dir = os.path.join('temp_weights', 'dataset_cache')
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_key = hashlib.sha1(f"{X_path}:{y_path}".encode('utf-8')).hexdigest()
-        cache_file = os.path.join(cache_dir, f"{cache_key}.cache")
-        dataset = dataset.cache(cache_file)
-
-    return dataset.unbatch().batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return dataset.prefetch(tf.data.AUTOTUNE)
 
 
 def load_test_dataset(batch_size: int, num_classes: int) -> tf.data.Dataset:

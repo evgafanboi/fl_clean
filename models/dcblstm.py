@@ -14,8 +14,9 @@ class DCBLSTMModel:
         num_classes=20,
         batch_size=4096,
         learning_rate=None,
-        conv_filters=32,
+        conv_filters=64,
         lstm_units=64,
+        lstm_units_2=128,
         dnn_sizes=(64, 32, 16),
     ):
         self.input_dim = input_dim
@@ -23,6 +24,7 @@ class DCBLSTMModel:
         self.batch_size = batch_size
         self.conv_filters = conv_filters
         self.lstm_units = lstm_units
+        self.lstm_units_2 = lstm_units_2
         self.dnn_sizes = dnn_sizes
         if learning_rate is None:
             base_lr = 0.001
@@ -39,14 +41,15 @@ class DCBLSTMModel:
     def _create_dcblstm_model(self):
         inputs = tf.keras.layers.Input(shape=(self.input_dim,))
         x = tf.keras.layers.Reshape((self.input_dim, 1))(inputs)
-        x = tf.keras.layers.Conv1D(self.conv_filters, kernel_size=min(3, self.input_dim), activation='relu', padding='same')(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.Bidirectional(
-            tf.keras.layers.LSTM(self.lstm_units, return_sequences=True)
-        )(x)
+        x = tf.keras.layers.Conv1D(self.conv_filters, kernel_size=self.input_dim, activation='relu', padding='same')(x)
         x = tf.keras.layers.BatchNormalization()(x)
         x = tf.keras.layers.Bidirectional(
             tf.keras.layers.LSTM(self.lstm_units, return_sequences=False)
+        )(x)
+        x = tf.keras.layers.Reshape((self.lstm_units * 2, 1))(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Bidirectional(
+            tf.keras.layers.LSTM(self.lstm_units_2, return_sequences=False)
         )(x)
         x = tf.keras.layers.Dropout(0.1)(x)
         for i, size in enumerate(self.dnn_sizes, start=1):
@@ -76,7 +79,7 @@ class DCBLSTMModel:
                 decay_epochs = max(1, epoch - 5)
                 return self.learning_rate * 0.5 * (1 + np.cos(np.pi * decay_epochs / 50))
 
-        callbacks.append(tf.keras.callbacks.LearningRateScheduler(lr_schedule, verbose=1))
+        callbacks.append(tf.keras.callbacks.LearningRateScheduler(lr_schedule, verbose=0))
 
         if validation_data is not None:
             callbacks.append(

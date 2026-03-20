@@ -491,7 +491,7 @@ class FederatedLearningPipeline:
                         verbose=1
                     )
                 ],
-                verbose=1,
+                verbose=2,
             )
             loss = float(history.history.get("loss", [0.0])[-1])
 

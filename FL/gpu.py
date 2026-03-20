@@ -7,7 +7,6 @@ from .colors import COLORS
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices=false'
 tf.get_logger().setLevel('ERROR')
 tf.autograph.set_verbosity(0)
 

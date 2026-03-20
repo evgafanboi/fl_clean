@@ -145,35 +145,40 @@ def ekd_stage(
     keras_model.optimizer = optimizer
     lam = tf.constant(ekd_lambda, dtype=tf.float32)
 
-    @tf.function
-    def train_step(batch_X, teacher_logits):
-        with tf.GradientTape() as tape:
-            student_logits = logits_model(batch_X, training=True)
+    if not hasattr(model_wrapper, '_ekd_train_step'):
+        @tf.function
+        def train_step(batch_X, teacher_logits):
+            with tf.GradientTape() as tape:
+                student_logits = logits_model(batch_X, training=True)
 
-            alpha_T = tf.exp(teacher_logits) + 1.0
-            alpha_S = tf.exp(student_logits) + 1.0
-            alpha0_T = tf.reduce_sum(alpha_T, axis=-1, keepdims=True)
-            alpha0_S = tf.reduce_sum(alpha_S, axis=-1, keepdims=True)
+                alpha_T = tf.exp(teacher_logits) + 1.0
+                alpha_S = tf.exp(student_logits) + 1.0
+                alpha0_T = tf.reduce_sum(alpha_T, axis=-1, keepdims=True)
+                alpha0_S = tf.reduce_sum(alpha_S, axis=-1, keepdims=True)
 
-            L_1st = tf.reduce_sum(
-                (alpha_T / alpha0_T) * (tf.math.log(alpha_T / alpha0_T + 1e-8) - tf.math.log(alpha_S / alpha0_S + 1e-8)),
-                axis=-1,
-            )
-
-            L_2nd = (
-                tf.math.lgamma(alpha0_T[:, 0]) - tf.math.lgamma(alpha0_S[:, 0])
-                - tf.reduce_sum(tf.math.lgamma(alpha_T) - tf.math.lgamma(alpha_S), axis=-1)
-                + tf.reduce_sum(
-                    (alpha_T - alpha_S) * (tf.math.digamma(alpha_T) - tf.math.digamma(alpha0_T)),
+                L_1st = tf.reduce_sum(
+                    (alpha_T / alpha0_T) * (tf.math.log(alpha_T / alpha0_T + 1e-8) - tf.math.log(alpha_S / alpha0_S + 1e-8)),
                     axis=-1,
                 )
-            )
 
-            loss = tf.reduce_mean(L_1st + lam * L_2nd)
+                L_2nd = (
+                    tf.math.lgamma(alpha0_T[:, 0]) - tf.math.lgamma(alpha0_S[:, 0])
+                    - tf.reduce_sum(tf.math.lgamma(alpha_T) - tf.math.lgamma(alpha_S), axis=-1)
+                    + tf.reduce_sum(
+                        (alpha_T - alpha_S) * (tf.math.digamma(alpha_T) - tf.math.digamma(alpha0_T)),
+                        axis=-1,
+                    )
+                )
 
-        gradients = tape.gradient(loss, keras_model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
-        return loss
+                loss = tf.reduce_mean(L_1st + lam * L_2nd)
+
+            gradients = tape.gradient(loss, keras_model.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+            return loss
+
+        model_wrapper._ekd_train_step = train_step
+
+    train_step = model_wrapper._ekd_train_step
 
     n_samples = len(public_features)
     for epoch in range(epochs):
@@ -203,52 +208,57 @@ def abkd_stage(
     b = tf.constant(beta, dtype=tf.float32)
     T = tf.constant(temperature, dtype=tf.float32)
 
-    @tf.function
-    def train_step(batch_X, teacher_logits):
-        with tf.GradientTape() as tape:
-            student_logits = logits_model(batch_X, training=True)
-            p = tf.nn.softmax(teacher_logits / T)
-            q = tf.nn.softmax(student_logits / T)
+    if not hasattr(model_wrapper, '_abkd_train_step'):
+        @tf.function
+        def train_step(batch_X, teacher_logits):
+            with tf.GradientTape() as tape:
+                student_logits = logits_model(batch_X, training=True)
+                p = tf.nn.softmax(teacher_logits / T)
+                q = tf.nn.softmax(student_logits / T)
 
-            ab_sum = a + b
-            if alpha == 0.0 and beta == 0.0:
-                log_diff = tf.math.log(q + 1e-10) - tf.math.log(p + 1e-10)
-                divergence = 0.5 * tf.reduce_sum(log_diff ** 2, axis=1)
-            elif alpha == 0.0:
-                q_b = tf.pow(q, b)
-                p_b = tf.pow(p, b)
-                ratio = q_b / (p_b + 1e-10)
-                divergence = (1.0 / b) * tf.reduce_sum(
-                    q_b * tf.math.log(ratio + 1e-10) - q_b + p_b, axis=1,
-                )
-            elif beta == 0.0:
-                p_a = tf.pow(p, a)
-                q_a = tf.pow(q, a)
-                divergence = (1.0 / a) * tf.reduce_sum(
-                    p_a * tf.math.log(p_a / (q_a + 1e-10) + 1e-10) - p_a + q_a, axis=1,
-                )
-            elif alpha + beta == 0.0:
-                p_a = tf.pow(p, a)
-                q_a = tf.pow(q, a)
-                divergence = tf.reduce_sum(
-                    (1.0 / a) * (tf.math.log(q_a / (p_a + 1e-10) + 1e-10) + p_a / (q_a + 1e-10) - 1.0),
-                    axis=1,
-                )
-            else:
-                p_a = tf.pow(p, a)
-                q_b = tf.pow(q, b)
-                p_ab = tf.pow(p, ab_sum)
-                q_ab = tf.pow(q, ab_sum)
-                divergence = -tf.reduce_sum(
-                    p_a * q_b - (a / ab_sum) * p_ab - (b / ab_sum) * q_ab,
-                    axis=1,
-                ) / (a * b)
+                ab_sum = a + b
+                if alpha == 0.0 and beta == 0.0:
+                    log_diff = tf.math.log(q + 1e-10) - tf.math.log(p + 1e-10)
+                    divergence = 0.5 * tf.reduce_sum(log_diff ** 2, axis=1)
+                elif alpha == 0.0:
+                    q_b = tf.pow(q, b)
+                    p_b = tf.pow(p, b)
+                    ratio = q_b / (p_b + 1e-10)
+                    divergence = (1.0 / b) * tf.reduce_sum(
+                        q_b * tf.math.log(ratio + 1e-10) - q_b + p_b, axis=1,
+                    )
+                elif beta == 0.0:
+                    p_a = tf.pow(p, a)
+                    q_a = tf.pow(q, a)
+                    divergence = (1.0 / a) * tf.reduce_sum(
+                        p_a * tf.math.log(p_a / (q_a + 1e-10) + 1e-10) - p_a + q_a, axis=1,
+                    )
+                elif alpha + beta == 0.0:
+                    p_a = tf.pow(p, a)
+                    q_a = tf.pow(q, a)
+                    divergence = tf.reduce_sum(
+                        (1.0 / a) * (tf.math.log(q_a / (p_a + 1e-10) + 1e-10) + p_a / (q_a + 1e-10) - 1.0),
+                        axis=1,
+                    )
+                else:
+                    p_a = tf.pow(p, a)
+                    q_b = tf.pow(q, b)
+                    p_ab = tf.pow(p, ab_sum)
+                    q_ab = tf.pow(q, ab_sum)
+                    divergence = -tf.reduce_sum(
+                        p_a * q_b - (a / ab_sum) * p_ab - (b / ab_sum) * q_ab,
+                        axis=1,
+                    ) / (a * b)
 
-            loss = tf.reduce_mean(divergence)
+                loss = tf.reduce_mean(divergence)
 
-        gradients = tape.gradient(loss, keras_model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
-        return loss
+            gradients = tape.gradient(loss, keras_model.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+            return loss
+
+        model_wrapper._abkd_train_step = train_step
+
+    train_step = model_wrapper._abkd_train_step
 
     n_samples = len(public_features)
     for epoch in range(epochs):

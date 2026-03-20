@@ -45,14 +45,17 @@ class FedDynModelWrapper:
         """Compile with direct FedDyn objective: CE - <∇L_k, θ> + (α/2)||θ - θ_g||²."""
         if self._global_weights is None:
             template = self.model.get_weights()
-            self._global_weights = [tf.constant(w, dtype=tf.float32) for w in template]
-            self._grad_L = [tf.constant(np.zeros_like(w), dtype=tf.float32) for w in template]
+            self._global_weights = [tf.Variable(w, dtype=tf.float32, trainable=False) for w in template]
+            self._grad_L = [tf.Variable(np.zeros_like(w), dtype=tf.float32, trainable=False) for w in template]
+
+        if self._compiled:
+            return
 
         ce_loss_fn = tf.keras.losses.CategoricalCrossentropy()
         alpha = self.feddyn.get_alpha()
         global_w = self._global_weights
         grad_L = self._grad_L
-        all_vars = self.model.trainable_weights
+        all_vars = list(self.model.weights)
         n = min(len(all_vars), len(global_w), len(grad_L))
 
         def feddyn_loss(y_true, y_pred):
@@ -78,10 +81,15 @@ class FedDynModelWrapper:
             self.model.set_weights(weights)
 
         template = self.model.get_weights()
-        self._global_weights = [tf.constant(w, dtype=tf.float32) for w in template]
         grad_L = self.feddyn.get_grad_L_for_client(self.client_id, template)
-        self._grad_L = [tf.constant(g, dtype=tf.float32) for g in grad_L]
-        self._compile_with_feddyn_loss()
+
+        if self._global_weights is None:
+            self._compile_with_feddyn_loss()
+
+        for var, w in zip(self._global_weights, template):
+            var.assign(w)
+        for var, g in zip(self._grad_L, grad_L):
+            var.assign(g)
 
     def fit(self, dataset, epochs=50, **kwargs):
         if not self._compiled:
