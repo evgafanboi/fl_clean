@@ -394,6 +394,94 @@ class FederatedLearningPipeline:
 
     _WRAPPER_STRATEGIES = frozenset({'fedprox', 'feddyn', 'fedmlb', 'fedora'})
 
+    def _checkpoint_dir(self) -> str:
+        stem = os.path.splitext(os.path.basename(self.log_filename))[0]
+        return os.path.join("checkpoint", stem)
+
+    def _save_checkpoint(self, round_num, latest_weights, n_clients, round_times,
+                         selected_server=None, ms_prev_scores=None):
+        ckpt_dir = self._checkpoint_dir()
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        with open(os.path.join(ckpt_dir, "global_weights.bin"), "wb") as f:
+            pickle.dump(latest_weights, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        info_lines = [
+            f"round: {round_num}",
+            f"total_rounds: {self.config.rounds}",
+            f"strategy: {self.config.strategy}",
+            f"model: {self.config.model}",
+            f"n_clients: {n_clients}",
+            f"partition_type: {self.config.partition_type}",
+            f"epochs: {self.config.epochs}",
+            f"batch_size: {self.config.batch_size}",
+            f"poisoned_clients: {self.poisoned_clients if self.poisoned_clients else 'none'}",
+            f"poison_config: {self.config.poison or 'none'}",
+            f"decentralized: {self.config.decentralized or 'none'}",
+            f"selected_server: {selected_server if selected_server is not None else 'N/A'}",
+            f"completed_rounds: {len(round_times)}",
+            f"avg_round_time: {sum(round_times) / len(round_times):.2f}s" if round_times else "avg_round_time: N/A",
+        ]
+        with open(os.path.join(ckpt_dir, "info.txt"), "w") as f:
+            f.write("\n".join(info_lines) + "\n")
+
+        if ms_prev_scores is not None:
+            with open(os.path.join(ckpt_dir, "ms_prev_scores.bin"), "wb") as f:
+                pickle.dump(ms_prev_scores, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        strategy_obj = self.strategy_runtime.client_strategy
+        if hasattr(strategy_obj, '_grad_L'):
+            state = {
+                '_grad_L': strategy_obj._grad_L,
+                '_prev_global': strategy_obj._prev_global,
+                '_h': strategy_obj._h,
+                '_n_clients_total': strategy_obj._n_clients_total,
+                'round_num': strategy_obj.round_num,
+            }
+            with open(os.path.join(ckpt_dir, "strategy_state.bin"), "wb") as f:
+                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        self.results_df.to_pickle(os.path.join(ckpt_dir, "results_df.pkl"))
+
+        print(f"{COLORS.OKCYAN}Checkpoint saved (round {round_num}) -> {ckpt_dir}{COLORS.ENDC}")
+
+    def _load_checkpoint(self):
+        ckpt_dir = self._checkpoint_dir()
+        info_path = os.path.join(ckpt_dir, "info.txt")
+        if not os.path.exists(info_path):
+            return None
+
+        info = {}
+        with open(info_path) as f:
+            for line in f:
+                key, _, val = line.strip().partition(": ")
+                info[key] = val
+
+        with open(os.path.join(ckpt_dir, "global_weights.bin"), "rb") as f:
+            latest_weights = pickle.load(f)
+
+        ms_path = os.path.join(ckpt_dir, "ms_prev_scores.bin")
+        ms_prev_scores = None
+        if os.path.exists(ms_path):
+            with open(ms_path, "rb") as f:
+                ms_prev_scores = pickle.load(f)
+
+        strategy_state_path = os.path.join(ckpt_dir, "strategy_state.bin")
+        if os.path.exists(strategy_state_path):
+            with open(strategy_state_path, "rb") as f:
+                strategy_state = pickle.load(f)
+            strategy_obj = self.strategy_runtime.client_strategy
+            for key, val in strategy_state.items():
+                setattr(strategy_obj, key, val)
+
+        df_path = os.path.join(ckpt_dir, "results_df.pkl")
+        if os.path.exists(df_path):
+            self.results_df = pd.read_pickle(df_path)
+
+        resume_round = int(info["round"]) + 1
+        print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {info['round']}) -> starting round {resume_round}{COLORS.ENDC}")
+        return {"resume_round": resume_round, "latest_weights": latest_weights, "ms_prev_scores": ms_prev_scores}
+
     def _train_single_client(
         self,
         client_id: int,
@@ -783,10 +871,18 @@ class FederatedLearningPipeline:
         ms_prev_scores = None
 
         latest_weights = None
+        start_round = 1
         pipeline_start_time = time.time()
         log_timestamp(self.logger, "=== FL PIPELINE STARTED ===")
         log_timestamp(self.logger, f"Strategy: {self.config.strategy}, Clients: {n_clients}, Rounds: {self.config.rounds}")
         round_times: List[float] = []
+
+        ckpt = self._load_checkpoint()
+        if ckpt:
+            latest_weights = ckpt["latest_weights"]
+            start_round = ckpt["resume_round"]
+            ms_prev_scores = ckpt["ms_prev_scores"]
+            log_timestamp(self.logger, f"Resumed from checkpoint, starting at round {start_round}")
 
         # Special handling for None strategy (independent learning)
         if self.config.strategy == "None":
@@ -804,7 +900,8 @@ class FederatedLearningPipeline:
             strategy_runtime=self.strategy_runtime,
             client_id=None,
         )
-        latest_weights = reusable_model.get_weights()
+        if latest_weights is None:
+            latest_weights = reusable_model.get_weights()
         _strategy_key = getattr(self.strategy_runtime.client_strategy, 'name', '').lower()
         can_reuse = _strategy_key not in self._WRAPPER_STRATEGIES
         if not can_reuse:
@@ -817,7 +914,7 @@ class FederatedLearningPipeline:
             self.strategy_runtime.aggregator.M_class = np.ones(num_classes, dtype=np.float32)
             print(f"{COLORS.OKCYAN}M_class initialized to ones (will be computed from full training data in each round){COLORS.ENDC}")
 
-        for round_num in range(1, self.config.rounds + 1):
+        for round_num in range(start_round, self.config.rounds + 1):
             self.current_round = round_num
             round_start_time = time.time()
 
@@ -1041,6 +1138,14 @@ class FederatedLearningPipeline:
             round_times.append(round_time)
             log_timestamp(self.logger, f"--- Round {round_num} completed in {round_time:.2f}s ---")
 
+            selected_server = None
+            if self.config.decentralized == "braintorrent":
+                selected_server = braintorrent_select_server(latest_weights, n_clients)
+            elif self.config.decentralized == "ModelSimilarity" and ms_prev_scores is not None:
+                selected_server = select_model_similarity_server(ms_prev_scores)
+            self._save_checkpoint(round_num, latest_weights, n_clients, round_times,
+                                  selected_server=selected_server, ms_prev_scores=ms_prev_scores)
+
             aggressive_memory_cleanup()
 
         pipeline_end_time = time.time()
@@ -1153,7 +1258,29 @@ def run_distillation_pipeline(config, strategy) -> None:
     
     strategy.setup(context)
     
-    for round_number in range(1, config.rounds + 1):
+    # Checkpoint: resume from last completed round
+    start_round = 1
+    ckpt_stem = os.path.splitext(os.path.basename(log_filename))[0]
+    ckpt_dir = os.path.join("checkpoint", ckpt_stem)
+    ckpt_info_path = os.path.join(ckpt_dir, "info.txt")
+    if os.path.exists(ckpt_info_path):
+        ckpt_info = {}
+        with open(ckpt_info_path) as f:
+            for line in f:
+                key, _, val = line.strip().partition(": ")
+                ckpt_info[key] = val
+        start_round = int(ckpt_info["round"]) + 1
+        shared_path = os.path.join(ckpt_dir, "shared_state.bin")
+        if os.path.exists(shared_path):
+            with open(shared_path, "rb") as _f:
+                saved_shared = pickle.load(_f)
+            context.shared_state.update(saved_shared)
+        results_path = os.path.join(ckpt_dir, "results.pkl")
+        if os.path.exists(results_path):
+            context.results = pd.read_pickle(results_path)
+        print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {ckpt_info['round']}) -> starting round {start_round}{COLORS.ENDC}")
+    
+    for round_number in range(start_round, config.rounds + 1):
         logger.info(f"Round {round_number}/{config.rounds}")
         print(f"\n{COLORS.HEADER}Round {round_number}/{config.rounds}{COLORS.ENDC}")
         log_timestamp(logger, f"Round {round_number} started")
@@ -1162,6 +1289,25 @@ def run_distillation_pipeline(config, strategy) -> None:
         
         if round_metrics:
             _record_metrics(context, round_number, round_metrics, excel_filename)
+
+        # Save checkpoint after each round
+        os.makedirs(ckpt_dir, exist_ok=True)
+        info_lines = [
+            f"round: {round_number}",
+            f"total_rounds: {config.rounds}",
+            f"strategy: {strategy.name}",
+            f"n_clients: {n_clients}",
+            f"partition_type: {config.partition_type}",
+            f"poisoned_clients: {poisoned_clients if poisoned_clients else 'none'}",
+        ]
+        with open(os.path.join(ckpt_dir, "info.txt"), "w") as _f:
+            _f.write("\n".join(info_lines) + "\n")
+        saveable_shared = {k: v for k, v in context.shared_state.items() if k != "extra_log_tokens"}
+        with open(os.path.join(ckpt_dir, "shared_state.bin"), "wb") as _f:
+            pickle.dump(saveable_shared, _f, protocol=pickle.HIGHEST_PROTOCOL)
+        if context.results:
+            pd.to_pickle(context.results, os.path.join(ckpt_dir, "results.pkl"))
+        print(f"{COLORS.OKCYAN}Checkpoint saved (round {round_number}) -> {ckpt_dir}{COLORS.ENDC}")
     
     strategy.finalize(context)
     
