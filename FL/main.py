@@ -91,6 +91,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # decentralized
     parser.add_argument("--decentralized", type=str, default=None, help="Decentralized topology simulation (e.g. braintorrent)")
 
+    # checkpointing
+    parser.add_argument("--checkpoint", action="store_true", help="Enable round-level checkpointing (saves/resumes state to disk)")
+
     return parser
 
 
@@ -143,6 +146,7 @@ def main(argv=None):
             exp2_temperature=args.exp2_temperature,
             robust_epsilon=args.robust_epsilon,
             remove_dis=args.remove_dis,
+            checkpoint=args.checkpoint,
         )
         
         strategy = strategy_registry[args.strategy](config)
@@ -173,6 +177,7 @@ def main(argv=None):
             support=args.support,
             threshold=args.threshold,
             decentralized=args.decentralized,
+            checkpoint=args.checkpoint,
         )
         run_pipeline(config)
 
