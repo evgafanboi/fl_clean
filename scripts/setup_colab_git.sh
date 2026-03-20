@@ -21,7 +21,7 @@ PAT_CREATE_URL="https://github.com/settings/tokens/new?scopes=repo&description=C
 GITHUB_USERNAME="tungmv"
 GITHUB_EMAIL="tungminh4399@gmail.com"
 REPO_URL="https://github.com/tungmv/fl_clean.git"
-BRANCH="modular"
+BRANCH="main"
 
 # Colors for output
 RED='\033[0;31m'

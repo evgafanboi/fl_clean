@@ -133,7 +133,7 @@ bash scripts/sync.sh
 **What it does:**
 - Loads credentials from Google Drive
 - Checks for uncommitted local changes
-- Fetches latest from `origin/modular`
+- Fetches latest from `origin/main`
 - Pulls changes with fast-forward only
 - Shows minimal output (success/error)
 
@@ -199,7 +199,7 @@ bash scripts/colab_init.sh
 
 ✓ Drive mounted at /content/drive
 ✓ Repository found: /content/drive/MyDrive/fl_clean
-✓ Branch: modular
+✓ Branch: main
 
 🔄 Syncing from GitHub...
 ✓ Credentials loaded
@@ -209,7 +209,7 @@ bash scripts/colab_init.sh
 📊 Environment:
    Python: 3.10.12
    Directory: /content/drive/MyDrive/fl_clean
-   Branch: modular
+   Branch: main
    GPU: Tesla T4
 
 ✅ Ready to work!
@@ -265,7 +265,7 @@ GITHUB_USERNAME=tungmv
 GITHUB_EMAIL=tungminh4399@gmail.com
 GITHUB_PAT=ghp_xxxxxxxxxxxxxxxxxxxx
 REPO_URL=https://github.com/tungmv/fl_clean.git
-BRANCH=modular
+BRANCH=main
 ```
 
 ### Security Notes
@@ -326,16 +326,16 @@ This means your local branch has diverged from remote.
 ```bash
 # See what's different
 git status
-git log origin/modular..HEAD
+git log origin/main..HEAD
 
 # Option 1: Stash local commits, pull, reapply
 git stash
-git pull origin modular
+git pull origin main
 git stash pop
 
 # Option 2: Hard reset (DANGER: loses local commits)
 git fetch origin
-git reset --hard origin/modular
+git reset --hard origin/main
 ```
 
 ### Error: "Connection failed" or "Network error"
@@ -364,7 +364,7 @@ chmod +x scripts/*.sh
 
 ### Working with Branches
 
-The scripts default to `modular` branch. To change:
+The scripts default to `main` branch. To change:
 
 **Option 1: Edit credentials file**
 ```bash
@@ -385,7 +385,7 @@ If you want to sync from the upstream repo (evgafanboi/fl_clean):
 
 ```bash
 git fetch upstream
-git merge upstream/modular
+git merge upstream/main
 ```
 
 Or add to your workflow:
@@ -395,7 +395,7 @@ bash scripts/sync.sh
 
 # Then pull from upstream
 git fetch upstream
-git merge upstream/modular
+git merge upstream/main
 ```
 
 ### Working with Multiple Repositories
@@ -474,7 +474,7 @@ A: The scripts currently only pull. To push:
 ```bash
 git add .
 git commit -m "your message"
-git push origin modular
+git push origin main
 ```
 
 **Q: What if I accidentally deleted the credential file?**

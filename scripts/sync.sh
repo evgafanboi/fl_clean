@@ -7,7 +7,7 @@ set -e  # Exit on error
 
 # Constants
 DRIVE_CRED_FILE="/content/drive/MyDrive/.colab_git_credentials"
-BRANCH="modular"
+BRANCH="main"
 
 # Colors for output
 RED='\033[0;31m'
