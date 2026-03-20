@@ -63,6 +63,7 @@ class FLConfig:
     support: bool = False
     threshold: float = 0.3
     decentralized: Optional[str] = None
+    checkpoint: bool = False
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -821,7 +822,7 @@ class FederatedLearningPipeline:
 
         extra_log_tokens = self.strategy_runtime.extra_log_tokens() if hasattr(self.strategy_runtime, 'extra_log_tokens') else {}
 
-        extra_tokens = list(extra_log_tokens.values())
+        extra_tokens = [self.config.model, *list(extra_log_tokens.values())]
         if self.config.decentralized:
             extra_tokens.append(self.config.decentralized)
 
@@ -877,12 +878,13 @@ class FederatedLearningPipeline:
         log_timestamp(self.logger, f"Strategy: {self.config.strategy}, Clients: {n_clients}, Rounds: {self.config.rounds}")
         round_times: List[float] = []
 
-        ckpt = self._load_checkpoint()
-        if ckpt:
-            latest_weights = ckpt["latest_weights"]
-            start_round = ckpt["resume_round"]
-            ms_prev_scores = ckpt["ms_prev_scores"]
-            log_timestamp(self.logger, f"Resumed from checkpoint, starting at round {start_round}")
+        if self.config.checkpoint:
+            ckpt = self._load_checkpoint()
+            if ckpt:
+                latest_weights = ckpt["latest_weights"]
+                start_round = ckpt["resume_round"]
+                ms_prev_scores = ckpt["ms_prev_scores"]
+                log_timestamp(self.logger, f"Resumed from checkpoint, starting at round {start_round}")
 
         # Special handling for None strategy (independent learning)
         if self.config.strategy == "None":
@@ -1143,8 +1145,9 @@ class FederatedLearningPipeline:
                 selected_server = braintorrent_select_server(latest_weights, n_clients)
             elif self.config.decentralized == "ModelSimilarity" and ms_prev_scores is not None:
                 selected_server = select_model_similarity_server(ms_prev_scores)
-            self._save_checkpoint(round_num, latest_weights, n_clients, round_times,
-                                  selected_server=selected_server, ms_prev_scores=ms_prev_scores)
+            if self.config.checkpoint:
+                self._save_checkpoint(round_num, latest_weights, n_clients, round_times,
+                                      selected_server=selected_server, ms_prev_scores=ms_prev_scores)
 
             aggressive_memory_cleanup()
 
@@ -1186,7 +1189,7 @@ def run_distillation_pipeline(config, strategy) -> None:
         algorithm_name=strategy.name,
         n_clients=n_clients,
         partition_label=partition_label,
-        extra_tokens=list(extra_log_tokens.values()),
+        extra_tokens=[config.model_type, *list(extra_log_tokens.values())],
         poison_suffix=poison_suffix,
     )
     excel_filename = log_filename.replace(".log", ".xlsx")
@@ -1258,27 +1261,27 @@ def run_distillation_pipeline(config, strategy) -> None:
     
     strategy.setup(context)
     
-    # Checkpoint: resume from last completed round
     start_round = 1
     ckpt_stem = os.path.splitext(os.path.basename(log_filename))[0]
     ckpt_dir = os.path.join("checkpoint", ckpt_stem)
-    ckpt_info_path = os.path.join(ckpt_dir, "info.txt")
-    if os.path.exists(ckpt_info_path):
-        ckpt_info = {}
-        with open(ckpt_info_path) as f:
-            for line in f:
-                key, _, val = line.strip().partition(": ")
-                ckpt_info[key] = val
-        start_round = int(ckpt_info["round"]) + 1
-        shared_path = os.path.join(ckpt_dir, "shared_state.bin")
-        if os.path.exists(shared_path):
-            with open(shared_path, "rb") as _f:
-                saved_shared = pickle.load(_f)
-            context.shared_state.update(saved_shared)
-        results_path = os.path.join(ckpt_dir, "results.pkl")
-        if os.path.exists(results_path):
-            context.results = pd.read_pickle(results_path)
-        print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {ckpt_info['round']}) -> starting round {start_round}{COLORS.ENDC}")
+    if config.checkpoint:
+        ckpt_info_path = os.path.join(ckpt_dir, "info.txt")
+        if os.path.exists(ckpt_info_path):
+            ckpt_info = {}
+            with open(ckpt_info_path) as f:
+                for line in f:
+                    key, _, val = line.strip().partition(": ")
+                    ckpt_info[key] = val
+            start_round = int(ckpt_info["round"]) + 1
+            shared_path = os.path.join(ckpt_dir, "shared_state.bin")
+            if os.path.exists(shared_path):
+                with open(shared_path, "rb") as _f:
+                    saved_shared = pickle.load(_f)
+                context.shared_state.update(saved_shared)
+            results_path = os.path.join(ckpt_dir, "results.pkl")
+            if os.path.exists(results_path):
+                context.results = pd.read_pickle(results_path)
+            print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {ckpt_info['round']}) -> starting round {start_round}{COLORS.ENDC}")
     
     for round_number in range(start_round, config.rounds + 1):
         logger.info(f"Round {round_number}/{config.rounds}")
@@ -1290,24 +1293,24 @@ def run_distillation_pipeline(config, strategy) -> None:
         if round_metrics:
             _record_metrics(context, round_number, round_metrics, excel_filename)
 
-        # Save checkpoint after each round
-        os.makedirs(ckpt_dir, exist_ok=True)
-        info_lines = [
-            f"round: {round_number}",
-            f"total_rounds: {config.rounds}",
-            f"strategy: {strategy.name}",
-            f"n_clients: {n_clients}",
-            f"partition_type: {config.partition_type}",
-            f"poisoned_clients: {poisoned_clients if poisoned_clients else 'none'}",
-        ]
-        with open(os.path.join(ckpt_dir, "info.txt"), "w") as _f:
-            _f.write("\n".join(info_lines) + "\n")
-        saveable_shared = {k: v for k, v in context.shared_state.items() if k != "extra_log_tokens"}
-        with open(os.path.join(ckpt_dir, "shared_state.bin"), "wb") as _f:
-            pickle.dump(saveable_shared, _f, protocol=pickle.HIGHEST_PROTOCOL)
-        if context.results:
-            pd.to_pickle(context.results, os.path.join(ckpt_dir, "results.pkl"))
-        print(f"{COLORS.OKCYAN}Checkpoint saved (round {round_number}) -> {ckpt_dir}{COLORS.ENDC}")
+        if config.checkpoint:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            info_lines = [
+                f"round: {round_number}",
+                f"total_rounds: {config.rounds}",
+                f"strategy: {strategy.name}",
+                f"n_clients: {n_clients}",
+                f"partition_type: {config.partition_type}",
+                f"poisoned_clients: {poisoned_clients if poisoned_clients else 'none'}",
+            ]
+            with open(os.path.join(ckpt_dir, "info.txt"), "w") as _f:
+                _f.write("\n".join(info_lines) + "\n")
+            saveable_shared = {k: v for k, v in context.shared_state.items() if k != "extra_log_tokens"}
+            with open(os.path.join(ckpt_dir, "shared_state.bin"), "wb") as _f:
+                pickle.dump(saveable_shared, _f, protocol=pickle.HIGHEST_PROTOCOL)
+            if context.results:
+                pd.to_pickle(context.results, os.path.join(ckpt_dir, "results.pkl"))
+            print(f"{COLORS.OKCYAN}Checkpoint saved (round {round_number}) -> {ckpt_dir}{COLORS.ENDC}")
     
     strategy.finalize(context)
     
