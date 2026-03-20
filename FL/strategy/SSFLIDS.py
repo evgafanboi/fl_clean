@@ -114,14 +114,18 @@ def train_on_pseudo_labeled_public(
     keras_model.optimizer = optimizer
     ce_loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
 
-    @tf.function
-    def train_step(batch_X, batch_y):
-        with tf.GradientTape() as tape:
-            predictions = keras_model(batch_X, training=True)
-            loss = ce_loss_fn(batch_y, predictions)
-        gradients = tape.gradient(loss, keras_model.trainable_variables)
+    if not hasattr(model_wrapper, '_ssflids_train_step'):
+        @tf.function
+        def train_step(batch_X, batch_y):
+            with tf.GradientTape() as tape:
+                predictions = keras_model(batch_X, training=True)
+                loss = ce_loss_fn(batch_y, predictions)
+            gradients = tape.gradient(loss, keras_model.trainable_variables)
         optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
-        return loss
+
+        model_wrapper._ssflids_train_step = train_step
+
+    train_step = model_wrapper._ssflids_train_step
 
     def generator():
         X_mmap = np.load(X_path, mmap_mode="r")

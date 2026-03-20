@@ -83,34 +83,40 @@ def train_with_ssd_loss(
 
     M_class_expanded = tf.constant(tf.expand_dims(M_class, axis=0), dtype=tf.float32)
 
-    @tf.function
-    def train_step(batch_X, batch_y):
-        with tf.GradientTape() as tape:
-            local_logits, predictions = logits_model(batch_X, training=True)
-            
-            # Compute SSD loss
-            global_logits = global_logits_model(batch_X, training=False)
-            global_probs = tf.nn.softmax(global_logits)
+    # Cache a compiled train_step on the model wrapper to avoid recompilation each round
+    if not hasattr(model_wrapper, "_ssd_train_step"):
+        @tf.function
+        def train_step(batch_X, batch_y, m_class, m_max_val):
+            with tf.GradientTape() as tape:
+                local_logits, predictions = logits_model(batch_X, training=True)
 
-            true_labels = tf.cast(tf.argmax(batch_y, axis=1), tf.int32)
-            batch_size = tf.shape(batch_y)[0]
+                # Compute SSD loss
+                global_logits = global_logits_model(batch_X, training=False)
+                global_probs = tf.nn.softmax(global_logits)
 
-            indices = tf.stack([tf.range(batch_size), true_labels], axis=1)
-            p_g_k2 = tf.gather_nd(global_probs, indices)
-            M_sample_expanded = tf.expand_dims(1.0 - tf.sqrt(tf.maximum(1.0 - p_g_k2, 0.0)), axis=1)
+                true_labels = tf.cast(tf.argmax(batch_y, axis=1), tf.int32)
+                batch_size = tf.shape(batch_y)[0]
 
-            M = m_max * tf.nn.relu(M_class_expanded * M_sample_expanded - 0.1)
+                indices = tf.stack([tf.range(batch_size), true_labels], axis=1)
+                p_g_k2 = tf.gather_nd(global_probs, indices)
+                M_sample_expanded = tf.expand_dims(1.0 - tf.sqrt(tf.maximum(1.0 - p_g_k2, 0.0)), axis=1)
 
-            logit_diff = M * (global_logits - local_logits)
-            ssd_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logit_diff), axis=1))
+                M = m_max_val * tf.nn.relu(m_class * M_sample_expanded - 0.1)
 
-            ce_loss = ce_loss_fn(batch_y, predictions)
-            total_loss = ce_loss + ssd_loss
+                logit_diff = M * (global_logits - local_logits)
+                ssd_loss = tf.reduce_mean(tf.reduce_sum(tf.square(logit_diff), axis=1))
 
-        gradients = tape.gradient(total_loss, keras_model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+                ce_loss = ce_loss_fn(batch_y, predictions)
+                total_loss = ce_loss + ssd_loss
 
-        return ce_loss, ssd_loss, total_loss
+            gradients = tape.gradient(total_loss, keras_model.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+
+            return ce_loss, ssd_loss, total_loss
+
+        model_wrapper._ssd_train_step = train_step
+
+    train_step = model_wrapper._ssd_train_step
 
     print(f"  Training with CE+SSD loss (m_max={m_max:.2f}) for {epochs} epochs...")
 
@@ -119,7 +125,7 @@ def train_with_ssd_loss(
         num_batches = 0
 
         for batch_X, batch_y in private_dataset:
-            ce_loss, ssd_loss, total_loss = train_step(batch_X, batch_y)
+            ce_loss, ssd_loss, total_loss = train_step(batch_X, batch_y, M_class_expanded, m_max)
             epoch_losses = epoch_losses + tf.stack([ce_loss, ssd_loss, total_loss])
             num_batches += 1
 

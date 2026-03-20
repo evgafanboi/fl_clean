@@ -5,7 +5,6 @@ import warnings
 # Suppress all warnings before importing TensorFlow
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices=false'
 warnings.filterwarnings('ignore')
 
 from .pipeline import FLConfig, run_pipeline

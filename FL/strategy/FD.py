@@ -136,30 +136,35 @@ def local_training_with_distillation(
         optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
         keras_model.optimizer = optimizer
 
-    @tf.function
-    def train_step(X_batch, y_batch):
-        with tf.GradientTape() as tape:
-            student_logits, predictions = dual_output_model(X_batch, training=True)
-            y_labels = tf.argmax(y_batch, axis=1)
+    if not hasattr(model_wrapper, "_fd_train_step"):
+        @tf.function
+        def train_step(X_batch, y_batch, global_logits_tensor, has_global_logits_tensor, gamma_val):
+            with tf.GradientTape() as tape:
+                student_logits, predictions = dual_output_model(X_batch, training=True)
+                y_labels = tf.argmax(y_batch, axis=1)
 
-            ce = ce_loss_fn(y_batch, predictions)
+                ce = ce_loss_fn(y_batch, predictions)
 
-            batch_global_logits = tf.gather(global_logits_tensor, y_labels)
-            batch_has_global = tf.gather(has_global_logits_tensor, y_labels)
+                batch_global_logits = tf.gather(global_logits_tensor, y_labels)
+                batch_has_global = tf.gather(has_global_logits_tensor, y_labels)
 
-            valid_student = tf.boolean_mask(student_logits, batch_has_global)
-            valid_global = tf.boolean_mask(batch_global_logits, batch_has_global)
+                valid_student = tf.boolean_mask(student_logits, batch_has_global)
+                valid_global = tf.boolean_mask(batch_global_logits, batch_has_global)
 
-            if tf.shape(valid_student)[0] > 0:
-                distill = gamma * mae_loss(valid_global, valid_student)
-            else:
-                distill = 0.0
+                if tf.shape(valid_student)[0] > 0:
+                    distill = gamma_val * mae_loss(valid_global, valid_student)
+                else:
+                    distill = 0.0
 
-            loss = ce + distill
+                loss = ce + distill
 
-        gradients = tape.gradient(loss, keras_model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
-        return loss, ce, distill, student_logits, y_labels
+            gradients = tape.gradient(loss, keras_model.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+            return loss, ce, distill, student_logits, y_labels
+
+        model_wrapper._fd_train_step = train_step
+
+    train_step = model_wrapper._fd_train_step
 
     for epoch in range(epochs):
         epoch_start = time.time()
@@ -171,8 +176,13 @@ def local_training_with_distillation(
         print(f"    Epoch {epoch + 1}/{epochs}", end='', flush=True)
 
         for X_batch, y_batch in private_dataset:
-            loss, ce, distill, batch_logits, batch_labels = train_step(X_batch, y_batch)
-
+            loss, ce, distill, batch_logits, batch_labels = train_step(
+                X_batch,
+                y_batch,
+                global_logits_tensor,
+                has_global_logits_tensor,
+                gamma,
+            )
             batch_logits_np = batch_logits.numpy()
             batch_labels_np = batch_labels.numpy()
             np.add.at(class_logits_sum, batch_labels_np, batch_logits_np)

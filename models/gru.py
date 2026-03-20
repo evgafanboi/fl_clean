@@ -124,7 +124,7 @@ class GRUModel:
                 decay_epochs = max(1, epoch - 5)
                 return self.learning_rate * 0.5 * (1 + np.cos(np.pi * decay_epochs / 50))
 
-        callbacks.append(tf.keras.callbacks.LearningRateScheduler(lr_schedule, verbose=1))
+        callbacks.append(tf.keras.callbacks.LearningRateScheduler(lr_schedule, verbose=0))
 
         if validation_data is not None:
             callbacks.append(tf.keras.callbacks.EarlyStopping(

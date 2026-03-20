@@ -7,7 +7,6 @@ from .colors import COLORS
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices=false'
 tf.get_logger().setLevel('ERROR')
 tf.autograph.set_verbosity(0)
 
@@ -33,6 +32,7 @@ def configure_gpu_memory() -> None:
         config.gpu_options.allow_growth = True
         tf.compat.v1.keras.backend.set_session(tf.compat.v1.Session(config=config))
         tf.keras.mixed_precision.set_global_policy('mixed_float16')
-        print(f"{COLORS.OKCYAN}GPU memory growth enabled + mixed precision enabled{COLORS.ENDC}")
+        tf.config.optimizer.set_jit(True)
+        print(f"{COLORS.OKCYAN}GPU memory growth enabled + mixed precision + XLA JIT enabled{COLORS.ENDC}")
     except Exception as exc:
         print(f"GPU configuration error: {exc}")

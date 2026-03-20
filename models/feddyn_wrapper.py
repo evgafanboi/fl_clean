@@ -52,7 +52,7 @@ class FedDynModelWrapper:
         alpha = self.feddyn.get_alpha()
         global_w = self._global_weights
         grad_L = self._grad_L
-        all_vars = self.model.trainable_weights
+        all_vars = list(self.model.weights)
         n = min(len(all_vars), len(global_w), len(grad_L))
 
         def feddyn_loss(y_true, y_pred):

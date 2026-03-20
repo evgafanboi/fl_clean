@@ -78,16 +78,22 @@ def digest_phase(
     optimizer = keras_model.optimizer or tf.keras.optimizers.Adam(learning_rate=0.001)
     keras_model.optimizer = optimizer
 
-    loss_fn = tf.keras.losses.get(keras_model.loss)
+    # Cache a compiled train_step on the model wrapper so it isn't recompiled each round
+    if not hasattr(model_wrapper, "_fedmd_train_step"):
+        loss_fn = tf.keras.losses.get(keras_model.loss)
 
-    @tf.function
-    def train_step(batch_X, batch_consensus):
-        with tf.GradientTape() as tape:
-            student_logits = logits_model(batch_X, training=True)
-            loss = loss_fn(batch_consensus, student_logits)
-        gradients = tape.gradient(loss, keras_model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
-        return loss
+        @tf.function
+        def train_step(batch_X, batch_consensus):
+            with tf.GradientTape() as tape:
+                student_logits = logits_model(batch_X, training=True)
+                loss = loss_fn(batch_consensus, student_logits)
+            gradients = tape.gradient(loss, keras_model.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+            return loss
+
+        model_wrapper._fedmd_train_step = train_step
+
+    train_step = model_wrapper._fedmd_train_step
 
     n_samples = len(public_features)
     for epoch in range(epochs):
