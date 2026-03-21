@@ -37,7 +37,7 @@ class GRUModel:
     temporal patterns; only the last hidden state feeds a dense head.
     """
 
-    def __init__(self, input_dim, num_classes, batch_size=4096, learning_rate=None, gru_units=128):
+    def __init__(self, input_dim, num_classes, batch_size=4096, learning_rate=None, gru_units=128, compile=True):
         self.input_dim = input_dim
         self.num_classes = num_classes
         self.batch_size = batch_size
@@ -51,11 +51,11 @@ class GRUModel:
 
         print(f"GRU Model - Using learning rate: {self.learning_rate:.6f} for batch size: {batch_size}")
 
-        self.model = self._create_gru_model()
+        self.model = self._create_gru_model(compile=compile)
         self._logits_model = None
         self._feature_model = None
 
-    def _create_gru_model(self):
+    def _create_gru_model(self, compile=True):
         inputs = tf.keras.layers.Input(shape=(self.input_dim,))
 
         # Reshape flat features -> (timesteps, 1) for GRU
@@ -106,11 +106,12 @@ class GRUModel:
                 learning_rate=self.learning_rate, clipnorm=0.5
             )
 
-        model.compile(
-            optimizer=optimizer,
-            loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05),
-            metrics=['accuracy', precision_m, recall_m, f1_m]
-        )
+        if compile:
+            model.compile(
+                optimizer=optimizer,
+                loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05),
+                metrics=['accuracy', precision_m, recall_m, f1_m]
+            )
 
         return model
 
@@ -202,5 +203,5 @@ class GRUModel:
         gc.collect()
 
 
-def create_gru_model(input_dim, num_classes, batch_size=4096, learning_rate=None, gru_units=128):
-    return GRUModel(input_dim, num_classes, batch_size, learning_rate, gru_units)
+def create_gru_model(input_dim, num_classes, batch_size=4096, learning_rate=None, gru_units=128, compile=True):
+    return GRUModel(input_dim, num_classes, batch_size, learning_rate, gru_units, compile=compile)

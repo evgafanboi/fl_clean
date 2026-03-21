@@ -18,6 +18,7 @@ class DCBLSTMModel:
         lstm_units=64,
         lstm_units_2=128,
         dnn_sizes=(64, 32, 16),
+        compile=True,
     ):
         self.input_dim = input_dim
         self.num_classes = num_classes
@@ -34,6 +35,7 @@ class DCBLSTMModel:
 
         print(f"DCBLSTM Model - Using learning rate: {self.learning_rate:.6f} for batch size: {batch_size}")
 
+        self._do_compile = compile
         self.model = self._create_dcblstm_model()
         self._logits_model = None
         self._feature_model = None
@@ -61,12 +63,13 @@ class DCBLSTMModel:
 
         model = tf.keras.Model(inputs=inputs, outputs=outputs)
 
-        optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate, clipnorm=0.5)
-        model.compile(
-            optimizer=optimizer,
-            loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05),
-            metrics=['accuracy', precision_m, recall_m, f1_m],
-        )
+        if self._do_compile:
+            optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate, clipnorm=0.5)
+            model.compile(
+                optimizer=optimizer,
+                loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05),
+                metrics=['accuracy', precision_m, recall_m, f1_m],
+            )
         return model
 
     def get_callbacks(self, validation_data=None):
@@ -157,5 +160,5 @@ class DCBLSTMModel:
         gc.collect()
 
 
-def create_dcblstm_model(input_dim=20, num_classes=20, batch_size=4096, learning_rate=None):
-    return DCBLSTMModel(input_dim=input_dim, num_classes=num_classes, batch_size=batch_size, learning_rate=learning_rate)
+def create_dcblstm_model(input_dim=20, num_classes=20, batch_size=4096, learning_rate=None, compile=True):
+    return DCBLSTMModel(input_dim=input_dim, num_classes=num_classes, batch_size=batch_size, learning_rate=learning_rate, compile=compile)

@@ -1,6 +1,6 @@
 from typing import Callable, Dict, Optional
 
-from models import dense, gru, dcblstm, fedprox_wrapper, feddyn_wrapper, fedmlb_wrapper, lora_factory
+from models import dense, gru, dcblstm, fedprox_wrapper, feddyn_wrapper, fedmlb_wrapper
 
 from .aggregators import StrategyRuntime
 
@@ -44,7 +44,8 @@ def _gru_builder(
 ):
     strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
 
-    base = gru.create_gru_model(input_dim, num_classes, batch_size)
+    skip_compile = strategy_name == 'feddyn'
+    base = gru.create_gru_model(input_dim, num_classes, batch_size, compile=not skip_compile)
     if strategy_name == 'fedprox':
         return fedprox_wrapper.FedProxModelWrapper(base, strategy_runtime.client_strategy)
     if strategy_name == 'feddyn':
@@ -61,7 +62,8 @@ def _dcblstm_builder(
 ):
     strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
 
-    base = dcblstm.create_dcblstm_model(input_dim, num_classes, batch_size)
+    skip_compile = strategy_name == 'feddyn'
+    base = dcblstm.create_dcblstm_model(input_dim, num_classes, batch_size, compile=not skip_compile)
     if strategy_name == 'fedprox':
         return fedprox_wrapper.FedProxModelWrapper(base, strategy_runtime.client_strategy)
     if strategy_name == 'feddyn':
