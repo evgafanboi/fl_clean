@@ -89,6 +89,10 @@ python3 -m FL --n_clients 10 --partition_type iid-500 --strategy FedSSD
 
 - Client selection for poisoning are randomized in the first run and the chosen IDs are stored under `results/poison_history` for reproducibility. For example, all simulation runs that use the partition type `label_skew_0.1`, `10 clients` share the same randomized poisoning client selection.
 
+### Checkpointing
+
+- Add per-round checkpoint with `--checkpoint`. Note that the configs are hashed to the checkpoint, so if any hyperparameter change for the same partition type and strategy, or there's no checkpoint at all, the simulation will start fresh (there will be a warning).
+- **Important:** Note that checkpointing stores the global model weights and a text holding the run's settings. In the context of _FD strategy_ that does not have a global model, client weights will be stored instead. For large `--n_clients`, checkpoints would consume significant storage. Make sure to clean checkpoints properly. The simulation should cleans up checkpoint automatically if the simulation ended successfully.
 ---
 
 ## Federated Class Incremental Learning

@@ -1,6 +1,8 @@
+import dataclasses
 import logging
 import os
 import pickle
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -30,6 +32,15 @@ from .decentralized import (
     compute_model_similarity_scores, select_model_similarity_server, log_model_similarity_selection,
 )
 from .poison_utils import parse_poison_config, get_or_create_poisoned_clients, PoisonedDataLoader
+
+
+def _config_fingerprint(config) -> str:
+    import hashlib
+    d = dataclasses.asdict(config)
+    d.pop('checkpoint', None)
+    d.pop('rounds', None)
+    raw = str(sorted(d.items()))
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 @dataclass
@@ -410,6 +421,7 @@ class FederatedLearningPipeline:
         info_lines = [
             f"round: {round_num}",
             f"total_rounds: {self.config.rounds}",
+            f"config_hash: {_config_fingerprint(self.config)}",
             f"strategy: {self.config.strategy}",
             f"model: {self.config.model}",
             f"n_clients: {n_clients}",
@@ -457,6 +469,12 @@ class FederatedLearningPipeline:
             for line in f:
                 key, _, val = line.strip().partition(": ")
                 info[key] = val
+
+        saved_hash = info.get("config_hash", "")
+        current_hash = _config_fingerprint(self.config)
+        if saved_hash and saved_hash != current_hash:
+            print(f"{COLORS.WARNING}No checkpoint found, starting fresh{COLORS.ENDC}")
+            return None
 
         with open(os.path.join(ckpt_dir, "global_weights.bin"), "rb") as f:
             latest_weights = pickle.load(f)
@@ -1166,6 +1184,10 @@ class FederatedLearningPipeline:
         print(f"{COLORS.OKGREEN}Average time per round: {avg_round_time:.2f} seconds{COLORS.ENDC}")
         print(f"{COLORS.OKCYAN}Results saved to {excel_filename}{COLORS.ENDC}")
 
+        if self.config.checkpoint and os.path.isdir(self._checkpoint_dir()):
+            shutil.rmtree(self._checkpoint_dir(), ignore_errors=True)
+            print(f"{COLORS.OKCYAN}Checkpoint cleaned up{COLORS.ENDC}")
+
 
 def run_pipeline(config: FLConfig) -> None:
     pipeline = FederatedLearningPipeline(config)
@@ -1274,16 +1296,21 @@ def run_distillation_pipeline(config, strategy) -> None:
                 for line in f:
                     key, _, val = line.strip().partition(": ")
                     ckpt_info[key] = val
-            start_round = int(ckpt_info["round"]) + 1
-            shared_path = os.path.join(ckpt_dir, "shared_state.bin")
-            if os.path.exists(shared_path):
-                with open(shared_path, "rb") as _f:
-                    saved_shared = pickle.load(_f)
-                context.shared_state.update(saved_shared)
-            results_path = os.path.join(ckpt_dir, "results.pkl")
-            if os.path.exists(results_path):
-                context.results = pd.read_pickle(results_path)
-            print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {ckpt_info['round']}) -> starting round {start_round}{COLORS.ENDC}")
+            saved_hash = ckpt_info.get("config_hash", "")
+            current_hash = _config_fingerprint(config)
+            if saved_hash and saved_hash != current_hash:
+                print(f"{COLORS.WARNING}Checkpoint config mismatch (saved={saved_hash}, current={current_hash}) \u2014 starting fresh{COLORS.ENDC}")
+            else:
+                start_round = int(ckpt_info["round"]) + 1
+                shared_path = os.path.join(ckpt_dir, "shared_state.bin")
+                if os.path.exists(shared_path):
+                    with open(shared_path, "rb") as _f:
+                        saved_shared = pickle.load(_f)
+                    context.shared_state.update(saved_shared)
+                results_path = os.path.join(ckpt_dir, "results.pkl")
+                if os.path.exists(results_path):
+                    context.results = pd.read_pickle(results_path)
+                print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {ckpt_info['round']}) -> starting round {start_round}{COLORS.ENDC}")
     
     for round_number in range(start_round, config.rounds + 1):
         logger.info(f"Round {round_number}/{config.rounds}")
@@ -1300,6 +1327,7 @@ def run_distillation_pipeline(config, strategy) -> None:
             info_lines = [
                 f"round: {round_number}",
                 f"total_rounds: {config.rounds}",
+                f"config_hash: {_config_fingerprint(config)}",
                 f"strategy: {strategy.name}",
                 f"n_clients: {n_clients}",
                 f"partition_type: {config.partition_type}",
@@ -1321,6 +1349,10 @@ def run_distillation_pipeline(config, strategy) -> None:
         log_timestamp(logger, f"Pipeline completed in {total_time:.2f}s ({total_time/60:.2f}m)")
     else:
         log_timestamp(logger, "Pipeline completed")
+
+    if config.checkpoint and os.path.isdir(ckpt_dir):
+        shutil.rmtree(ckpt_dir, ignore_errors=True)
+        print(f"{COLORS.OKCYAN}Checkpoint cleaned up{COLORS.ENDC}")
 
 
 def _extract_labels(dataset: tf.data.Dataset, num_classes: int) -> np.ndarray:
