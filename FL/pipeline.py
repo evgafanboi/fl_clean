@@ -832,6 +832,7 @@ class FederatedLearningPipeline:
             strategy_name=self.config.strategy,
             extra_tokens=extra_tokens,
             poison_suffix=poison_suffix,
+            resume=self.config.checkpoint,
         )
         excel_filename = self.log_filename.replace('.log', '.xlsx')
 
@@ -1191,6 +1192,7 @@ def run_distillation_pipeline(config, strategy) -> None:
         partition_label=partition_label,
         extra_tokens=[config.model_type, *list(extra_log_tokens.values())],
         poison_suffix=poison_suffix,
+        resume=config.checkpoint,
     )
     excel_filename = log_filename.replace(".log", ".xlsx")
     
