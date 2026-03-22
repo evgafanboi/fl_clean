@@ -1033,7 +1033,24 @@ class FederatedLearningPipeline:
             # Only needed when stream=False
             client_results: List = [] if not stream else None
 
+            _REFRESH_EVERY = 25  # recreate model periodically to defragment CuDNN workspace
+
             for client_idx in range(n_clients):
+                # Periodic GPU memory defragmentation (CuDNN backward workspace grows until OOM)
+                if (can_reuse and reusable_model is not None
+                        and client_idx > 0 and client_idx % _REFRESH_EVERY == 0):
+                    del reusable_model
+                    tf.keras.backend.clear_session()
+                    aggressive_memory_cleanup()
+                    reusable_model = create_model(
+                        architecture=self.config.model,
+                        input_dim=input_dim,
+                        num_classes=num_classes,
+                        batch_size=self.config.batch_size,
+                        strategy_runtime=self.strategy_runtime,
+                        client_id=None,
+                    )
+
                 result_data, sample_size, loss = self._train_single_client(
                     client_id=client_idx,
                     input_dim=input_dim,

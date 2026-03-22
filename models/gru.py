@@ -61,23 +61,25 @@ class GRUModel:
         # Reshape flat features -> (timesteps, 1) for GRU
         x = tf.keras.layers.Reshape((self.input_dim, 1), name='reshape_input')(inputs)
 
+        # Native GRU uses fused CuDNN kernels (much lower memory than RNN+GRUCell).
+        # dtype='float32' avoids CuDNN OOM / DoRNNForward errors under mixed_float16.
         x = tf.keras.layers.GRU(
             self.gru_units, return_sequences=True,
-            name='gru_1', unroll=True
+            name='gru_1', dtype='float32'
         )(x)
         x = tf.keras.layers.LayerNormalization(name='ln_gru_1')(x)
         x = tf.keras.layers.Dropout(0.15, name='drop_gru_1')(x)
 
         x = tf.keras.layers.GRU(
             self.gru_units, return_sequences=True,
-            name='gru_2', unroll=True
+            name='gru_2', dtype='float32'
         )(x)
         x = tf.keras.layers.LayerNormalization(name='ln_gru_2')(x)
         x = tf.keras.layers.Dropout(0.15, name='drop_gru_2')(x)
 
         x = tf.keras.layers.GRU(
             self.gru_units, return_sequences=False,
-            name='gru_3', unroll=True
+            name='gru_3', dtype='float32'
         )(x)
         x = tf.keras.layers.LayerNormalization(name='ln_gru_3')(x)
         x = tf.keras.layers.Dropout(0.15, name='drop_gru_3')(x)

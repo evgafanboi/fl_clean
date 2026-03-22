@@ -22,15 +22,6 @@ def configure_gpu_memory() -> None:
 
     try:
         tf.config.experimental.set_memory_growth(gpus[0], True)
-        gpu_options = tf.compat.v1.GPUOptions(
-            per_process_gpu_memory_fraction=0.9,
-            allow_growth=True,
-            polling_active_delay=10,
-            allocator_type='BFC'
-        )
-        config = tf.compat.v1.ConfigProto(gpu_options=gpu_options)
-        config.gpu_options.allow_growth = True
-        tf.compat.v1.keras.backend.set_session(tf.compat.v1.Session(config=config))
         tf.keras.mixed_precision.set_global_policy('mixed_float16')
         print(f"{COLORS.OKCYAN}GPU memory growth enabled + mixed precision enabled{COLORS.ENDC}")
     except Exception as exc:
