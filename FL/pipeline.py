@@ -1021,6 +1021,21 @@ class FederatedLearningPipeline:
                 print(f"{COLORS.OKGREEN}  M_class aggregated: min={M_class.min():.4f}, max={M_class.max():.4f}, mean={M_class.mean():.4f}{COLORS.ENDC}")
                 log_timestamp(self.logger, f"FedSSDexp M_class: min={M_class.min():.4f}, max={M_class.max():.4f}, mean={M_class.mean():.4f}")
 
+            # Refresh model at round boundaries to release CuDNN workspace to avoid DoRNNBackward OOM.
+            if (can_reuse and reusable_model is not None
+                    and round_num > start_round):
+                del reusable_model
+                tf.keras.backend.clear_session()
+                aggressive_memory_cleanup()
+                reusable_model = create_model(
+                    architecture=self.config.model,
+                    input_dim=input_dim,
+                    num_classes=num_classes,
+                    batch_size=self.config.batch_size,
+                    strategy_runtime=self.strategy_runtime,
+                    client_id=None,
+                )
+
             stream = self._can_stream_aggregate()
             sample_sizes: List[int] = []
             client_losses: List[float] = []
