@@ -404,7 +404,7 @@ class FederatedLearningPipeline:
         log_timestamp(self.logger, "Independent learning completed")
         print(f"{COLORS.OKGREEN}Independent learning completed!{COLORS.ENDC}")
 
-    _WRAPPER_STRATEGIES = frozenset({'fedprox', 'feddyn', 'fedmlb', 'fedora'})
+    _WRAPPER_STRATEGIES = frozenset({'fedmlb', 'fedora'})
 
     def _checkpoint_dir(self) -> str:
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
@@ -585,6 +585,15 @@ class FederatedLearningPipeline:
             del global_model
             loss = 0.0
             history = None
+        elif hasattr(self.strategy_runtime.client_strategy, 'train_client'):
+            loss = self.strategy_runtime.client_strategy.train_client(
+                model=model,
+                dataset=train_dataset,
+                epochs=self.config.epochs,
+                client_id=client_id,
+                global_weights=latest_weights,
+            )
+            history = None
         else:
             history = model.fit(
                 train_dataset,
@@ -627,11 +636,6 @@ class FederatedLearningPipeline:
                 result_data = poisoned_weights
             else:
                 result_data = [new_w - old_w for new_w, old_w in zip(poisoned_weights, latest_weights)]
-        elif self.config.strategy == "FedDyn":
-            feddyn_data = model.get_feddyn_update()
-            if 'weights' in feddyn_data:
-                feddyn_data['weights'] = poisoned_weights
-            result_data = feddyn_data
         else:
             result_data = poisoned_weights
 

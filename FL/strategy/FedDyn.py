@@ -1,4 +1,5 @@
 import numpy as np
+import tensorflow as tf
 from .FedAvg import FedAvg
 
 
@@ -112,3 +113,55 @@ class FedDyn(FedAvg):
     def get_alpha(self):
         """Return alpha for client-side regularization."""
         return self.alpha
+
+    def train_client(self, model, dataset, epochs, client_id=None, global_weights=None):
+        keras_model = model.model if hasattr(model, 'model') else model
+        all_weights = keras_model.weights
+        trainable = keras_model.trainable_variables
+        trainable_idx = [i for i, w in enumerate(all_weights) if w.trainable]
+
+        if not hasattr(model, '_feddyn_train_step'):
+            gw_vars = [tf.Variable(tf.zeros_like(trainable[i]), trainable=False) for i in range(len(trainable))]
+            gL_vars = [tf.Variable(tf.zeros_like(trainable[i]), trainable=False) for i in range(len(trainable))]
+            n = len(trainable)
+            alpha = self.alpha
+            ce_fn = tf.keras.losses.CategoricalCrossentropy()
+            optimizer = tf.keras.optimizers.SGD(learning_rate=0.01, clipnorm=0.5)
+
+            @tf.function
+            def train_step(X, y):
+                with tf.GradientTape() as tape:
+                    pred = keras_model(X, training=True)
+                    ce = ce_fn(y, pred)
+                    lin = tf.constant(0.0, dtype=tf.float32)
+                    quad = tf.constant(0.0, dtype=tf.float32)
+                    for i in range(n):
+                        p = tf.reshape(trainable[i], [-1])
+                        g = tf.reshape(gL_vars[i], [-1])
+                        gw = tf.reshape(gw_vars[i], [-1])
+                        lin += tf.reduce_sum(p * g)
+                        quad += tf.reduce_sum(tf.square(p - gw))
+                    loss = ce - lin + (alpha / 2.0) * quad
+                grads = tape.gradient(loss, trainable)
+                optimizer.apply_gradients(zip(grads, trainable))
+                return loss
+
+            model._feddyn_train_step = train_step
+            model._feddyn_gw_vars = gw_vars
+            model._feddyn_gL_vars = gL_vars
+
+        template = keras_model.get_weights()
+        grad_L = self.get_grad_L_for_client(client_id, template)
+        for var, idx in zip(model._feddyn_gw_vars, trainable_idx):
+            var.assign(tf.cast(global_weights[idx], var.dtype))
+        for var, idx in zip(model._feddyn_gL_vars, trainable_idx):
+            var.assign(tf.cast(grad_L[idx], var.dtype))
+        train_step = model._feddyn_train_step
+
+        total_loss = 0.0
+        n_batches = 0
+        for _ in range(epochs):
+            for X, y in dataset:
+                total_loss += float(train_step(X, y))
+                n_batches += 1
+        return total_loss / max(n_batches, 1)

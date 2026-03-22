@@ -1,6 +1,6 @@
 from typing import Callable, Dict, Optional
 
-from models import dense, gru, dcblstm, fedprox_wrapper, feddyn_wrapper, fedmlb_wrapper
+from models import dense, gru, dcblstm, fedmlb_wrapper
 
 from .aggregators import StrategyRuntime
 
@@ -17,12 +17,6 @@ def _dense_builder(
 ):
     strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
 
-    if strategy_name == 'fedora':
-        return dense.create_dense_model(input_dim, num_classes, batch_size)
-    if strategy_name == 'fedprox':
-        return fedprox_wrapper.create_fedprox_dense_model(input_dim, num_classes, batch_size, strategy_runtime.client_strategy)
-    if strategy_name == 'feddyn':
-        return feddyn_wrapper.create_feddyn_dense_model(input_dim, num_classes, batch_size, strategy_runtime.client_strategy, client_id)
     if strategy_name == 'fedmlb':
         return fedmlb_wrapper.create_fedmlb_model(
             input_dim,
@@ -42,15 +36,7 @@ def _gru_builder(
     strategy_runtime: StrategyRuntime,
     client_id: Optional[int]
 ):
-    strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
-
-    skip_compile = strategy_name == 'feddyn'
-    base = gru.create_gru_model(input_dim, num_classes, batch_size, compile=not skip_compile)
-    if strategy_name == 'fedprox':
-        return fedprox_wrapper.FedProxModelWrapper(base, strategy_runtime.client_strategy)
-    if strategy_name == 'feddyn':
-        return feddyn_wrapper.FedDynModelWrapper(base, strategy_runtime.client_strategy, client_id)
-    return base
+    return gru.create_gru_model(input_dim, num_classes, batch_size)
 
 
 def _dcblstm_builder(
@@ -60,15 +46,7 @@ def _dcblstm_builder(
     strategy_runtime: StrategyRuntime,
     client_id: Optional[int],
 ):
-    strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
-
-    skip_compile = strategy_name == 'feddyn'
-    base = dcblstm.create_dcblstm_model(input_dim, num_classes, batch_size, compile=not skip_compile)
-    if strategy_name == 'fedprox':
-        return fedprox_wrapper.FedProxModelWrapper(base, strategy_runtime.client_strategy)
-    if strategy_name == 'feddyn':
-        return feddyn_wrapper.FedDynModelWrapper(base, strategy_runtime.client_strategy, client_id)
-    return base
+    return dcblstm.create_dcblstm_model(input_dim, num_classes, batch_size)
 
 MODEL_REGISTRY: Dict[str, ModelBuilder] = {
     'dense': _dense_builder,
