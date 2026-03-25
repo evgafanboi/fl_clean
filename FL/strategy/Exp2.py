@@ -304,7 +304,6 @@ class Exp2(DistillationStrategy):
 
     def setup(self, context: PipelineContext) -> None:
         config = context.config
-        is_sequence = config.model_type.lower() == "gru"
         use_dis = not getattr(config, "remove_dis", False)
         kd_method = getattr(config, "exp2_kd", "ekd")
 
@@ -312,7 +311,7 @@ class Exp2(DistillationStrategy):
 
         public_unlabeled_ds, total_public = load_public_dataset_from_clients(
             context.paths, batch_size=config.batch_size, num_classes=context.num_classes,
-            shuffle=False, return_labels=False, is_sequence=is_sequence,
+            shuffle=False, return_labels=False,
         )
         public_features = numpy_from_dataset(public_unlabeled_ds)
         del public_unlabeled_ds
@@ -325,7 +324,6 @@ class Exp2(DistillationStrategy):
         context.shared_state.update({
             "public_features_path": pub_path,
             "public_sample_count": total_public,
-            "is_sequence": is_sequence,
             "use_dis": use_dis,
         })
 
@@ -410,7 +408,6 @@ class Exp2(DistillationStrategy):
             private_dataset = create_private_dataset(
                 state.paths["train_X"], state.paths["train_y"],
                 context.input_dim, context.num_classes, config.batch_size,
-                is_sequence=context.shared_state["is_sequence"],
             )
             ce_stage(model, private_dataset, self.ce_epochs)
             pool.checkin(state.client_id, model)

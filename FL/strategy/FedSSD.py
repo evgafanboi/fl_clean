@@ -57,40 +57,54 @@ def compute_class_metrics(model_wrapper, aux_dataset: tf.data.Dataset, num_class
     return M_class
 
 
+def _get_ssd_models(model_wrapper, global_model):
+    """Build or retrieve cached logits sub-models for SSD training."""
+    keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
+    global_keras = global_model.model if hasattr(global_model, "model") else global_model
+
+    if not hasattr(model_wrapper, "_ssd_logits_model"):
+        logits_layer = keras_model.get_layer("logits")
+        model_wrapper._ssd_logits_model = tf.keras.Model(
+            inputs=keras_model.input, outputs=[logits_layer.output, keras_model.output]
+        )
+
+    if not hasattr(model_wrapper, "_ssd_global_logits_model") or model_wrapper._ssd_global_keras is not global_keras:
+        global_logits_layer = global_keras.get_layer("logits")
+        model_wrapper._ssd_global_logits_model = tf.keras.Model(
+            inputs=global_keras.input, outputs=global_logits_layer.output
+        )
+        model_wrapper._ssd_global_keras = global_keras
+
+    return model_wrapper._ssd_logits_model, model_wrapper._ssd_global_logits_model
+
+
 def train_with_ssd_loss(
     model_wrapper,
     private_dataset: tf.data.Dataset,
     global_model,
-    M_class: np.ndarray,
+    m_class_expanded: tf.Tensor,
     m_max: float,
     num_classes: int,
     epochs: int,
 ) -> None:
     """Train with CE + selective self-distillation (L = L_CE + L_SSD)."""
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
-    global_keras = global_model.model if hasattr(global_model, "model") else global_model
 
     optimizer = keras_model.optimizer or tf.keras.optimizers.Adam(learning_rate=0.001)
     keras_model.optimizer = optimizer
 
     ce_loss_fn = keras_model.loss if hasattr(keras_model, "loss") else tf.keras.losses.CategoricalCrossentropy()
 
-    logits_layer = keras_model.get_layer("logits")
-    logits_model = tf.keras.Model(inputs=keras_model.input, outputs=[logits_layer.output, keras_model.output])
+    logits_model, global_logits_model = _get_ssd_models(model_wrapper, global_model)
 
-    global_logits_layer = global_keras.get_layer("logits")
-    global_logits_model = tf.keras.Model(inputs=global_keras.input, outputs=global_logits_layer.output)
+    m_max_tensor = tf.constant(m_max, dtype=tf.float32)
 
-    M_class_expanded = tf.constant(tf.expand_dims(M_class, axis=0), dtype=tf.float32)
-
-    # Cache a compiled train_step on the model wrapper to avoid recompilation each round
     if not hasattr(model_wrapper, "_ssd_train_step"):
-        @tf.function
+        @tf.function(reduce_retracing=True)
         def train_step(batch_X, batch_y, m_class, m_max_val):
             with tf.GradientTape() as tape:
                 local_logits, predictions = logits_model(batch_X, training=True)
 
-                # Compute SSD loss
                 global_logits = global_logits_model(batch_X, training=False)
                 global_probs = tf.nn.softmax(global_logits)
 
@@ -121,19 +135,20 @@ def train_with_ssd_loss(
     print(f"  Training with CE+SSD loss (m_max={m_max:.2f}) for {epochs} epochs...")
 
     for epoch in range(epochs):
-        epoch_losses = tf.constant([0.0, 0.0, 0.0], dtype=tf.float32)
+        ce_sum, ssd_sum, total_sum = 0.0, 0.0, 0.0
         num_batches = 0
 
         for batch_X, batch_y in private_dataset:
-            ce_loss, ssd_loss, total_loss = train_step(batch_X, batch_y, M_class_expanded, m_max)
-            epoch_losses = epoch_losses + tf.stack([ce_loss, ssd_loss, total_loss])
+            ce_loss, ssd_loss, total_loss = train_step(batch_X, batch_y, m_class_expanded, m_max_tensor)
+            ce_sum += float(ce_loss)
+            ssd_sum += float(ssd_loss)
+            total_sum += float(total_loss)
             num_batches += 1
 
         if num_batches > 0:
-            avg_losses = epoch_losses / num_batches
             print(
-                f"    Epoch {epoch + 1}/{epochs} - CE: {avg_losses[0]:.4f}, "
-                f"SSD: {avg_losses[1]:.4f}, Total: {avg_losses[2]:.4f}"
+                f"    Epoch {epoch + 1}/{epochs} - CE: {ce_sum / num_batches:.4f}, "
+                f"SSD: {ssd_sum / num_batches:.4f}, Total: {total_sum / num_batches:.4f}"
             )
 
 
@@ -145,19 +160,16 @@ class FedSSD(DistillationStrategy):
 
     def setup(self, context: PipelineContext) -> None:
         config = context.config
-        is_sequence = config.model_type.lower() == "gru"
         aux_dataset, public_len = load_public_dataset_from_clients(
             context.paths,
             batch_size=config.batch_size,
             num_classes=context.num_classes,
             shuffle=True,
             return_labels=True,
-            is_sequence=is_sequence,
         )
         context.shared_state.update(
             {
                 "aux_dataset": aux_dataset,
-                "is_sequence": is_sequence,
                 "sample_sizes": [],
             }
         )
@@ -205,14 +217,17 @@ class FedSSD(DistillationStrategy):
             f"  M_class statistics -> mean: {M_class.mean():.4f}, max: {M_class.max():.4f}"
         )
 
+        m_class_expanded = tf.constant(np.expand_dims(M_class, axis=0), dtype=tf.float32)
+        global_weights = global_model.get_weights()
+
         print(f"\n{COLORS.OKCYAN}[STEP 2/2] Client selective soft distillation training{COLORS.ENDC}")
         client_weights: List[List[np.ndarray]] = []
         pool = context.model_pool
+        wrapper = pool._available[-1]
 
         for idx, state in enumerate(context.client_states):
             print(f"\n{COLORS.BOLD}Client {state.client_id}{COLORS.ENDC}")
-            model = pool.checkout(state.client_id)
-            model.set_weights(global_model.get_weights())
+            wrapper.set_weights(global_weights)
 
             train_dataset = create_private_dataset(
                 state.paths["train_X"],
@@ -220,21 +235,19 @@ class FedSSD(DistillationStrategy):
                 context.input_dim,
                 context.num_classes,
                 config.batch_size,
-                is_sequence=context.shared_state["is_sequence"],
             )
 
             train_with_ssd_loss(
-                model,
+                wrapper,
                 train_dataset,
                 global_model,
-                M_class,
+                m_class_expanded,
                 config.m_max,
                 context.num_classes,
                 config.epochs,
             )
 
-            client_weights.append(model.get_weights())
-            pool.checkin(state.client_id, model)
+            client_weights.append(wrapper.get_weights())
             del train_dataset
             aggressive_memory_cleanup()
 
@@ -262,10 +275,10 @@ class FedSSD(DistillationStrategy):
         round_metrics: Dict[int, Dict[str, float]] = {-1: global_metrics}
         
         if config.personalized_eval:
-            for state in context.client_states:
-                model = pool.checkout(state.client_id)
-                metrics = evaluate_model(model, context.test_dataset, context.test_labels)
-                pool.release(model)
+            for idx, state in enumerate(context.client_states):
+                wrapper.set_weights(client_weights[idx])
+                metrics = evaluate_model(wrapper, context.test_dataset, context.test_labels)
+                round_metrics[state.client_id] = metrics
                 round_metrics[state.client_id] = metrics
                 context.logger.info(
                     "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",

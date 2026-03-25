@@ -12,6 +12,11 @@ try:  # Optional GRU dependency used by select algorithms
 except Exception:  # pragma: no cover - gracefully handle absence
     gru = None  # type: ignore
 
+try:
+    from models import dcblstm  # type: ignore
+except Exception:
+    dcblstm = None  # type: ignore
+
 
 def create_model(input_dim: int, num_classes: int, batch_size: int, model_type: str = "dense"):
     model_type_normalized = model_type.lower()
@@ -21,6 +26,10 @@ def create_model(input_dim: int, num_classes: int, batch_size: int, model_type: 
         if gru is None:
             raise ValueError("GRU model requested but models.gru is unavailable")
         return gru.create_gru_model(input_dim, num_classes, batch_size)
+    if model_type_normalized == "dcblstm":
+        if dcblstm is None:
+            raise ValueError("DCBLSTM model requested but models.dcblstm is unavailable")
+        return dcblstm.create_dcblstm_model(input_dim, num_classes, batch_size)
     raise ValueError(f"Unknown model type: {model_type}")
 
 

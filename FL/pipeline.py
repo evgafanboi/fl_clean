@@ -1339,7 +1339,7 @@ def run_distillation_pipeline(config, strategy) -> None:
             else:
                 start_round = int(ckpt_info["round"]) + 1
                 shared_path = os.path.join(ckpt_dir, "shared_state.bin")
-                if os.path.exists(shared_path):
+                if os.path.exists(shared_path) and os.path.getsize(shared_path) > 0:
                     with open(shared_path, "rb") as _f:
                         saved_shared = pickle.load(_f)
                     context.shared_state.update(saved_shared)
@@ -1371,9 +1371,19 @@ def run_distillation_pipeline(config, strategy) -> None:
             ]
             with open(os.path.join(ckpt_dir, "info.txt"), "w") as _f:
                 _f.write("\n".join(info_lines) + "\n")
-            saveable_shared = {k: v for k, v in context.shared_state.items() if k != "extra_log_tokens"}
-            with open(os.path.join(ckpt_dir, "shared_state.bin"), "wb") as _f:
+            _SKIP_KEYS = {"extra_log_tokens"}
+            saveable_shared = {}
+            for k, v in context.shared_state.items():
+                if k in _SKIP_KEYS:
+                    continue
+                if isinstance(v, (tf.data.Dataset, tf.Tensor)):
+                    continue
+                saveable_shared[k] = v
+            _shared_tmp = os.path.join(ckpt_dir, "shared_state.bin.tmp")
+            _shared_dst = os.path.join(ckpt_dir, "shared_state.bin")
+            with open(_shared_tmp, "wb") as _f:
                 pickle.dump(saveable_shared, _f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(_shared_tmp, _shared_dst)
             if context.results:
                 pd.to_pickle(context.results, os.path.join(ckpt_dir, "results.pkl"))
             print(f"{COLORS.OKCYAN}Checkpoint saved (round {round_number}) -> {ckpt_dir}{COLORS.ENDC}")

@@ -105,8 +105,7 @@ class FedDKD(DistillationStrategy):
 
     def setup(self, context: PipelineContext) -> None:
         print(f"{COLORS.OKGREEN}Setting up FedDKD{COLORS.ENDC}")
-        is_sequence = context.config.model_type.lower() == "gru"
-        context.shared_state["is_sequence"] = is_sequence
+
         
         sample_sizes = []
         pool = context.model_pool
@@ -121,7 +120,6 @@ class FedDKD(DistillationStrategy):
                 context.input_dim,
                 context.num_classes,
                 context.config.batch_size,
-                is_sequence=is_sequence,
             )
             
             X_train_mmap = np.load(paths["train_X"], mmap_mode='r')
@@ -174,7 +172,6 @@ class FedDKD(DistillationStrategy):
     def run_round(self, context: PipelineContext, round_number: int) -> Dict[int, Dict[str, float]]:
         round_start = time.time()
         config = context.config
-        is_sequence = context.shared_state["is_sequence"]
         sample_sizes = context.shared_state["sample_sizes"]
         global_model = context.shared_state["global_model"]
         
@@ -194,7 +191,6 @@ class FedDKD(DistillationStrategy):
                 context.input_dim,
                 context.num_classes,
                 config.batch_size,
-                is_sequence=is_sequence,
             )
             
             model.fit(train_dataset, epochs=self.expert_epochs, verbose=1)
@@ -214,7 +210,6 @@ class FedDKD(DistillationStrategy):
                 context.input_dim,
                 context.num_classes,
                 config.batch_size,
-                is_sequence=is_sequence,
             )
             for state in context.client_states
         }

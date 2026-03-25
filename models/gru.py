@@ -91,7 +91,7 @@ class GRUModel:
             name='dense_head'
         )(x)
         x = tf.keras.layers.LayerNormalization(name='ln_head')(x)
-        x = tf.keras.layers.Dropout(0.2)(x)
+        x = tf.keras.layers.Dropout(0.2, name='drop_head')(x)
 
         logits = tf.keras.layers.Dense(self.num_classes, activation=None, name='logits')(x)
         outputs = tf.keras.layers.Activation('softmax', name='predictions')(logits)

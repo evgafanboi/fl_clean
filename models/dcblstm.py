@@ -40,20 +40,21 @@ class DCBLSTMModel:
 
     def _create_dcblstm_model(self):
         inputs = tf.keras.layers.Input(shape=(self.input_dim,))
-        x = tf.keras.layers.Reshape((self.input_dim, 1))(inputs)
-        x = tf.keras.layers.Conv1D(self.conv_filters, kernel_size=self.input_dim, activation='relu', padding='same')(x)
-        x = tf.keras.layers.LayerNormalization()(x)
-        # Stacked BiLSTM: first returns full sequence so the second BiLSTM
-        # sees (batch, input_dim, lstm_units*2) instead of a fake (batch, lstm_units*2, 1).
+        x = tf.keras.layers.Reshape((self.input_dim, 1), name='reshape_input')(inputs)
+        x = tf.keras.layers.Conv1D(self.conv_filters, kernel_size=self.input_dim, activation='relu', padding='same', name='conv1d')(x)
+        x = tf.keras.layers.LayerNormalization(name='ln_conv')(x)
+        # Stacked BiLSTM
         # dtype='float32' avoids CuDNN DoRNNForward errors under mixed_float16.
         x = tf.keras.layers.Bidirectional(
-            tf.keras.layers.LSTM(self.lstm_units, return_sequences=True, dtype='float32')
+            tf.keras.layers.LSTM(self.lstm_units, return_sequences=True, dtype='float32'),
+            name='bilstm_1'
         )(x)
-        x = tf.keras.layers.LayerNormalization()(x)
+        x = tf.keras.layers.LayerNormalization(name='ln_bilstm_1')(x)
         x = tf.keras.layers.Bidirectional(
-            tf.keras.layers.LSTM(self.lstm_units_2, return_sequences=False, dtype='float32')
+            tf.keras.layers.LSTM(self.lstm_units_2, return_sequences=False, dtype='float32'),
+            name='bilstm_2'
         )(x)
-        x = tf.keras.layers.Dropout(0.1)(x)
+        x = tf.keras.layers.Dropout(0.1, name='drop_bilstm')(x)
         for i, size in enumerate(self.dnn_sizes, start=1):
             x = tf.keras.layers.Dense(size, activation='relu', name=f'dense_{i}')(x)
             x = tf.keras.layers.Dropout(0.1, name=f'dropout_{i}')(x)

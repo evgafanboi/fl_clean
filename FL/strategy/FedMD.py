@@ -132,15 +132,12 @@ class FedMD(DistillationStrategy):
 
     def setup(self, context: PipelineContext) -> None:
         print(f"{COLORS.OKGREEN}Preparing FedMD with public data from client slices{COLORS.ENDC}")
-        is_sequence = context.config.model_type.lower() == "gru"
-
         public_unlabeled_ds, total_public = load_public_dataset_from_clients(
             context.paths,
             batch_size=context.config.batch_size,
             num_classes=context.num_classes,
             shuffle=False,
             return_labels=False,
-            is_sequence=is_sequence,
         )
         public_features = numpy_from_dataset(public_unlabeled_ds)
         del public_unlabeled_ds
@@ -156,7 +153,6 @@ class FedMD(DistillationStrategy):
             num_classes=context.num_classes,
             shuffle=True,
             return_labels=True,
-            is_sequence=is_sequence,
         )
 
         context.shared_state.update(
@@ -164,7 +160,6 @@ class FedMD(DistillationStrategy):
                 "public_features_path": pub_path,
                 "public_sample_count": total_public,
                 "public_dataset_labeled": public_labeled_ds,
-                "is_sequence": is_sequence,
             }
         )
 
@@ -182,7 +177,6 @@ class FedMD(DistillationStrategy):
                 context.input_dim,
                 context.num_classes,
                 context.config.batch_size,
-                is_sequence=is_sequence,
             )
             model.fit(private_dataset, epochs=self.revisit_epochs, verbose=1)
             context.model_pool.checkin(client_id, model)
@@ -230,7 +224,6 @@ class FedMD(DistillationStrategy):
                 context.input_dim,
                 context.num_classes,
                 config.batch_size,
-                is_sequence=context.shared_state["is_sequence"],
             )
             revisit_phase(model, private_dataset, self.revisit_epochs)
             pool.checkin(state.client_id, model)

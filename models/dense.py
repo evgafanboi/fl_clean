@@ -63,7 +63,7 @@ class DenseModel:
             name='dense_1'
         )(x)
         x = tf.keras.layers.LayerNormalization(name='ln_1')(x)
-        x = tf.keras.layers.Dropout(0.15)(x)
+        x = tf.keras.layers.Dropout(0.15, name='drop_1')(x)
         
         residual = x
         x = tf.keras.layers.Dense(
@@ -73,7 +73,7 @@ class DenseModel:
             name='dense_2'
         )(x)
         x = tf.keras.layers.LayerNormalization(name='ln_2')(x)
-        x = tf.keras.layers.Dropout(0.2)(x)
+        x = tf.keras.layers.Dropout(0.2, name='drop_2')(x)
         
         x = tf.keras.layers.add([x, residual])
         
@@ -84,7 +84,7 @@ class DenseModel:
             name='dense_3'
         )(x)
         x = tf.keras.layers.LayerNormalization(name='ln_3')(x)
-        x = tf.keras.layers.Dropout(0.15)(x)
+        x = tf.keras.layers.Dropout(0.15, name='drop_3')(x)
         
         # Logits layer 
         logits = tf.keras.layers.Dense(
