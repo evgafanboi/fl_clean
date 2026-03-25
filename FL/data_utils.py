@@ -45,33 +45,27 @@ def setup_paths(client_id: str, partition_type: str, client_count: int) -> Dict[
 
 
 def restore_full_partition(paths: Dict[str, str]) -> bool:
-    """Merge public and private partitions IN MEMORY without modifying disk files"""
+    """Point paths to merged partition files, creating them if needed."""
     if not os.path.exists(paths['public_X']):
         return False
-    
-    # Load private partition
-    X_train = np.load(paths['train_X'], mmap_mode='r')
-    y_train = np.load(paths['train_y'], mmap_mode='r')
-    
-    # Load public partition
-    X_public = np.load(paths['public_X'], mmap_mode='r')
-    y_public = np.load(paths['public_y'], mmap_mode='r')
-    
-    # Create merged copies in memory (copy to avoid mmap issues)
-    X_full = np.concatenate([np.array(X_train), np.array(X_public)], axis=0)
-    y_full = np.concatenate([np.array(y_train), np.array(y_public)], axis=0)
-    
-    # Create temporary files with _merged suffix
+
     merged_X_path = paths['train_X'].replace('_train.npy', '_merged.npy')
     merged_y_path = paths['train_y'].replace('_train.npy', '_merged.npy')
-    
-    np.save(merged_X_path, X_full)
-    np.save(merged_y_path, y_full)
-    
-    # Update paths to point to merged files
+
+    # Skip the expensive concat+save if pre-built merged files exist on disk
+    # (created by restore_partition.py)
+    if not (os.path.exists(merged_X_path) and os.path.exists(merged_y_path)):
+        X_train = np.load(paths['train_X'], mmap_mode='r')
+        y_train = np.load(paths['train_y'], mmap_mode='r')
+        X_public = np.load(paths['public_X'], mmap_mode='r')
+        y_public = np.load(paths['public_y'], mmap_mode='r')
+
+        np.save(merged_X_path, np.concatenate([np.array(X_train), np.array(X_public)], axis=0))
+        np.save(merged_y_path, np.concatenate([np.array(y_train), np.array(y_public)], axis=0))
+
     paths['train_X'] = merged_X_path
     paths['train_y'] = merged_y_path
-    
+
     return True
 
 

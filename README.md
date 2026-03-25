@@ -31,6 +31,17 @@ python partition_data.py --num-clients 10 --partition-type label_skew --alpha 0.
     - The partitioner will further split each partition into a public slice and private slice (train). For simulations that assume a public dataset (auxiliary dataset in `FedSSD`), public slices are concatenated at runtime and clients only use `*_train.npy` for their private dataset. For other simulations, both public and private slices are concatenated at runtime to form a larger set, which will be used for their private dataset. This happens separately between different partitioning runs.
     - The default public slice ratio is randomized between `5%` to `20%` for each client, with this the public set would be `~14.5%` of the total CICIoT2023 dataset, with the test set being `20%` and the train set being `80% (minus the public slice in some FL cases)`.
     - It also sums the sample count per class for each clien into a table, available in `Markdown` and `Excel` format under the same directory as the partitions.
+### IMPORTANT: Pre-merge
+
+Since non-public FL strategies (`FedAvg`, `FedProx`,...) do not use a public dataset, they will attempt to restore the full partitions every run and delete the merged files afterwards. To avoid repeated merging ops and if storage allows, it is always recommended to pre-merge the partitions and have the FL pipeline read them instead of re-merging every time.
+
+```bash
+python restore_partition.py data/partitions/<n_clients>/<partition_type>
+
+### for example, for label_skew (alpha=0.1), 100 client partiitons, run:
+python restore_partition.py data/partitions/100_client/label_skew_0.1
+```
+
 
 ## Federated Learning
 
