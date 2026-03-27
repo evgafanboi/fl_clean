@@ -301,7 +301,8 @@ class SSFLIDS(DistillationStrategy):
         pool = context.model_pool
         disc_pool = context.shared_state["disc_pool"]
 
-        for state in context.client_states:
+        cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
+        for client_idx, state in enumerate(context.client_states):
             cid = state.client_id
             print(f"\n{COLORS.BOLD}Client {cid} Stage I training{COLORS.ENDC}")
             private_dataset = create_private_dataset(
@@ -322,7 +323,8 @@ class SSFLIDS(DistillationStrategy):
                 print("  Skipping discriminator (insufficient classes)")
                 pool.checkin(cid, model)
                 del private_dataset
-                aggressive_memory_cleanup()
+                if (client_idx + 1) % cleanup_interval == 0:
+                    aggressive_memory_cleanup()
                 continue
 
             disc = disc_pool.checkout(cid)
@@ -341,7 +343,8 @@ class SSFLIDS(DistillationStrategy):
                 disc_pool.checkin(cid, disc)
                 pool.checkin(cid, model)
                 del private_dataset
-                aggressive_memory_cleanup()
+                if (client_idx + 1) % cleanup_interval == 0:
+                    aggressive_memory_cleanup()
                 continue
 
             pred_path = _pred_path(cid, round_number)
@@ -358,7 +361,8 @@ class SSFLIDS(DistillationStrategy):
             pred_files.append(pred_path)
 
             del private_dataset
-            aggressive_memory_cleanup()
+            if (client_idx + 1) % cleanup_interval == 0:
+                aggressive_memory_cleanup()
 
         del open_feature
         aggressive_memory_cleanup()

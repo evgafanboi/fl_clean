@@ -346,8 +346,9 @@ class Exp2(DistillationStrategy):
         pool = context.model_pool
         logit_files = []
         logit_shape = None
+        cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
 
-        for state in context.client_states:
+        for client_idx, state in enumerate(context.client_states):
             fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{state.client_id}.bin")
             model = pool.checkout(state.client_id)
 
@@ -372,7 +373,8 @@ class Exp2(DistillationStrategy):
             logit_files.append(fpath)
             logit_shape = shape
             print(f"  Client {state.client_id}: logits {shape} -> {fpath}")
-            aggressive_memory_cleanup()
+            if (client_idx + 1) % cleanup_interval == 0:
+                aggressive_memory_cleanup()
 
         return logit_files, logit_shape
 
@@ -380,8 +382,9 @@ class Exp2(DistillationStrategy):
         config = context.config
         kd_method = getattr(config, "exp2_kd", "ekd")
         pool = context.model_pool
+        cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
 
-        for state in context.client_states:
+        for client_idx, state in enumerate(context.client_states):
             print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 1 ({kd_method.upper()}){COLORS.ENDC}")
             model = pool.checkout(state.client_id)
             if kd_method == "abkd":
@@ -397,12 +400,14 @@ class Exp2(DistillationStrategy):
                     getattr(config, "exp2_ekd_lambda", 1.0),
                 )
             pool.checkin(state.client_id, model)
-            aggressive_memory_cleanup()
+            if (client_idx + 1) % cleanup_interval == 0:
+                aggressive_memory_cleanup()
 
     def _run_ce_stage(self, context):
         config = context.config
         pool = context.model_pool
-        for state in context.client_states:
+        cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
+        for client_idx, state in enumerate(context.client_states):
             print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 2 (CE){COLORS.ENDC}")
             model = pool.checkout(state.client_id)
             private_dataset = create_private_dataset(
@@ -412,7 +417,8 @@ class Exp2(DistillationStrategy):
             ce_stage(model, private_dataset, self.ce_epochs)
             pool.checkin(state.client_id, model)
             del private_dataset
-            aggressive_memory_cleanup()
+            if (client_idx + 1) % cleanup_interval == 0:
+                aggressive_memory_cleanup()
 
     def _evaluate(self, context, round_number):
         pool = context.model_pool

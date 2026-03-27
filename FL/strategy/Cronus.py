@@ -8,708 +8,344 @@ import numpy as np
 import tensorflow as tf
 
 from ..colors import COLORS
+from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
-from ..context import PipelineContext, ModelPool, evaluate_model
-from .base import DistillationStrategy
-from .common import (
-    create_model,
-    load_public_dataset_from_clients,
-    numpy_from_dataset,
-)
-from tqdm import tqdm
-from .robust_filter import RobustFilter
+from ..context import PipelineContext, evaluate_model
 from ..poison_utils import parse_poison_config, apply_gaussian_noise_scale
-from models.dense_discri import create_discriminator
+from .base import DistillationStrategy
+from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
+from .robust_filter import RobustFilter
+from tqdm import tqdm
 
-DISC_WEIGHTS_DIR = os.path.join("temp_weights", "cronus_disc_weights")
-
-CRONUS_CACHE_DIR = os.path.join("temp_weights", "cronus_cache")
-
-
-def _ensure_cache_dir():
-    os.makedirs(CRONUS_CACHE_DIR, exist_ok=True)
+CACHE_DIR = os.path.join("temp_weights", "cronus_cache")
 
 
-def _prediction_path(client_id: int, round_number: int) -> str:
-    return os.path.join(CRONUS_CACHE_DIR, f"r{round_number}_c{client_id}_preds.bin")
+# ── file-path helpers ──────────────────────────────────────────────────
+
+def _pred_path(cid: int, rnd: int) -> str:
+    return os.path.join(CACHE_DIR, f"r{rnd}_c{cid}.bin")
 
 
-def _base_public_path() -> str:
-    return os.path.join(CRONUS_CACHE_DIR, "public_features.npy")
+def _pub_path(rnd: int | None = None) -> str:
+    if rnd is None:
+        return os.path.join(CACHE_DIR, "public_X.npy")
+    return os.path.join(CACHE_DIR, f"r{rnd}_pub_X.npy")
 
 
-def _public_features_path(round_number: int) -> str:
-    return os.path.join(CRONUS_CACHE_DIR, f"r{round_number}_public_X.npy")
+def _pseudo_path(rnd: int) -> str:
+    return os.path.join(CACHE_DIR, f"r{rnd}_pseudo_y.npy")
 
 
-def _pseudo_labels_path(round_number: int) -> str:
-    return os.path.join(CRONUS_CACHE_DIR, f"r{round_number}_pseudo_y.npy")
+# ── predict / filter ───────────────────────────────────────────────────
+
+def _predict_to_file(model, X: np.ndarray, num_classes: int,
+                     batch_size: int, path: str) -> None:
+    preds = model.predict(X, batch_size=batch_size, verbose=0)
+    with open(path, "wb") as fp:
+        fp.write(preds.astype(np.float32).tobytes())
 
 
-def predict_to_file(
-    classify_model,
-    discri_model,
-    X_open: np.ndarray,
-    num_classes: int,
-    batch_size: int,
-    output_path: str,
-) -> int:
-    logits_model = (
-        classify_model.get_logits_model()
-        if hasattr(classify_model, "get_logits_model")
-        else classify_model
-    )
-    discriminator_net = (
-        discri_model.model if hasattr(discri_model, "model") else discri_model
-    )
-
-    total_rows = 0
-    with open(output_path, "wb") as fp:
-        for start in range(0, len(X_open), batch_size):
-            end = min(start + batch_size, len(X_open))
-            X_batch = X_open[start:end]
-            logits_batch = logits_model(X_batch, training=False).numpy()
-            probs_batch = tf.nn.softmax(logits_batch).numpy()
-
-            dis_pred = discriminator_net(X_batch, training=False).numpy().reshape(-1)
-            uncertain_mask = dis_pred > 0.5
-            if np.any(uncertain_mask):
-                probs_batch[uncertain_mask] = 1.0 / num_classes
-
-            fp.write(probs_batch.astype(np.float32).tobytes())
-            total_rows += probs_batch.shape[0]
-            del logits_batch, probs_batch, dis_pred, X_batch
-
-    return total_rows
-
-
-def predict_to_file_plain(
-    classify_model,
-    X_open: np.ndarray,
-    num_classes: int,
-    batch_size: int,
-    output_path: str,
-) -> int:
-    logits_model = (
-        classify_model.get_logits_model()
-        if hasattr(classify_model, "get_logits_model")
-        else classify_model
-    )
-
-    total_rows = 0
-    with open(output_path, "wb") as fp:
-        for start in range(0, len(X_open), batch_size):
-            end = min(start + batch_size, len(X_open))
-            X_batch = X_open[start:end]
-            logits_batch = logits_model(X_batch, training=False).numpy()
-            probs_batch = tf.nn.softmax(logits_batch).numpy()
-            fp.write(probs_batch.astype(np.float32).tobytes())
-            total_rows += probs_batch.shape[0]
-            del logits_batch, probs_batch, X_batch
-
-    return total_rows
-
-
-def robust_filter_labels(
-    pred_files: List[str],
-    n_samples: int,
-    num_classes: int,
-    epsilon: float,
-) -> Tuple[np.ndarray, Optional[float], Set[int]]:
-    """
-    Returns:
-        pseudo_labels: per-sample predicted class (-1 = uncertain)
-        round_max_eigenvalue: highest eigenvalue seen across all samples,
-                              or None if spectral norm never exceeded threshold.
-        removed_client_indices: 0-based indices (into pred_files) of clients
-                                filtered out at least once.
-    """
+def _robust_filter(pred_files: List[str], n_samples: int,
+                   num_classes: int, epsilon: float,
+                   ) -> Tuple[np.ndarray, Optional[float], Set[int]]:
     rf = RobustFilter(epsilon=epsilon, tau=0.1, preset="logits")
-
-    chunk_rows = 50_000
     row_bytes = num_classes * 4
-    pseudo_labels = np.empty(n_samples, dtype=np.int32)
-
-    round_max_eigenvalue: Optional[float] = None
-    removed_client_indices: Set[int] = set()
-
+    CHUNK = 200_000
+    pseudo = np.empty(n_samples, dtype=np.int32)
+    max_eig: Optional[float] = None
+    removed: Set[int] = set()
     handles = [open(f, "rb") for f in pred_files]
-    n_clients = len(handles)
-
     boundary = 1.0 / num_classes
-    offset = 0
-    pbar = tqdm(total=n_samples, desc="Robust filter voting", unit="sample")
-    while offset < n_samples:
-        rows = min(chunk_rows, n_samples - offset)
-        client_chunks = []
-        for fh in handles:
-            raw = fh.read(rows * row_bytes)
-            chunk = np.frombuffer(raw, dtype=np.float32).reshape(rows, num_classes)
-            client_chunks.append(chunk)
-
+    off = 0
+    pbar = tqdm(total=n_samples, desc="Robust filter", unit="sample")
+    while off < n_samples:
+        rows = min(CHUNK, n_samples - off)
+        chunks = np.stack([
+            np.frombuffer(h.read(rows * row_bytes), dtype=np.float32)
+              .reshape(rows, num_classes)
+            for h in handles
+        ])
         for i in range(rows):
-            sample_preds = [client_chunks[c][i] for c in range(n_clients)]
-            robust_mean, max_eig, removed = rf.compute_robust_mean_debug(sample_preds)
-
-            if max_eig is not None:
-                if round_max_eigenvalue is None or max_eig > round_max_eigenvalue:
-                    round_max_eigenvalue = max_eig
-            removed_client_indices.update(removed)
-
-            max_prob = float(np.max(robust_mean))
-            if max_prob > boundary:
-                pseudo_labels[offset + i] = int(np.argmax(robust_mean))
-            else:
-                pseudo_labels[offset + i] = -1
-            del sample_preds, robust_mean, removed
-
+            mean, eig, rm = rf.compute_robust_mean_debug(chunks[:, i, :])
+            if eig is not None and (max_eig is None or eig > max_eig):
+                max_eig = eig
+            removed.update(rm)
+            pseudo[off + i] = int(np.argmax(mean)) if float(np.max(mean)) > boundary else -1
         pbar.update(rows)
-        offset += rows
-        del client_chunks
+        off += rows
     pbar.close()
-
-    for fh in handles:
-        fh.close()
-
-    return pseudo_labels, round_max_eigenvalue, removed_client_indices
+    for h in handles:
+        h.close()
+    return pseudo, max_eig, removed
 
 
-def train_discriminator(
-    classify_model,
-    discri_model,
-    open_feature: np.ndarray,
-    dis_rounds: int,
-    batch_size: int,
-    num_classes: int,
-    private_X_path: str,
-) -> bool:
-    logits_model = (
-        classify_model.get_logits_model()
-        if hasattr(classify_model, "get_logits_model")
-        else classify_model
-    )
-    discriminator_net = (
-        discri_model.model if hasattr(discri_model, "model") else discri_model
-    )
+# ── merged dataset (round 2+) ─────────────────────────────────────────
 
-    prediction_batch_size = min(10000, max(batch_size, 1))
-    logits_batches = []
-    for start in range(0, len(open_feature), prediction_batch_size):
-        end = min(start + prediction_batch_size, len(open_feature))
-        batch_logits = logits_model(open_feature[start:end], training=False)
-        logits_batches.append(tf.nn.softmax(batch_logits).numpy())
+def _make_merged_dataset(priv_X_path, priv_y_path, pub_X_path, pseudo_y_path,
+                         input_dim, num_classes, batch_size, poison_loader=None):
+    priv_X = np.array(np.load(priv_X_path, mmap_mode="r"), dtype=np.float32)
+    priv_y = np.array(np.load(priv_y_path, mmap_mode="r"), dtype=np.int32)
+    if poison_loader:
+        priv_y = poison_loader.poison_labels(priv_y)
+    priv_y = tf.keras.utils.to_categorical(priv_y, num_classes).astype(np.float32)
 
-    dis_logits = np.vstack(logits_batches)
-    max_probs = np.max(dis_logits, axis=1)
-    del logits_batches, dis_logits
+    pseudo = np.array(np.load(pseudo_y_path, mmap_mode="r"), dtype=np.int32)
+    valid = pseudo >= 0
+    pub_X = np.array(np.load(pub_X_path, mmap_mode="r")[valid], dtype=np.float32)
+    pub_y = tf.keras.utils.to_categorical(pseudo[valid], num_classes).astype(np.float32)
+    del pseudo
 
-    theta = float(np.median(max_probs))
-    sure_unknown_mask = max_probs < theta
-    sure_unknown_feature = open_feature[sure_unknown_mask]
-    del max_probs
+    X = np.concatenate([priv_X, pub_X])
+    y = np.concatenate([priv_y, pub_y])
+    del priv_X, priv_y, pub_X, pub_y
+    perm = np.random.permutation(len(X))
+    X, y = X[perm], y[perm]
+    del perm
 
-    if sure_unknown_feature.size == 0:
-        return False
+    # Use from_generator (fixed output_signature → single tf.function trace)
+    # instead of from_tensor_slices (creates new TF constant ops each call).
+    def gen():
+        for i in range(0, len(X), batch_size):
+            yield X[i:i + batch_size], y[i:i + batch_size]
 
-    X_mmap = np.load(private_X_path, mmap_mode="r")
-    sure_known_feature = np.array(X_mmap[: len(sure_unknown_feature)], dtype=np.float32)
-    del X_mmap
-
-    dis_X = np.vstack([sure_known_feature, sure_unknown_feature])
-    dis_y = np.concatenate(
-        [
-            np.zeros(len(sure_known_feature), dtype=np.float32),
-            np.ones(len(sure_unknown_feature), dtype=np.float32),
-        ]
-    )
-    del sure_known_feature, sure_unknown_feature
-
-    indices = np.random.permutation(len(dis_X))
-    dis_X = dis_X[indices]
-    dis_y = dis_y[indices]
-
-    dataset = tf.data.Dataset.from_tensor_slices((dis_X, dis_y)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    for _ in range(dis_rounds):
-        discri_model.fit(dataset, epochs=1, verbose=0)
-
-    del dis_X, dis_y, dataset
-    return True
+    sig = (tf.TensorSpec(shape=(None, input_dim), dtype=tf.float32),
+           tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32))
+    return (tf.data.Dataset.from_generator(gen, output_signature=sig)
+              .unbatch().batch(batch_size).prefetch(tf.data.AUTOTUNE))
 
 
-def _create_merged_dataset(
-    private_X_path: str,
-    private_y_path: str,
-    public_X_path: str,
-    pseudo_labels_path: str,
-    input_dim: int,
-    num_classes: int,
-    batch_size: int,
-    chunk_size: int = 50_000,
-) -> tf.data.Dataset:
-    def generator():
-        priv_X = np.load(private_X_path, mmap_mode="r")
-        priv_y = np.load(private_y_path, mmap_mode="r")
-        for s in range(0, priv_X.shape[0], chunk_size):
-            e = min(s + chunk_size, priv_X.shape[0])
-            X_c = np.array(priv_X[s:e], dtype=np.float32)
-            y_c = tf.keras.utils.to_categorical(
-                np.array(priv_y[s:e], dtype=np.int32), num_classes
-            ).astype(np.float32)
-            yield X_c, y_c
-            del X_c, y_c
-        del priv_X, priv_y
-
-        pub_X = np.load(public_X_path, mmap_mode="r")
-        pseudo_y = np.load(pseudo_labels_path, mmap_mode="r")
-        for s in range(0, pub_X.shape[0], chunk_size):
-            e = min(s + chunk_size, pub_X.shape[0])
-            labels_chunk = np.array(pseudo_y[s:e], dtype=np.int32)
-            valid_mask = labels_chunk >= 0
-            if not np.any(valid_mask):
-                continue
-            X_c = np.array(pub_X[s:e], dtype=np.float32)[valid_mask]
-            y_c = tf.keras.utils.to_categorical(
-                labels_chunk[valid_mask], num_classes
-            ).astype(np.float32)
-            yield X_c, y_c
-            del X_c, y_c, labels_chunk, valid_mask
-        del pub_X, pseudo_y
-
-    output_signature = (
-        tf.TensorSpec(shape=(None, input_dim), dtype=tf.float32),
-        tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32),
-    )
-    dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
-    return dataset.unbatch().shuffle(20_000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
+# ── strategy ───────────────────────────────────────────────────────────
 
 class Cronus(DistillationStrategy):
     name = "Cronus"
+    use_model_pool = False
 
-    def extra_log_tokens(self) -> Dict[str, float]:
-        tokens = {
-            "dis_rounds": self.config.dis_rounds,
-            "dist_rounds": self.config.dist_rounds,
-        }
-        if getattr(self.config, "remove_dis", False):
-            tokens["no_dis"] = 1
-        return tokens
+    # ── setup ──────────────────────────────────────────────────────────
 
     def setup(self, context: PipelineContext) -> None:
-        config = context.config
-        _ensure_cache_dir()
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        cfg = context.config
 
-        public_dataset, total_public = load_public_dataset_from_clients(
-            context.paths,
-            batch_size=config.batch_size,
-            num_classes=context.num_classes,
-            shuffle=False,
-            return_labels=False,
+        pub_ds, _ = load_public_dataset_from_clients(
+            context.paths, batch_size=cfg.batch_size,
+            num_classes=context.num_classes, shuffle=False, return_labels=False,
         )
-        public_features = numpy_from_dataset(public_dataset)
-        del public_dataset
+        pub_X = numpy_from_dataset(pub_ds)
+        del pub_ds
+        np.save(_pub_path(), pub_X)
+        context.shared_state["n_public"] = pub_X.shape[0]
+        del pub_X
 
-        base_pub_path = _base_public_path()
-        np.save(base_pub_path, public_features)
-        n_public = public_features.shape[0]
-        del public_features
+        tf.keras.backend.clear_session()
+        reusable = create_model(context.input_dim, context.num_classes,
+                                cfg.batch_size, model_type=cfg.model_type)
+        init_w = reusable.get_weights()
 
-        context.shared_state.update(
-            {
-                "public_sample_count": n_public,
-            }
-        )
+        context.shared_state["init_w"] = init_w
+        context.shared_state["global_w"] = [np.array(w, copy=True) for w in init_w]
+        self._model = reusable
 
-        use_dis = not getattr(config, "remove_dis", False)
-        context.shared_state["use_dis"] = use_dis
-        label = "clients and discriminators" if use_dis else "clients (no discriminator)"
-        print(f"{COLORS.OKGREEN}Initializing Cronus {label}{COLORS.ENDC}")
+        for cid, paths in enumerate(context.paths):
+            st = context.add_client_state(cid, None, paths)
+            st.data["w"] = None
 
-        if use_dis:
-            disc_pool = ModelPool(
-                pool_size=min(5, len(context.paths)),
-                factory_fn=lambda: create_discriminator(context.input_dim),
-                weights_dir=DISC_WEIGHTS_DIR,
-            )
-            context.shared_state["disc_pool"] = disc_pool
+        print(f"{COLORS.OKGREEN}Cronus initialized ({context.n_clients} clients){COLORS.ENDC}")
 
-        pool = context.model_pool
-        for client_id, paths in enumerate(context.paths):
-            state = context.add_client_state(client_id, None, paths)
+    # ── round ──────────────────────────────────────────────────────────
 
-            y_mmap = np.load(paths["train_y"], mmap_mode="r")
-            class_counts = np.bincount(y_mmap.astype(np.int32), minlength=context.num_classes)
-            state.data["class_counts"] = class_counts
-            del y_mmap
+    def run_round(self, context: PipelineContext, round_number: int
+                  ) -> Dict[int, Dict[str, float]]:
+        t0 = time.time()
+        cfg = context.config
+        n_pub = context.shared_state["n_public"]
+        model = self._model
+        _REFRESH_EVERY = getattr(cfg, "cleanup_interval", 25)
 
-        global_model = create_model(
-            context.input_dim,
-            context.num_classes,
-            config.batch_size,
-            model_type=config.model_type,
-        )
-        context.shared_state["global_model"] = global_model
-        print(f"{COLORS.OKGREEN}Global evaluation model created{COLORS.ENDC}")
+        # Round-boundary refresh
+        if round_number > 1:
+            del model
+            tf.keras.backend.clear_session()
+            aggressive_memory_cleanup()
+            model = create_model(context.input_dim, context.num_classes,
+                                 cfg.batch_size, model_type=cfg.model_type)
+            self._model = model
 
-    def run_round(
-        self, context: PipelineContext, round_number: int
-    ) -> Dict[int, Dict[str, float]]:
-        round_start = time.time()
-        config = context.config
-        n_public = context.shared_state["public_sample_count"]
+        base = np.load(_pub_path(), mmap_mode="r")
+        perm = np.random.permutation(n_pub)
+        open_X = np.array(base[perm], dtype=np.float32)
+        del base
+        pub_X_file = _pub_path(round_number)
+        np.save(pub_X_file, open_X)
 
-        base_mmap = np.load(_base_public_path(), mmap_mode="r")
-        permutation = np.random.permutation(n_public)
-        open_feature = np.array(base_mmap[permutation], dtype=np.float32)
-        del base_mmap
-
-        pub_X_path = _public_features_path(round_number)
-        np.save(pub_X_path, open_feature)
-
-        # ------ Poison config (parsed once per round) ------
         attack_type, poison_value, _ = parse_poison_config(
-            getattr(config, "poison", None)
-        )
+            getattr(cfg, "poison", None))
 
-        # ------ Stage I: local training + collect predictions ------
-        print(f"\n{COLORS.HEADER}Round {round_number} Stage I — local training & prediction{COLORS.ENDC}")
+        is_init = round_number == 1
+        prev_pseudo = context.shared_state.get("pseudo_path")
+        prev_pub   = context.shared_state.get("pub_X_path")
+
+        tag = "Init (private only)" if is_init else "Merged (private + public)"
+        print(f"\n{COLORS.HEADER}Round {round_number} — {tag}{COLORS.ENDC}")
+
         pred_files: List[str] = []
-        pred_client_ids: List[int] = []  # parallel list: pred_files[i] belongs to pred_client_ids[i]
+        pred_cids:  List[int] = []
 
-        use_dis = context.shared_state["use_dis"]
+        # ---- per-client: reuse model → set_weights → train → predict ----
+        for idx, st in enumerate(context.client_states):
+            cid = st.client_id
+            poisoned = cid in context.poisoned_clients
 
-        pool = context.model_pool
-        disc_pool = context.shared_state.get("disc_pool")
-
-        for state in context.client_states:
-            cid = state.client_id
-            is_poisoned = cid in context.poisoned_clients
-            print(f"\n{COLORS.BOLD}Client {cid} Stage I training{COLORS.ENDC}")
-
-            if is_poisoned and attack_type == "label_flip":
-                print(f"  \u26a0\ufe0f  POISONED CLIENT — Labels flipped")
-
-            model = pool.checkout(cid)
-            priv_ds = self._private_dataset(state, context)
-            for _ in range(config.train_rounds):
-                model.fit(priv_ds, epochs=1, verbose=0)
-
-            if use_dis:
-                class_counts = state.data["class_counts"]
-                if np.sum(class_counts > 0) <= 1:
-                    print("  Skipping discriminator (insufficient classes)")
-                    pool.checkin(cid, model)
-                    del priv_ds
-                    aggressive_memory_cleanup()
-                    continue
-
-                disc = disc_pool.checkout(cid)
-                success = train_discriminator(
-                    model,
-                    disc,
-                    open_feature,
-                    config.dis_rounds,
-                    config.batch_size,
-                    context.num_classes,
-                    state.paths["train_X"],
-                )
-
-                del priv_ds
+            # Periodic refresh to defrag GPU memory (same as FedAvg)
+            if idx > 0 and idx % _REFRESH_EVERY == 0:
+                del model
+                tf.keras.backend.clear_session()
                 aggressive_memory_cleanup()
+                model = create_model(context.input_dim, context.num_classes,
+                                     cfg.batch_size, model_type=cfg.model_type)
+                self._model = model
 
-                if not success:
-                    print("  Discriminator training skipped (no uncertain samples)")
-                    disc_pool.checkin(cid, disc)
-                    pool.checkin(cid, model)
-                    continue
+            model.set_weights(st.data["w"] or context.shared_state["init_w"])
 
-                if is_poisoned and attack_type == "gradient_scale":
-                    apply_gaussian_noise_scale(model, poison_value)
-                    print(f"  \u26a0\ufe0f  POISONED CLIENT — Gaussian noise + scale x{poison_value:.1f}")
+            print(f"\n{COLORS.BOLD}Client {cid}{COLORS.ENDC}")
 
-                pred_path = _prediction_path(cid, round_number)
-                predict_to_file(
-                    model,
-                    disc,
-                    open_feature,
-                    context.num_classes,
-                    config.batch_size,
-                    pred_path,
-                )
-                disc_pool.checkin(cid, disc)
+            p_loader = (context.poison_loader
+                        if poisoned and context.poison_loader else None)
+
+            if is_init:
+                ds = create_client_dataset(
+                    st.paths["train_X"], st.paths["train_y"],
+                    context.input_dim, context.num_classes,
+                    cfg.batch_size, poison_loader=p_loader)
             else:
-                del priv_ds
-                aggressive_memory_cleanup()
+                ds = _make_merged_dataset(
+                    st.paths["train_X"], st.paths["train_y"],
+                    prev_pub, prev_pseudo,
+                    context.input_dim, context.num_classes,
+                    cfg.batch_size, poison_loader=p_loader)
 
-                if is_poisoned and attack_type == "gradient_scale":
-                    apply_gaussian_noise_scale(model, poison_value)
-                    print(f"  \u26a0\ufe0f  POISONED CLIENT — Gaussian noise + scale x{poison_value:.1f}")
+            model.fit(ds, epochs=cfg.epochs)
+            st.data["w"] = model.get_weights()
 
-                pred_path = _prediction_path(cid, round_number)
-                predict_to_file_plain(
-                    model,
-                    open_feature,
-                    context.num_classes,
-                    config.batch_size,
-                    pred_path,
-                )
+            if poisoned and attack_type == "gradient_scale":
+                apply_gaussian_noise_scale(model, poison_value)
 
-            pool.checkin(cid, model)
-            pred_files.append(pred_path)
-            pred_client_ids.append(cid)
+            pf = _pred_path(cid, round_number)
+            _predict_to_file(model, open_X, context.num_classes,
+                             cfg.batch_size, pf)
+            pred_files.append(pf)
+            pred_cids.append(cid)
+
+            del ds
             aggressive_memory_cleanup()
 
-        del open_feature
+        del open_X
         aggressive_memory_cleanup()
 
-        if not pred_files:
-            print(
-                f"{COLORS.WARNING}No client provided confident predictions; "
-                f"skipping public training{COLORS.ENDC}"
-            )
-            return self._eval_fallback(context, round_start, round_number)
+        # ---- robust filter ----
+        print(f"\n{COLORS.HEADER}Robust filtering{COLORS.ENDC}")
+        eps = getattr(cfg, "robust_epsilon", 0.2)
+        pseudo, max_eig, removed_idx = _robust_filter(
+            pred_files, n_pub, context.num_classes, eps)
 
-        # ------ Robust filtering instead of majority vote ------
-        print(f"\n{COLORS.HEADER}Round {round_number} — Robust filter pseudo-labeling{COLORS.ENDC}")
-
-        epsilon = getattr(config, "robust_epsilon", 0.2)
-        pseudo_labels, round_max_eigenvalue, removed_client_indices = robust_filter_labels(
-            pred_files, n_public, context.num_classes, epsilon
-        )
-
-        # --- Debug: aggregation diagnostics ---
-        removed_client_ids = sorted({pred_client_ids[i] for i in removed_client_indices})
-        eigenvalue_str = (
-            f"{round_max_eigenvalue:.6f}" if round_max_eigenvalue is not None else "N/A"
-        )
-        removed_str = str(removed_client_ids) if removed_client_ids else "none"
-        print(f"  [RobustFilter] epsilon={epsilon}")
-        print(f"  [RobustFilter] Highest eigenvalue this round: {eigenvalue_str}")
-        print(f"  [RobustFilter] Clients removed at least once: {removed_str}")
+        removed_cids = sorted({pred_cids[i] for i in removed_idx})
+        eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
+        valid_n = int(np.sum(pseudo >= 0))
+        print(f"  epsilon={eps}  max_eig={eig_s}  removed={removed_cids or 'none'}")
+        print(f"  {valid_n}/{n_pub} pseudo-labeled")
         context.logger.info(
-            "Round %s | RobustFilter | epsilon=%.4f | max_eigenvalue=%s | removed_clients=%s",
-            round_number, epsilon, eigenvalue_str, removed_str,
-        )
+            "Round %s | RobustFilter | eps=%.4f | max_eig=%s | removed=%s | valid=%d/%d",
+            round_number, eps, eig_s, removed_cids or "none", valid_n, n_pub)
 
-        valid_count = int(np.sum(pseudo_labels >= 0))
-        print(
-            f"  {valid_count}/{n_public} samples received a confident pseudo-label"
-        )
-
-        pseudo_y_path = _pseudo_labels_path(round_number)
-        np.save(pseudo_y_path, pseudo_labels)
-        del pseudo_labels
+        pseudo_file = _pseudo_path(round_number)
+        np.save(pseudo_file, pseudo)
+        del pseudo
 
         for f in pred_files:
             os.remove(f)
+        if round_number > 1:
+            self._cleanup(round_number - 1)
 
-        # ------ Stage II: train on merged (private + pseudo-labeled public) ------
-        print(f"\n{COLORS.HEADER}Round {round_number} Stage II — merged training{COLORS.ENDC}")
+        context.shared_state["pseudo_path"] = pseudo_file
+        context.shared_state["pub_X_path"] = pub_X_file
 
-        for state in context.client_states:
-            print(f"  Client {state.client_id}: merged private + pseudo-public training")
-            model = pool.checkout(state.client_id)
-            merged_ds = _create_merged_dataset(
-                state.paths["train_X"],
-                state.paths["train_y"],
-                pub_X_path,
-                pseudo_y_path,
-                context.input_dim,
-                context.num_classes,
-                config.batch_size,
-            )
+        # ---- global model on pseudo-labeled public ----
+        print(f"\n{COLORS.HEADER}Global model training{COLORS.ENDC}")
+        context.shared_state["global_w"] = self._train_global(
+            context, model, pub_X_file, pseudo_file, cfg.batch_size, cfg.epochs)
 
-            model.fit(merged_ds, epochs=config.dist_rounds, verbose=0)
-            pool.checkin(state.client_id, model)
-            del merged_ds
-            aggressive_memory_cleanup()
+        # ---- evaluation ----
+        metrics: Dict[int, Dict[str, float]] = {}
 
-        print(f"\n{COLORS.HEADER}Training global model on pseudo-labeled public data{COLORS.ENDC}")
-        global_model = context.shared_state["global_model"]
-        self._train_on_pseudo_public(
-            global_model,
-            pub_X_path,
-            pseudo_y_path,
-            context.num_classes,
-            config.batch_size,
-            config.dist_rounds,
-        )
-
-        self._cleanup_round_files(round_number)
-        aggressive_memory_cleanup()
-
-        # ------ Evaluation ------
-        is_last_round = round_number == config.rounds
-        round_metrics: Dict[int, Dict[str, float]] = {}
-
-        if is_last_round:
-            print(f"\n{COLORS.HEADER}Evaluation (per-client, last round){COLORS.ENDC}")
-            for state in context.client_states:
-                cid = state.client_id
-                model = pool.checkout(cid)
-                m = evaluate_model(model, context.test_dataset, context.test_labels)
-                pool.release(model)
-                round_metrics[cid] = m
+        if round_number == cfg.rounds:
+            print(f"\n{COLORS.HEADER}Per-client evaluation{COLORS.ENDC}")
+            for st in context.client_states:
+                model.set_weights(st.data["w"] or context.shared_state["init_w"])
+                ev = evaluate_model(model, context.test_dataset, context.test_labels)
+                metrics[st.client_id] = ev
                 context.logger.info(
-                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                    round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["Loss"],
-                )
-                print(
-                    f"  Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, "
-                    f"Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, Loss={m['Loss']:.4f}"
-                )
+                    "Round %s | Client %s | Acc: %.4f | F1: %.4f",
+                    round_number, st.client_id, ev["Acc"], ev["F1"])
+                print(f"  Client {st.client_id}: Acc={ev['Acc']:.4f} F1={ev['F1']:.4f}")
 
-        print(f"\n{COLORS.HEADER}Evaluation (global model){COLORS.ENDC}")
-        global_metrics = evaluate_model(
-            global_model, context.test_dataset, context.test_labels
-        )
-        round_metrics[-1] = global_metrics
+        model.set_weights(context.shared_state["global_w"])
+        gev = evaluate_model(model, context.test_dataset, context.test_labels)
+        metrics[-1] = gev
 
         context.logger.info(
-            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-            round_number,
-            global_metrics["Acc"],
-            global_metrics["F1"],
-            global_metrics["Precision"],
-            global_metrics["Recall"],
-            global_metrics["Loss"],
-        )
-        print(
-            f"{COLORS.OKGREEN}Global Model: Acc={global_metrics['Acc']:.4f}, "
-            f"F1={global_metrics['F1']:.4f}, Precision={global_metrics['Precision']:.4f}, "
-            f"Recall={global_metrics['Recall']:.4f}, Loss={global_metrics['Loss']:.4f}{COLORS.ENDC}"
-        )
+            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Loss: %.4f",
+            round_number, gev["Acc"], gev["F1"], gev["Loss"])
+        print(f"{COLORS.OKGREEN}Global: Acc={gev['Acc']:.4f} F1={gev['F1']:.4f} Loss={gev['Loss']:.4f}{COLORS.ENDC}")
 
-        round_time = time.time() - round_start
+        dt = time.time() - t0
         context.shared_state["pipeline_elapsed_s"] = (
-            context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
-        )
-        context.logger.info("Round %s completed in %.2fs", round_number, round_time)
-        print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
-        return round_metrics
+            context.shared_state.get("pipeline_elapsed_s", 0.0) + dt)
+        context.logger.info("Round %s completed in %.2fs", round_number, dt)
+        print(f"{COLORS.OKCYAN}Round {round_number} done in {dt:.1f}s{COLORS.ENDC}")
+        return metrics
 
-    # ---- helpers ----
+    # ── helpers ────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _private_dataset(state, context):
-        from .common import create_private_dataset
+    def _train_global(self, ctx, model, pub_X_path, pseudo_path, batch_size, epochs):
+        pseudo = np.array(np.load(pseudo_path, mmap_mode="r"), dtype=np.int32)
+        valid = pseudo >= 0
+        if not np.any(valid):
+            print("  No valid pseudo-labels — skipping")
+            return ctx.shared_state["global_w"]
 
-        poison_loader = None
-        if state.client_id in context.poisoned_clients and context.poison_loader is not None:
-            poison_loader = context.poison_loader
+        model.set_weights(ctx.shared_state["global_w"])
 
-        return create_private_dataset(
-            state.paths["train_X"],
-            state.paths["train_y"],
-            context.input_dim,
-            context.num_classes,
-            context.config.batch_size,
-            poison_loader=poison_loader,
-        )
+        X = np.array(np.load(pub_X_path, mmap_mode="r")[valid], dtype=np.float32)
+        y = tf.keras.utils.to_categorical(pseudo[valid], ctx.num_classes).astype(np.float32)
+        del pseudo
+        perm = np.random.permutation(len(X))
+        X, y = X[perm], y[perm]
+        del perm
 
-    @staticmethod
-    def _train_on_pseudo_public(
-        model_wrapper,
-        pub_X_path: str,
-        pseudo_y_path: str,
-        num_classes: int,
-        batch_size: int,
-        epochs: int,
-        chunk_size: int = 50_000,
-    ):
-        keras_model = (
-            model_wrapper.model
-            if hasattr(model_wrapper, "model")
-            else model_wrapper
-        )
-        optimizer = keras_model.optimizer or tf.keras.optimizers.Adam(learning_rate=0.001)
-        keras_model.optimizer = optimizer
-        ce_loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
+        input_dim = X.shape[1]
+        num_classes = ctx.num_classes
 
-        if not hasattr(model_wrapper, '_cronus_train_step'):
-            @tf.function
-            def train_step(bx, by):
-                with tf.GradientTape() as tape:
-                    preds = keras_model(bx, training=True)
-                    loss = ce_loss_fn(by, preds)
-                grads = tape.gradient(loss, keras_model.trainable_variables)
-                optimizer.apply_gradients(zip(grads, keras_model.trainable_variables))
-                return loss
+        def gen():
+            for i in range(0, len(X), batch_size):
+                yield X[i:i + batch_size], y[i:i + batch_size]
 
-            model_wrapper._cronus_train_step = train_step
+        sig = (tf.TensorSpec(shape=(None, input_dim), dtype=tf.float32),
+               tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32))
+        ds = (tf.data.Dataset.from_generator(gen, output_signature=sig)
+              .unbatch().batch(batch_size).prefetch(tf.data.AUTOTUNE))
 
-        train_step = model_wrapper._cronus_train_step
-
-        def generator():
-            pub_X = np.load(pub_X_path, mmap_mode="r")
-            pseudo_y = np.load(pseudo_y_path, mmap_mode="r")
-            for s in range(0, pub_X.shape[0], chunk_size):
-                e = min(s + chunk_size, pub_X.shape[0])
-                labels_chunk = np.array(pseudo_y[s:e], dtype=np.int32)
-                valid = labels_chunk >= 0
-                if not np.any(valid):
-                    continue
-                X_c = np.array(pub_X[s:e], dtype=np.float32)[valid]
-                y_c = tf.keras.utils.to_categorical(labels_chunk[valid], num_classes).astype(np.float32)
-                yield X_c, y_c
-                del X_c, y_c, labels_chunk, valid
-            del pub_X, pseudo_y
-
-        input_dim = np.load(pub_X_path, mmap_mode="r").shape[1]
-        sig = (
-            tf.TensorSpec(shape=(None, input_dim), dtype=tf.float32),
-            tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32),
-        )
-        dataset = (
-            tf.data.Dataset.from_generator(generator, output_signature=sig)
-            .unbatch()
-            .shuffle(20_000)
-            .batch(batch_size)
-            .prefetch(tf.data.AUTOTUNE)
-        )
-
-        for epoch in range(epochs):
-            epoch_loss = 0.0
-            batches = 0
-            for bx, by in dataset:
-                loss = train_step(bx, by)
-                epoch_loss += float(loss)
-                batches += 1
-            if batches > 0:
-                print(f"    Global public epoch {epoch + 1}/{epochs} — Loss {epoch_loss / batches:.4f}")
-
-        del dataset
-
-    def _eval_fallback(
-        self, context: PipelineContext, round_start: float, round_number: int
-    ) -> Dict[int, Dict[str, float]]:
-        pool = context.model_pool
-        all_metrics = []
-        round_metrics: Dict[int, Dict[str, float]] = {}
-        for state in context.client_states:
-            model = pool.checkout(state.client_id)
-            m = evaluate_model(model, context.test_dataset, context.test_labels)
-            pool.release(model)
-            all_metrics.append(m)
-            round_metrics[state.client_id] = m
-        round_metrics[-1] = {
-            k: np.mean([m[k] for m in all_metrics])
-            for k in ("Acc", "F1", "Precision", "Recall")
-        }
-        round_time = time.time() - round_start
-        context.shared_state["pipeline_elapsed_s"] = (
-            context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
-        )
-        context.logger.info("Round %s completed in %.2fs", round_number, round_time)
-        print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
-        return round_metrics
+        model.fit(ds, epochs=epochs)
+        w = model.get_weights()
+        del ds, X, y
+        return w
 
     @staticmethod
-    def _cleanup_round_files(round_number: int):
-        for name in os.listdir(CRONUS_CACHE_DIR):
-            if name.startswith(f"r{round_number}_"):
-                os.remove(os.path.join(CRONUS_CACHE_DIR, name))
+    def _cleanup(rnd: int):
+        for name in os.listdir(CACHE_DIR):
+            if name.startswith(f"r{rnd}_"):
+                os.remove(os.path.join(CACHE_DIR, name))
 
     def finalize(self, context: PipelineContext) -> None:
-        for name in os.listdir(CRONUS_CACHE_DIR):
-            os.remove(os.path.join(CRONUS_CACHE_DIR, name))
+        del self._model
+        tf.keras.backend.clear_session()
+        for name in os.listdir(CACHE_DIR):
+            os.remove(os.path.join(CACHE_DIR, name))

@@ -31,6 +31,7 @@ class FDConfig:
     robust_epsilon: float = 0.2
     remove_dis: bool = False
     checkpoint: bool = False
+    cleanup_interval: int = 10
 
     def to_algorithm_params(self) -> dict:
         return {

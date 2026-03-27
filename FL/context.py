@@ -10,15 +10,41 @@ MODEL_WEIGHTS_DIR = os.path.join("temp_weights", "model_weights")
 
 
 class ModelPool:
-    def __init__(self, pool_size, factory_fn, weights_dir=MODEL_WEIGHTS_DIR):
+    def __init__(self, pool_size, factory_fn, weights_dir=MODEL_WEIGHTS_DIR, in_memory=False):
+        self.weights_dir = weights_dir
+        self.in_memory = in_memory
+        self._available = [factory_fn() for _ in range(pool_size)]
+        if self.in_memory:
+            self._weights_cache = {}
+            self._initial_weights = self._clone_weights(self._get_weights(self._available[0]))
+            return
+
         if os.path.isdir(weights_dir):
             for f in os.listdir(weights_dir):
                 os.remove(os.path.join(weights_dir, f))
         os.makedirs(weights_dir, exist_ok=True)
-        self.weights_dir = weights_dir
-        self._available = [factory_fn() for _ in range(pool_size)]
         self._init_path = os.path.join(weights_dir, "_init.weights.h5")
-        self._available[0].model.save_weights(self._init_path)
+        self._keras_model(self._available[0]).save_weights(self._init_path)
+
+    @staticmethod
+    def _keras_model(model):
+        return model.model if hasattr(model, "model") else model
+
+    @staticmethod
+    def _clone_weights(weights):
+        return [np.array(weight, copy=True) for weight in weights]
+
+    def _get_weights(self, model):
+        if hasattr(model, "get_weights"):
+            return model.get_weights()
+        return self._keras_model(model).get_weights()
+
+    def _set_weights(self, model, weights):
+        copied_weights = self._clone_weights(weights)
+        if hasattr(model, "set_weights"):
+            model.set_weights(copied_weights)
+            return
+        self._keras_model(model).set_weights(copied_weights)
 
     def _path(self, client_id, tag=""):
         suffix = f"_{tag}" if tag else ""
@@ -26,20 +52,33 @@ class ModelPool:
 
     def checkout(self, client_id, tag=""):
         model = self._available.pop()
+        if self.in_memory:
+            weights = self._weights_cache.get((client_id, tag), self._initial_weights)
+            self._set_weights(model, weights)
+            return model
+
         path = self._path(client_id, tag)
         weights_path = path if os.path.exists(path) else self._init_path
-        model.model.load_weights(weights_path)
+        self._keras_model(model).load_weights(weights_path)
         return model
 
     def checkin(self, client_id, model, tag=""):
-        model.model.save_weights(self._path(client_id, tag))
+        if self.in_memory:
+            self._weights_cache[(client_id, tag)] = self._clone_weights(self._get_weights(model))
+            self._available.append(model)
+            return
+
+        self._keras_model(model).save_weights(self._path(client_id, tag))
         self._available.append(model)
 
     def release(self, model):
         self._available.append(model)
 
     def save(self, client_id, model, tag=""):
-        model.model.save_weights(self._path(client_id, tag))
+        if self.in_memory:
+            self._weights_cache[(client_id, tag)] = self._clone_weights(self._get_weights(model))
+            return
+        self._keras_model(model).save_weights(self._path(client_id, tag))
 
 
 @dataclass

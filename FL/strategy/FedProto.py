@@ -162,7 +162,8 @@ class FedProto(DistillationStrategy):
         print(f"\n{COLORS.OKCYAN}[STEP 1/3] Local training (CE + proto regularization){COLORS.ENDC}")
         pool = context.model_pool
 
-        for state in context.client_states:
+        cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
+        for client_idx, state in enumerate(context.client_states):
             model = pool.checkout(state.client_id)
             dataset = create_private_dataset(
                 state.paths["train_X"],
@@ -181,7 +182,8 @@ class FedProto(DistillationStrategy):
             )
             del dataset
             pool.checkin(state.client_id, model)
-            aggressive_memory_cleanup()
+            if (client_idx + 1) % cleanup_interval == 0:
+                aggressive_memory_cleanup()
 
         print(f"\n{COLORS.OKCYAN}[STEP 2/3] Computing & aggregating prototypes{COLORS.ENDC}")
         all_client_prototypes: Dict[int, Dict[int, Dict[str, np.ndarray | int]]] = {}

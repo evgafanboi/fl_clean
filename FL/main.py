@@ -91,6 +91,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # decentralized
     parser.add_argument("--decentralized", type=str, default=None, help="Decentralized topology simulation (e.g. braintorrent)")
 
+    # memory cleanup
+    parser.add_argument("--cleanup_interval", type=int, default=25, help="Run tf.keras.backend.clear_session + gc.collect every N clients")
+
     # checkpointing
     parser.add_argument("--checkpoint", action="store_true", help="Enable round-level checkpointing (saves/resumes state to disk)")
 
@@ -147,6 +150,7 @@ def main(argv=None):
             robust_epsilon=args.robust_epsilon,
             remove_dis=args.remove_dis,
             checkpoint=args.checkpoint,
+            cleanup_interval=args.cleanup_interval,
         )
         
         strategy = strategy_registry[args.strategy](config)
@@ -178,6 +182,7 @@ def main(argv=None):
             threshold=args.threshold,
             decentralized=args.decentralized,
             checkpoint=args.checkpoint,
+            cleanup_interval=args.cleanup_interval,
         )
         run_pipeline(config)
 

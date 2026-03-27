@@ -106,15 +106,16 @@ class DCBLSTMModel:
             dataset, epochs=epochs, validation_data=validation_data, callbacks=callbacks, verbose=1, **kwargs
         )
 
-    def predict(self, X, verbose=None):
+    def predict(self, X, verbose=None, batch_size=None):
+        kwargs = {}
+        if batch_size is not None:
+            kwargs['batch_size'] = batch_size
         if hasattr(self.model, 'predict'):
-            return self.model.predict(X, verbose=verbose)
+            return self.model.predict(X, verbose=verbose, **kwargs)
         return self.model(X)
 
-    def predict_proba(self, X, verbose=None):
-        if hasattr(self.model, 'predict'):
-            return self.model.predict(X, verbose=verbose)
-        return self.model(X)
+    def predict_proba(self, X, verbose=None, batch_size=None):
+        return self.predict(X, verbose=verbose, batch_size=batch_size)
 
     def evaluate(self, dataset, verbose=0):
         return self.model.evaluate(dataset, verbose=verbose)

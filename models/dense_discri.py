@@ -11,17 +11,17 @@ class DenseDiscriminator:
     def _create_model(self):
         inputs = tf.keras.layers.Input(shape=(self.input_dim,))
         
-        x = tf.keras.layers.LayerNormalization()(inputs)
+        x = tf.keras.layers.LayerNormalization(name='ln_input')(inputs)
         
-        x = tf.keras.layers.Dense(128, activation='swish', kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
-        x = tf.keras.layers.LayerNormalization()(x)
-        x = tf.keras.layers.Dropout(0.15)(x)
+        x = tf.keras.layers.Dense(128, activation='swish', kernel_regularizer=tf.keras.regularizers.l2(1e-4), name='dense_1')(x)
+        x = tf.keras.layers.LayerNormalization(name='ln_1')(x)
+        x = tf.keras.layers.Dropout(0.15, name='drop_1')(x)
         
-        x = tf.keras.layers.Dense(64, activation='swish', kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
-        x = tf.keras.layers.LayerNormalization()(x)
-        x = tf.keras.layers.Dropout(0.15)(x)
+        x = tf.keras.layers.Dense(64, activation='swish', kernel_regularizer=tf.keras.regularizers.l2(1e-4), name='dense_2')(x)
+        x = tf.keras.layers.LayerNormalization(name='ln_2')(x)
+        x = tf.keras.layers.Dropout(0.15, name='drop_2')(x)
         
-        outputs = tf.keras.layers.Dense(1, activation='sigmoid')(x)
+        outputs = tf.keras.layers.Dense(1, activation='sigmoid', name='output')(x)
         
         model = tf.keras.Model(inputs=inputs, outputs=outputs)
         

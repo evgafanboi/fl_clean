@@ -58,6 +58,7 @@ class FLConfig:
     model: str = "dense"
     robust_epsilon: float = 0.2
     robust_tau: float = 0.1
+    cleanup_interval: int = 10
     poison: Optional[str] = None
     personalized_eval: bool = False
     root_iterations: int = 1
@@ -119,7 +120,7 @@ class FederatedLearningPipeline:
         self.dh_private_keys: Dict[int, int] = {}
         self.dh_public_keys: Dict[int, int] = {}
 
-    def _load_class_metadata(self, partition_label: str, client_count: int) -> (List[str], int):
+    def _load_class_metadata(self, partition_label: str, client_count: int) -> tuple[List[str], int]:
         class_names_file = os.path.join(
             "data", "partitions", f"{client_count}_client", partition_label, "label_classes.npy"
         )
@@ -1048,7 +1049,7 @@ class FederatedLearningPipeline:
             # Only needed when stream=False
             client_results: List = [] if not stream else None
 
-            _REFRESH_EVERY = 25  # recreate model periodically to defragment CuDNN workspace
+            _REFRESH_EVERY = self.config.cleanup_interval
 
             for client_idx in range(n_clients):
                 # Periodic GPU memory defragmentation (CuDNN backward workspace grows until OOM)
@@ -1276,10 +1277,13 @@ def run_distillation_pipeline(config, strategy) -> None:
     test_labels = _extract_labels(test_dataset, num_classes)
 
     model_type = getattr(config, "model_type", "dense")
-    model_pool = ModelPool(
-        pool_size=min(10, n_clients),
-        factory_fn=lambda: create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type),
-    )
+    model_pool = None
+    if getattr(strategy, "use_model_pool", True):
+        model_pool = ModelPool(
+            pool_size=min(10, n_clients),
+            factory_fn=lambda: create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type),
+            in_memory=bool(getattr(strategy, "prefer_in_memory_pool", False)),
+        )
     
     poisoned_clients = []
     poison_loader = None
@@ -1371,7 +1375,7 @@ def run_distillation_pipeline(config, strategy) -> None:
             ]
             with open(os.path.join(ckpt_dir, "info.txt"), "w") as _f:
                 _f.write("\n".join(info_lines) + "\n")
-            _SKIP_KEYS = {"extra_log_tokens"}
+            _SKIP_KEYS = {"extra_log_tokens", "global_model", "disc_pool"}
             saveable_shared = {}
             for k, v in context.shared_state.items():
                 if k in _SKIP_KEYS:
