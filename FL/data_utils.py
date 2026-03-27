@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -20,7 +20,7 @@ def parse_partition_type(partition_type: str) -> Tuple[str, int]:
     raise ValueError(f"Invalid partition type '{partition_type}'. Use format 'iid-10'")
 
 
-def setup_paths(client_id: str, partition_type: str, client_count: int) -> Dict[str, str]:
+def setup_paths(client_id: str, partition_type: str, client_count: int) -> Dict[str, Any]:
     partitions_root = os.path.join("data", "partitions")
     client_folder = f"{client_count}_client"
     partition_dir = os.path.join(partitions_root, client_folder, partition_type)
@@ -44,28 +44,21 @@ def setup_paths(client_id: str, partition_type: str, client_count: int) -> Dict[
     return paths
 
 
-def restore_full_partition(paths: Dict[str, str]) -> bool:
-    """Point paths to merged partition files, creating them if needed."""
+def restore_full_partition(paths: Dict[str, Any]) -> bool:
+    """Mark partition for lazy in-memory merge (no disk I/O).
+    
+    Instead of loading and writing merged files to disk (slow on Colab),
+    we just flag that public data exists. The actual merge happens
+    on-demand in create_client_dataset when the data is accessed.
+    
+    This approach avoids disk writes which can be slow on cloud environments
+    like Google Colab, while still allowing full partition access.
+    """
     if not os.path.exists(paths['public_X']):
         return False
-
-    merged_X_path = paths['train_X'].replace('_train.npy', '_merged.npy')
-    merged_y_path = paths['train_y'].replace('_train.npy', '_merged.npy')
-
-    # Skip the expensive concat+save if pre-built merged files exist on disk
-    # (created by restore_partition.py)
-    if not (os.path.exists(merged_X_path) and os.path.exists(merged_y_path)):
-        X_train = np.load(paths['train_X'], mmap_mode='r')
-        y_train = np.load(paths['train_y'], mmap_mode='r')
-        X_public = np.load(paths['public_X'], mmap_mode='r')
-        y_public = np.load(paths['public_y'], mmap_mode='r')
-
-        np.save(merged_X_path, np.concatenate([np.array(X_train), np.array(X_public)], axis=0))
-        np.save(merged_y_path, np.concatenate([np.array(y_train), np.array(y_public)], axis=0))
-
-    paths['train_X'] = merged_X_path
-    paths['train_y'] = merged_y_path
-
+    
+    # Just mark that this partition needs merging - actual merge happens lazily
+    paths['_needs_merge'] = True
     return True
 
 
@@ -77,18 +70,47 @@ def create_client_dataset(
     batch_size: int,
     poison_loader=None,
     cache: bool = True,
+    paths: Optional[Dict[str, Any]] = None,
 ) -> tf.data.Dataset:
+    """Create a TensorFlow dataset for client training.
+    
+    Args:
+        X_path: Path to features file (used if no lazy merge needed)
+        y_path: Path to labels file (used if no lazy merge needed)
+        input_dim: Input feature dimension
+        num_classes: Number of output classes
+        batch_size: Batch size for training
+        poison_loader: Optional poison loader for label flipping attacks
+        cache: Whether to cache dataset (unused, kept for compatibility)
+        paths: Optional paths dict with '_needs_merge' flag for lazy merging
+    """
+    # Check if we need to do lazy in-memory merge
+    needs_merge = paths is not None and paths.get('_needs_merge', False)
+    
     def generator():
-        X_mmap = np.load(X_path, mmap_mode='r')
-        y_mmap = np.load(y_path, mmap_mode='r')
-        total_samples = X_mmap.shape[0]
+        # Load data - merge public+private if needed
+        if needs_merge:
+            # Lazy merge: load both partitions and concatenate in memory
+            X_train = np.load(paths['train_X'], mmap_mode='r')
+            y_train = np.load(paths['train_y'], mmap_mode='r')
+            X_public = np.load(paths['public_X'], mmap_mode='r')
+            y_public = np.load(paths['public_y'], mmap_mode='r')
+            
+            # Concatenate (converts mmap to arrays)
+            X_data = np.concatenate([X_train, X_public], axis=0)
+            y_data = np.concatenate([y_train, y_public], axis=0)
+        else:
+            X_data = np.load(X_path, mmap_mode='r')
+            y_data = np.load(y_path, mmap_mode='r')
+        
+        total_samples = X_data.shape[0]
         indices = np.random.permutation(total_samples)
 
         for start_idx in range(0, total_samples, batch_size):
             end_idx = min(start_idx + batch_size, total_samples)
             idx = indices[start_idx:end_idx]
-            X_chunk = np.array(X_mmap[idx], dtype=np.float32)
-            y_chunk = np.array(y_mmap[idx], dtype=np.int32)
+            X_chunk = np.array(X_data[idx], dtype=np.float32)
+            y_chunk = np.array(y_data[idx], dtype=np.int32)
 
             if poison_loader is not None:
                 y_chunk = poison_loader.poison_labels(y_chunk)
@@ -106,6 +128,25 @@ def create_client_dataset(
     )
     dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
     return dataset.prefetch(tf.data.AUTOTUNE)
+
+
+def get_client_sample_size(paths: Dict[str, Any]) -> int:
+    """Get the total sample size for a client, accounting for lazy merge.
+    
+    This avoids loading the full data just to get the sample count.
+    """
+    if paths.get('_needs_merge', False):
+        # Count samples from both partitions
+        X_train = np.load(paths['train_X'], mmap_mode='r')
+        X_public = np.load(paths['public_X'], mmap_mode='r')
+        total = X_train.shape[0] + X_public.shape[0]
+        del X_train, X_public
+        return total
+    else:
+        X_train = np.load(paths['train_X'], mmap_mode='r')
+        total = X_train.shape[0]
+        del X_train
+        return total
 
 
 def load_test_dataset(batch_size: int, num_classes: int) -> tf.data.Dataset:

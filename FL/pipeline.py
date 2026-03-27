@@ -362,6 +362,7 @@ class FederatedLearningPipeline:
                 num_classes,
                 self.config.batch_size,
                 cache=True,
+                paths=paths_list[client_idx],
             )
             
             print(f"Training for {total_epochs} epochs independently")
@@ -550,11 +551,12 @@ class FederatedLearningPipeline:
             self.config.batch_size,
             poison_loader=poison_loader,
             cache=True,
+            paths=paths,
         )
 
-        X_train_mmap = np.load(paths['train_X'], mmap_mode='r')
-        sample_size = X_train_mmap.shape[0]
-        del X_train_mmap
+        # Use helper function to get sample size (works with lazy merge)
+        from .data_utils import get_client_sample_size
+        sample_size = get_client_sample_size(paths)
 
         print(f"Training client {client_id} for {self.config.epochs} epochs")
         
