@@ -37,7 +37,7 @@ class GRUModel:
     temporal patterns; only the last hidden state feeds a dense head.
     """
 
-    def __init__(self, input_dim, num_classes, batch_size=4096, learning_rate=None, gru_units=128):
+    def __init__(self, input_dim, num_classes, batch_size=8192, learning_rate=None, gru_units=128):
         self.input_dim = input_dim
         self.num_classes = num_classes
         self.batch_size = batch_size
@@ -150,15 +150,13 @@ class GRUModel:
             callbacks=callbacks, verbose=1, **kwargs
         )
 
-    def predict(self, X, verbose=None):
+    def predict(self, X, verbose=None, **kwargs):
         if hasattr(self.model, 'predict'):
-            return self.model.predict(X, verbose=verbose)
+            return self.model.predict(X, verbose=verbose, **kwargs)
         return self.model(X)
 
-    def predict_proba(self, X, verbose=None):
-        if hasattr(self.model, 'predict'):
-            return self.model.predict(X, verbose=verbose)
-        return self.model(X)
+    def predict_proba(self, X, verbose=None, **kwargs):
+        return self.predict(X, verbose=verbose, **kwargs)
 
     def evaluate(self, dataset, verbose=0):
         return self.model.evaluate(dataset, verbose=verbose)

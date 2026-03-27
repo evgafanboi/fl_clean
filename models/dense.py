@@ -167,17 +167,13 @@ class DenseModel:
             **kwargs
         )
     
-    def predict(self, X, verbose=None):
+    def predict(self, X, verbose=None, **kwargs):
         if hasattr(self.model, 'predict'):
-            return self.model.predict(X, verbose=verbose)
-        else:
-            return self.model(X)
+            return self.model.predict(X, verbose=verbose, **kwargs)
+        return self.model(X)
 
-    def predict_proba(self, X, verbose=None):
-        if hasattr(self.model, 'predict'):
-            return self.model.predict(X, verbose=verbose)
-        else:
-            return self.model(X)
+    def predict_proba(self, X, verbose=None, **kwargs):
+        return self.predict(X, verbose=verbose, **kwargs)
     
     def evaluate(self, dataset, verbose=0):
         return self.model.evaluate(dataset, verbose=verbose)

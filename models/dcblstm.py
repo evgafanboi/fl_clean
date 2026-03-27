@@ -12,7 +12,7 @@ class DCBLSTMModel:
         self,
         input_dim=20,
         num_classes=20,
-        batch_size=4096,
+        batch_size=8192,
         learning_rate=None,
         conv_filters=64,
         lstm_units=64,
@@ -106,16 +106,13 @@ class DCBLSTMModel:
             dataset, epochs=epochs, validation_data=validation_data, callbacks=callbacks, verbose=1, **kwargs
         )
 
-    def predict(self, X, verbose=None, batch_size=None):
-        kwargs = {}
-        if batch_size is not None:
-            kwargs['batch_size'] = batch_size
+    def predict(self, X, verbose=None, **kwargs):
         if hasattr(self.model, 'predict'):
             return self.model.predict(X, verbose=verbose, **kwargs)
         return self.model(X)
 
-    def predict_proba(self, X, verbose=None, batch_size=None):
-        return self.predict(X, verbose=verbose, batch_size=batch_size)
+    def predict_proba(self, X, verbose=None, **kwargs):
+        return self.predict(X, verbose=verbose, **kwargs)
 
     def evaluate(self, dataset, verbose=0):
         return self.model.evaluate(dataset, verbose=verbose)
@@ -161,5 +158,5 @@ class DCBLSTMModel:
         gc.collect()
 
 
-def create_dcblstm_model(input_dim=20, num_classes=20, batch_size=4096, learning_rate=None):
+def create_dcblstm_model(input_dim, num_classes, batch_size=8192, learning_rate=None):
     return DCBLSTMModel(input_dim=input_dim, num_classes=num_classes, batch_size=batch_size, learning_rate=learning_rate)
