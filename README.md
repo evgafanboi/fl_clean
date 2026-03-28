@@ -71,6 +71,8 @@ python -m FL --n_clients <> --partition_type <> --strategy <> --rounds <>
 - `FD`[16]: FederatedDistillation, use `--gamma` to control distillation weight.
 - `FLTrust`[17]: Byzantine-robust FL with labeled public dataset (root dataset). `--root_iterations`, default `1`, controls how many iterations the server trains on the root dataset.
 
+> **Note**: Strategies including `FedProto`, `Cronus`, `FD` or `FedMD` does not have a global model, so they perform per-client evaluation on the same test set. To avoid unnecessary per-round evaluation, add `--skip_eval` which disable evaluation for clients except the last round. 
+
 **Examples**:
 ```sh
 # FedProx with proximal term
