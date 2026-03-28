@@ -40,7 +40,7 @@ def _pseudo_path(rnd: int) -> str:
 
 def _predict_to_file(model, X: np.ndarray, num_classes: int,
                      batch_size: int, path: str) -> None:
-    preds = model.predict(X, batch_size=batch_size, verbose=0)
+    preds = model.predict(X, verbose=0, batch_size=batch_size)
     with open(path, "wb") as fp:
         fp.write(preds.astype(np.float32).tobytes())
 
@@ -102,16 +102,8 @@ def _make_merged_dataset(priv_X_path, priv_y_path, pub_X_path, pseudo_y_path,
     X, y = X[perm], y[perm]
     del perm
 
-    # Use from_generator (fixed output_signature → single tf.function trace)
-    # instead of from_tensor_slices (creates new TF constant ops each call).
-    def gen():
-        for i in range(0, len(X), batch_size):
-            yield X[i:i + batch_size], y[i:i + batch_size]
-
-    sig = (tf.TensorSpec(shape=(None, input_dim), dtype=tf.float32),
-           tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32))
-    return (tf.data.Dataset.from_generator(gen, output_signature=sig)
-              .unbatch().batch(batch_size).prefetch(tf.data.AUTOTUNE))
+    return (tf.data.Dataset.from_tensor_slices((X, y))
+              .batch(batch_size).prefetch(tf.data.AUTOTUNE))
 
 
 # ── strategy ───────────────────────────────────────────────────────────
@@ -324,14 +316,8 @@ class Cronus(DistillationStrategy):
         input_dim = X.shape[1]
         num_classes = ctx.num_classes
 
-        def gen():
-            for i in range(0, len(X), batch_size):
-                yield X[i:i + batch_size], y[i:i + batch_size]
-
-        sig = (tf.TensorSpec(shape=(None, input_dim), dtype=tf.float32),
-               tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32))
-        ds = (tf.data.Dataset.from_generator(gen, output_signature=sig)
-              .unbatch().batch(batch_size).prefetch(tf.data.AUTOTUNE))
+        ds = (tf.data.Dataset.from_tensor_slices((X, y))
+              .batch(batch_size).prefetch(tf.data.AUTOTUNE))
 
         model.fit(ds, epochs=epochs)
         w = model.get_weights()

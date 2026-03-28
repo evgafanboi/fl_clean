@@ -78,34 +78,20 @@ def create_client_dataset(
     poison_loader=None,
     cache: bool = True,
 ) -> tf.data.Dataset:
-    def generator():
-        X_mmap = np.load(X_path, mmap_mode='r')
-        y_mmap = np.load(y_path, mmap_mode='r')
-        total_samples = X_mmap.shape[0]
-        indices = np.random.permutation(total_samples)
+    X = np.array(np.load(X_path, mmap_mode='r'), dtype=np.float32)
+    y = np.array(np.load(y_path, mmap_mode='r'), dtype=np.int32)
 
-        for start_idx in range(0, total_samples, batch_size):
-            end_idx = min(start_idx + batch_size, total_samples)
-            idx = indices[start_idx:end_idx]
-            X_chunk = np.array(X_mmap[idx], dtype=np.float32)
-            y_chunk = np.array(y_mmap[idx], dtype=np.int32)
+    if poison_loader is not None:
+        y = poison_loader.poison_labels(y)
 
-            if poison_loader is not None:
-                y_chunk = poison_loader.poison_labels(y_chunk)
+    if len(y.shape) == 1 or y.shape[1] == 1:
+        y = tf.keras.utils.to_categorical(
+            y.astype(np.int32), num_classes=num_classes
+        ).astype(np.float32)
 
-            if len(y_chunk.shape) == 1 or y_chunk.shape[1] == 1:
-                y_chunk = tf.keras.utils.to_categorical(
-                    y_chunk.astype(np.int32),
-                    num_classes=num_classes
-                ).astype(np.float32)
-            yield X_chunk, y_chunk
-
-    output_signature = (
-        tf.TensorSpec(shape=(None, input_dim), dtype=tf.float32),
-        tf.TensorSpec(shape=(None, num_classes), dtype=tf.float32)
-    )
-    dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
-    return dataset.prefetch(tf.data.AUTOTUNE)
+    idx = np.random.permutation(len(X))
+    dataset = tf.data.Dataset.from_tensor_slices((X[idx], y[idx]))
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
 def load_test_dataset(batch_size: int, num_classes: int) -> tf.data.Dataset:

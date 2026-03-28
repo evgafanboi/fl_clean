@@ -19,10 +19,7 @@ def extract_class_prototypes(
     y_path: str,
     num_classes: int,
 ) -> Tuple[Dict[int, np.ndarray], Dict[int, int]]:
-    feature_model = model_wrapper.get_feature_model() if hasattr(model_wrapper, "get_feature_model") else None
-    if feature_model is None:
-        keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
-        feature_model = tf.keras.Model(inputs=keras_model.input, outputs=keras_model.get_layer("ln_3").output)
+    feature_model = model_wrapper.get_feature_model()
 
     X_mmap = np.load(X_path, mmap_mode="r")
     y_mmap = np.load(y_path, mmap_mode="r")
@@ -92,10 +89,10 @@ def local_training_with_prototypes(
 ) -> None:
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
 
-    feature_layer = keras_model.get_layer("ln_3")
+    feature_output = model_wrapper.get_feature_model().output
     dual_model = tf.keras.Model(
         inputs=keras_model.input,
-        outputs=[feature_layer.output, keras_model.output],
+        outputs=[feature_output, keras_model.output],
     )
 
     feature_dim = int(dual_model.output[0].shape[-1])
