@@ -274,14 +274,7 @@ class SSFLIDS(DistillationStrategy):
             state.data["class_counts"] = class_counts
             del y_mmap
 
-        global_model = create_model(
-            context.input_dim,
-            context.num_classes,
-            config.batch_size,
-            model_type=config.model_type,
-        )
-        context.shared_state["global_model"] = global_model
-        print(f"{COLORS.OKGREEN}Global evaluation model created{COLORS.ENDC}")
+        print(f"{COLORS.OKGREEN}SSFL-IDS initialized ({len(context.paths)} clients){COLORS.ENDC}")
 
     def run_round(self, context: PipelineContext, round_number: int) -> Dict[int, Dict[str, float]]:
         round_start = time.time()
@@ -369,21 +362,7 @@ class SSFLIDS(DistillationStrategy):
 
         if not pred_files:
             print(f"{COLORS.WARNING}No client provided confident predictions; skipping public training{COLORS.ENDC}")
-            all_client_metrics = []
             round_metrics: Dict[int, Dict[str, float]] = {}
-            for state in context.client_states:
-                model = pool.checkout(state.client_id)
-                metrics = evaluate_model(model, context.test_dataset, context.test_labels)
-                pool.release(model)
-                all_client_metrics.append(metrics)
-                round_metrics[state.client_id] = metrics
-            avg_metrics = {
-                "Acc": np.mean([m["Acc"] for m in all_client_metrics]),
-                "F1": np.mean([m["F1"] for m in all_client_metrics]),
-                "Precision": np.mean([m["Precision"] for m in all_client_metrics]),
-                "Recall": np.mean([m["Recall"] for m in all_client_metrics]),
-            }
-            round_metrics[-1] = avg_metrics
             round_time = time.time() - round_start
             context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
             context.logger.info("Round %s completed in %.2fs", round_number, round_time)
@@ -415,41 +394,49 @@ class SSFLIDS(DistillationStrategy):
             pool.checkin(state.client_id, model)
             aggressive_memory_cleanup()
 
-        print(f"\n{COLORS.HEADER}Training global evaluation model on pseudo-labeled public data{COLORS.ENDC}")
-        global_model = context.shared_state["global_model"]
-        train_on_pseudo_labeled_public(
-            global_model,
-            pseudo_y_path,
-            pub_X_path,
-            config.dist_rounds,
-            config.batch_size,
-            context.num_classes,
-        )
-
         for name in os.listdir(SSFLIDS_CACHE_DIR):
             if name.startswith(f"r{round_number}_"):
                 os.remove(os.path.join(SSFLIDS_CACHE_DIR, name))
         aggressive_memory_cleanup()
 
-        print(f"\n{COLORS.HEADER}Evaluation (global model){COLORS.ENDC}")
+        round_metrics: Dict[int, Dict[str, float]] = {}
+        is_last_round = round_number == config.rounds
+        do_eval = not getattr(config, "skip_eval", False) or is_last_round
 
-        global_metrics = evaluate_model(global_model, context.test_dataset, context.test_labels)
-        round_metrics: Dict[int, Dict[str, float]] = {-1: global_metrics}
+        if do_eval:
+            print(f"\n{COLORS.HEADER}Per-client evaluation{COLORS.ENDC}")
+            all_client_metrics = []
+            for state in context.client_states:
+                model = pool.checkout(state.client_id)
+                metrics = evaluate_model(model, context.test_dataset, context.test_labels)
+                pool.release(model)
+                all_client_metrics.append(metrics)
+                round_metrics[state.client_id] = metrics
+                context.logger.info(
+                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                    round_number, state.client_id,
+                    metrics["Acc"], metrics["F1"], metrics["Precision"], metrics["Recall"], metrics["Loss"],
+                )
+                print(
+                    f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
+                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+                )
 
-        context.logger.info(
-            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-            round_number,
-            global_metrics["Acc"],
-            global_metrics["F1"],
-            global_metrics["Precision"],
-            global_metrics["Recall"],
-            global_metrics["Loss"],
-        )
-        print(
-            f"{COLORS.OKGREEN}Global Model: Acc={global_metrics['Acc']:.4f}, "
-            f"F1={global_metrics['F1']:.4f}, Precision={global_metrics['Precision']:.4f}, "
-            f"Recall={global_metrics['Recall']:.4f}, Loss={global_metrics['Loss']:.4f}{COLORS.ENDC}"
-        )
+            avg_metrics = {
+                k: np.mean([m[k] for m in all_client_metrics])
+                for k in ("Acc", "F1", "Precision", "Recall", "Loss")
+            }
+            round_metrics[-1] = avg_metrics
+            print(
+                f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
+                f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
+                f"Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
+            )
+            context.logger.info(
+                "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                round_number, avg_metrics["Acc"], avg_metrics["F1"],
+                avg_metrics["Precision"], avg_metrics["Recall"], avg_metrics["Loss"],
+            )
 
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time

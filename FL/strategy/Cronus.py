@@ -134,7 +134,6 @@ class Cronus(DistillationStrategy):
         init_w = reusable.get_weights()
 
         context.shared_state["init_w"] = init_w
-        context.shared_state["global_w"] = [np.array(w, copy=True) for w in init_w]
         self._model = reusable
 
         for cid, paths in enumerate(context.paths):
@@ -260,15 +259,20 @@ class Cronus(DistillationStrategy):
         context.shared_state["pseudo_path"] = pseudo_file
         context.shared_state["pub_X_path"] = pub_X_file
 
-        # ---- global model on pseudo-labeled public ----
-        print(f"\n{COLORS.HEADER}Global model training{COLORS.ENDC}")
-        context.shared_state["global_w"] = self._train_global(
-            context, model, pub_X_file, pseudo_file, cfg.batch_size, cfg.epochs)
-
         # ---- evaluation ----
         metrics: Dict[int, Dict[str, float]] = {}
+        is_last_round = round_number == cfg.rounds
+        do_eval = not getattr(cfg, "skip_eval", False) or is_last_round
 
-        if round_number == cfg.rounds:
+        if do_eval:
+            # Fresh model to avoid CuDNN fragmentation from training loop
+            del model
+            tf.keras.backend.clear_session()
+            aggressive_memory_cleanup()
+            model = create_model(context.input_dim, context.num_classes,
+                                 cfg.batch_size, model_type=cfg.model_type)
+            self._model = model
+
             print(f"\n{COLORS.HEADER}Per-client evaluation{COLORS.ENDC}")
             for st in context.client_states:
                 model.set_weights(st.data["w"] or context.shared_state["init_w"])
@@ -279,15 +283,6 @@ class Cronus(DistillationStrategy):
                     round_number, st.client_id, ev["Acc"], ev["F1"])
                 print(f"  Client {st.client_id}: Acc={ev['Acc']:.4f} F1={ev['F1']:.4f}")
 
-        model.set_weights(context.shared_state["global_w"])
-        gev = evaluate_model(model, context.test_dataset, context.test_labels)
-        metrics[-1] = gev
-
-        context.logger.info(
-            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Loss: %.4f",
-            round_number, gev["Acc"], gev["F1"], gev["Loss"])
-        print(f"{COLORS.OKGREEN}Global: Acc={gev['Acc']:.4f} F1={gev['F1']:.4f} Loss={gev['Loss']:.4f}{COLORS.ENDC}")
-
         dt = time.time() - t0
         context.shared_state["pipeline_elapsed_s"] = (
             context.shared_state.get("pipeline_elapsed_s", 0.0) + dt)
@@ -296,33 +291,6 @@ class Cronus(DistillationStrategy):
         return metrics
 
     # ── helpers ────────────────────────────────────────────────────────
-
-    def _train_global(self, ctx, model, pub_X_path, pseudo_path, batch_size, epochs):
-        pseudo = np.array(np.load(pseudo_path, mmap_mode="r"), dtype=np.int32)
-        valid = pseudo >= 0
-        if not np.any(valid):
-            print("  No valid pseudo-labels — skipping")
-            return ctx.shared_state["global_w"]
-
-        model.set_weights(ctx.shared_state["global_w"])
-
-        X = np.array(np.load(pub_X_path, mmap_mode="r")[valid], dtype=np.float32)
-        y = tf.keras.utils.to_categorical(pseudo[valid], ctx.num_classes).astype(np.float32)
-        del pseudo
-        perm = np.random.permutation(len(X))
-        X, y = X[perm], y[perm]
-        del perm
-
-        input_dim = X.shape[1]
-        num_classes = ctx.num_classes
-
-        ds = (tf.data.Dataset.from_tensor_slices((X, y))
-              .batch(batch_size).prefetch(tf.data.AUTOTUNE))
-
-        model.fit(ds, epochs=epochs)
-        w = model.get_weights()
-        del ds, X, y
-        return w
 
     @staticmethod
     def _cleanup(rnd: int):

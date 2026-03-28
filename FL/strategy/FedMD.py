@@ -233,53 +233,57 @@ class FedMD(DistillationStrategy):
         del consensus_logits, public_features
         aggressive_memory_cleanup()
 
-        all_client_metrics = []
         round_metrics: Dict[int, Dict[str, float]] = {}
-        
-        for state in context.client_states:
-            model = pool.checkout(state.client_id)
-            metrics = evaluate_model(model, context.test_dataset, context.test_labels)
-            pool.release(model)
-            all_client_metrics.append(metrics)
-            round_metrics[state.client_id] = metrics
-            context.logger.info(
-                "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                round_number,
-                state.client_id,
-                metrics["Acc"],
-                metrics["F1"],
-                metrics["Precision"],
-                metrics["Recall"],
-                metrics["Loss"],
-            )
+        is_last_round = round_number == config.rounds
+        do_eval = not getattr(config, "skip_eval", False) or is_last_round
+
+        if do_eval:
+            all_client_metrics = []
+
+            for state in context.client_states:
+                model = pool.checkout(state.client_id)
+                metrics = evaluate_model(model, context.test_dataset, context.test_labels)
+                pool.release(model)
+                all_client_metrics.append(metrics)
+                round_metrics[state.client_id] = metrics
+                context.logger.info(
+                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                    round_number,
+                    state.client_id,
+                    metrics["Acc"],
+                    metrics["F1"],
+                    metrics["Precision"],
+                    metrics["Recall"],
+                    metrics["Loss"],
+                )
+                print(
+                    f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
+                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+                )
+
+            avg_metrics = {
+                "Acc": np.mean([m["Acc"] for m in all_client_metrics]),
+                "F1": np.mean([m["F1"] for m in all_client_metrics]),
+                "Precision": np.mean([m["Precision"] for m in all_client_metrics]),
+                "Recall": np.mean([m["Recall"] for m in all_client_metrics]),
+                "Loss": np.mean([m["Loss"] for m in all_client_metrics]),
+            }
+            round_metrics[-1] = avg_metrics
+
             print(
-                f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+                f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
+                f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
+                f"Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
             )
-        
-        avg_metrics = {
-            "Acc": np.mean([m["Acc"] for m in all_client_metrics]),
-            "F1": np.mean([m["F1"] for m in all_client_metrics]),
-            "Precision": np.mean([m["Precision"] for m in all_client_metrics]),
-            "Recall": np.mean([m["Recall"] for m in all_client_metrics]),
-            "Loss": np.mean([m["Loss"] for m in all_client_metrics]),
-        }
-        round_metrics[-1] = avg_metrics
-        
-        print(
-            f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
-            f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
-            f"Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
-        )
-        context.logger.info(
-            "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-            round_number,
-            avg_metrics["Acc"],
-            avg_metrics["F1"],
-            avg_metrics["Precision"],
-            avg_metrics["Recall"],
-            avg_metrics["Loss"],
-        )
+            context.logger.info(
+                "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                round_number,
+                avg_metrics["Acc"],
+                avg_metrics["F1"],
+                avg_metrics["Precision"],
+                avg_metrics["Recall"],
+                avg_metrics["Loss"],
+            )
 
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time

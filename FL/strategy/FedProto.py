@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import time
 from typing import Dict, Tuple
 
@@ -7,7 +8,6 @@ import numpy as np
 import tensorflow as tf
 
 from ..colors import COLORS
-from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, evaluate_model
 from .base import DistillationStrategy
 from .common import create_model, create_private_dataset
@@ -89,10 +89,10 @@ def local_training_with_prototypes(
 ) -> None:
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
 
-    feature_output = model_wrapper.get_feature_model().output
+    feature_model = model_wrapper.get_feature_model()
     dual_model = tf.keras.Model(
         inputs=keras_model.input,
-        outputs=[feature_output, keras_model.output],
+        outputs=[feature_model.output, keras_model.output],
     )
 
     feature_dim = int(dual_model.output[0].shape[-1])
@@ -138,6 +138,9 @@ def local_training_with_prototypes(
         for batch_x, batch_y in private_dataset:
             train_step(batch_x, batch_y)
 
+    del dual_model, feature_model
+    model_wrapper._feature_model = None
+
 
 class FedProto(DistillationStrategy):
     name = "FedProto"
@@ -153,15 +156,22 @@ class FedProto(DistillationStrategy):
     def run_round(self, context: PipelineContext, round_number: int) -> Dict[int, Dict[str, float]]:
         config = context.config
         round_start = time.time()
+        pool = context.model_pool
 
         global_prototypes: Dict[int, np.ndarray] = context.shared_state.get("global_prototypes", {})
 
-        print(f"\n{COLORS.OKCYAN}[STEP 1/3] Local training (CE + proto regularization){COLORS.ENDC}")
-        pool = context.model_pool
+        print(f"\n{COLORS.OKCYAN}[STEP 1/2] Local training + prototype extraction{COLORS.ENDC}")
 
-        cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
+        all_client_prototypes: Dict[int, Dict[int, Dict[str, np.ndarray | int]]] = {}
+        all_client_metrics = []
+        round_metrics: Dict[int, Dict[str, float]] = {}
+        is_last_round = round_number == config.rounds
+        do_eval = not config.skip_eval or is_last_round
+
         for client_idx, state in enumerate(context.client_states):
+            print(f"\n{COLORS.BOLD}Client {state.client_id}{COLORS.ENDC}")
             model = pool.checkout(state.client_id)
+
             dataset = create_private_dataset(
                 state.paths["train_X"],
                 state.paths["train_y"],
@@ -170,88 +180,66 @@ class FedProto(DistillationStrategy):
                 config.batch_size,
             )
             local_training_with_prototypes(
-                model,
-                dataset,
-                global_prototypes,
-                context.num_classes,
-                config.epochs,
-                config.gamma,
+                model, dataset, global_prototypes,
+                context.num_classes, config.epochs, config.gamma,
             )
             del dataset
-            pool.checkin(state.client_id, model)
-            if (client_idx + 1) % cleanup_interval == 0:
-                aggressive_memory_cleanup()
 
-        print(f"\n{COLORS.OKCYAN}[STEP 2/3] Computing & aggregating prototypes{COLORS.ENDC}")
-        all_client_prototypes: Dict[int, Dict[int, Dict[str, np.ndarray | int]]] = {}
-
-        for state in context.client_states:
-            model = pool.checkout(state.client_id)
             prototypes, supports = extract_class_prototypes(
                 model,
                 state.paths["train_X"],
                 state.paths["train_y"],
                 context.num_classes,
             )
-            pool.release(model)
+            model._feature_model = None
 
             proto_dict: Dict[int, Dict[str, np.ndarray | int]] = {}
             for class_id, proto in prototypes.items():
                 proto_dict[class_id] = {"prototype": proto, "support": supports[class_id]}
             all_client_prototypes[state.client_id] = proto_dict
+            del prototypes, supports
+
+            if do_eval:
+                metrics = evaluate_model(model, context.test_dataset, context.test_labels)
+                all_client_metrics.append(metrics)
+                round_metrics[state.client_id] = metrics
+                context.logger.info(
+                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                    round_number, state.client_id,
+                    metrics["Acc"], metrics["F1"], metrics["Precision"], metrics["Recall"], metrics["Loss"],
+                )
+                print(
+                    f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
+                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+                )
+
+            pool.checkin(state.client_id, model)
+            gc.collect()
+
+        print(f"\n{COLORS.OKCYAN}[STEP 2/2] Aggregating prototypes & summary{COLORS.ENDC}")
 
         global_prototypes = aggregate_prototypes(all_client_prototypes, context.num_classes)
         context.shared_state["global_prototypes"] = global_prototypes
+        del all_client_prototypes
 
-        print(f"\n{COLORS.OKCYAN}[STEP 3/3] Evaluation{COLORS.ENDC}")
+        if all_client_metrics:
+            avg_metrics = {
+                k: np.mean([m[k] for m in all_client_metrics])
+                for k in ("Acc", "F1", "Precision", "Recall", "Loss")
+            }
+            round_metrics[-1] = avg_metrics
 
-        all_client_metrics = []
-        round_metrics: Dict[int, Dict[str, float]] = {}
-        
-        for state in context.client_states:
-            model = pool.checkout(state.client_id)
-            metrics = evaluate_model(model, context.test_dataset, context.test_labels)
-            pool.release(model)
-            all_client_metrics.append(metrics)
-            round_metrics[state.client_id] = metrics
-            context.logger.info(
-                "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                round_number,
-                state.client_id,
-                metrics["Acc"],
-                metrics["F1"],
-                metrics["Precision"],
-                metrics["Recall"],
-                metrics["Loss"],
-            )
             print(
-                f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+                f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
+                f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
+                f"Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
             )
-        
-        avg_metrics = {
-            "Acc": np.mean([m["Acc"] for m in all_client_metrics]),
-            "F1": np.mean([m["F1"] for m in all_client_metrics]),
-            "Precision": np.mean([m["Precision"] for m in all_client_metrics]),
-            "Recall": np.mean([m["Recall"] for m in all_client_metrics]),
-            "Loss": np.mean([m["Loss"] for m in all_client_metrics]),
-        }
-        round_metrics[-1] = avg_metrics
-        
-        print(
-            f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
-            f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
-            f"Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
-        )
-        context.logger.info(
-            "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-            round_number,
-            avg_metrics["Acc"],
-            avg_metrics["F1"],
-            avg_metrics["Precision"],
-            avg_metrics["Recall"],
-            avg_metrics["Loss"],
-        )
+            context.logger.info(
+                "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                round_number,
+                avg_metrics["Acc"], avg_metrics["F1"], avg_metrics["Precision"],
+                avg_metrics["Recall"], avg_metrics["Loss"],
+            )
 
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time

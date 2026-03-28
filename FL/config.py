@@ -32,6 +32,7 @@ class FDConfig:
     remove_dis: bool = False
     checkpoint: bool = False
     cleanup_interval: int = 10
+    skip_eval: bool = False
 
     def to_algorithm_params(self) -> dict:
         return {

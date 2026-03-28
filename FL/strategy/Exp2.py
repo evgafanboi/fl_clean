@@ -489,7 +489,9 @@ class Exp2(DistillationStrategy):
         del consensus_logits, public_features
         aggressive_memory_cleanup()
 
-        round_metrics = self._evaluate(context, round_number)
+        is_last_round = round_number == config.rounds
+        do_eval = not getattr(config, "skip_eval", False) or is_last_round
+        round_metrics = self._evaluate(context, round_number) if do_eval else {}
 
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time

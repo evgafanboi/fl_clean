@@ -78,6 +78,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trust_score", action="store_true", help="Enable trust score logging (FLTrust cosine similarity) after local training")
     parser.add_argument("--peer_trust", action="store_true", help="Enable peer trust score logging (cosine similarity with adjacent neighbors +-1)")
     parser.add_argument("--personalized_eval", action="store_true", help="Evaluate individual client models in addition to global model (for FedMD, FD, FedProto)")
+    parser.add_argument("--skip_eval", action="store_true", help="Skip per-client evaluation on non-final rounds (FedProto, Cronus, Exp2, FedMD, SSFL-IDS)")
     
     # poisoning
     parser.add_argument(
@@ -151,6 +152,7 @@ def main(argv=None):
             remove_dis=args.remove_dis,
             checkpoint=args.checkpoint,
             cleanup_interval=args.cleanup_interval,
+            skip_eval=args.skip_eval,
         )
         
         strategy = strategy_registry[args.strategy](config)
