@@ -13,6 +13,8 @@ class ModelPool:
     def __init__(self, pool_size, factory_fn, weights_dir=MODEL_WEIGHTS_DIR, in_memory=False):
         self.weights_dir = weights_dir
         self.in_memory = in_memory
+        self._factory_fn = factory_fn
+        self._pool_size = pool_size
         self._available = [factory_fn() for _ in range(pool_size)]
         if self.in_memory:
             self._weights_cache = {}
@@ -79,6 +81,10 @@ class ModelPool:
             self._weights_cache[(client_id, tag)] = self._clone_weights(self._get_weights(model))
             return
         self._keras_model(model).save_weights(self._path(client_id, tag))
+
+    def refresh(self):
+        """Recreate pool models after tf.keras.backend.clear_session()."""
+        self._available = [self._factory_fn() for _ in range(self._pool_size)]
 
 
 @dataclass

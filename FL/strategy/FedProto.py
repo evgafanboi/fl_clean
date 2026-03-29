@@ -7,10 +7,36 @@ from typing import Dict, Tuple
 import numpy as np
 import tensorflow as tf
 
+from sklearn.metrics import f1_score, precision_score, recall_score
+
 from ..colors import COLORS
-from ..context import PipelineContext, evaluate_model
+from ..context import PipelineContext
+from ..memory import aggressive_memory_cleanup
 from .base import DistillationStrategy
 from .common import create_model, create_private_dataset
+
+
+def _evaluate_model(model_wrapper, test_dataset: tf.data.Dataset, reference_labels: np.ndarray) -> Dict[str, float]:
+    keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
+    all_preds = []
+    for batch_x, _ in test_dataset:
+        preds = keras_model(batch_x, training=False)
+        if isinstance(preds, (list, tuple)):
+            preds = preds[0]
+        all_preds.append(preds.numpy())
+    predictions = np.concatenate(all_preds, axis=0)
+    pred_labels = np.argmax(predictions, axis=1)
+    true_labels = reference_labels[:len(pred_labels)]
+
+    y_true_onehot = tf.keras.utils.to_categorical(true_labels, predictions.shape[1])
+    loss = float(-np.mean(np.sum(y_true_onehot * np.log(np.clip(predictions, 1e-7, 1.0)), axis=1)))
+    return {
+        "Acc": float(np.mean(pred_labels == true_labels)),
+        "F1": float(f1_score(true_labels, pred_labels, average="macro", zero_division=0)),
+        "Precision": float(precision_score(true_labels, pred_labels, average="macro", zero_division=0)),
+        "Recall": float(recall_score(true_labels, pred_labels, average="macro", zero_division=0)),
+        "Loss": loss,
+    }
 
 
 def extract_class_prototypes(
@@ -62,19 +88,13 @@ def aggregate_prototypes(
     global_prototypes: Dict[int, np.ndarray] = {}
 
     for class_id in range(num_classes):
-        weighted_sums = []
-        supports = []
+        proto_list = []
         for protos in all_client_prototypes.values():
             if class_id in protos:
-                entry = protos[class_id]
-                weighted_sums.append(entry["prototype"] * entry["support"])
-                supports.append(entry["support"])
+                proto_list.append(protos[class_id]["prototype"])
 
-        if weighted_sums and sum(supports) > 0:
-            total_support = float(sum(supports))
-            stacked = np.stack(weighted_sums, axis=0)
-            weights = np.array(supports, dtype=np.float32) / total_support
-            global_prototypes[class_id] = np.average(stacked, axis=0, weights=weights)
+        if proto_list:
+            global_prototypes[class_id] = np.mean(np.stack(proto_list, axis=0), axis=0)
 
     return global_prototypes
 
@@ -86,7 +106,7 @@ def local_training_with_prototypes(
     num_classes: int,
     epochs: int,
     gamma: float,
-) -> None:
+) -> Tuple[Dict[int, np.ndarray], Dict[int, int]]:
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
 
     feature_model = model_wrapper.get_feature_model()
@@ -98,7 +118,7 @@ def local_training_with_prototypes(
     feature_dim = int(dual_model.output[0].shape[-1])
 
     ce_loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
-    l1_loss_fn = tf.keras.losses.MeanAbsoluteError()
+    mse_loss_fn = tf.keras.losses.MeanSquaredError()
 
     if hasattr(keras_model, "optimizer") and keras_model.optimizer is not None:
         optimizer = keras_model.optimizer
@@ -128,18 +148,40 @@ def local_training_with_prototypes(
             mask = tf.gather(has_proto_tensor, labels)
             mask_expanded = tf.expand_dims(tf.cast(mask, tf.float32), -1)
             proto_new = mask_expanded * proto_targets + (1.0 - mask_expanded) * features
-            proto_loss = gamma_tf * l1_loss_fn(proto_new, features)
+            proto_loss = gamma_tf * mse_loss_fn(proto_new, features)
 
             loss = ce_loss + proto_loss
         gradients = tape.gradient(loss, keras_model.trainable_variables)
         optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+        return features
 
-    for _ in range(epochs):
+    class_features_sum = {c: np.zeros(feature_dim, dtype=np.float32) for c in range(num_classes)}
+    class_counts = {c: 0 for c in range(num_classes)}
+
+    for epoch_idx in range(epochs):
+        collect = (epoch_idx == epochs - 1)
         for batch_x, batch_y in private_dataset:
-            train_step(batch_x, batch_y)
+            features = train_step(batch_x, batch_y)
+            if collect:
+                features_np = features.numpy()
+                labels_np = tf.argmax(batch_y, axis=1).numpy()
+                for c in range(num_classes):
+                    mask = labels_np == c
+                    if np.any(mask):
+                        class_features_sum[c] += features_np[mask].sum(axis=0)
+                        class_counts[c] += int(mask.sum())
+
+    prototypes: Dict[int, np.ndarray] = {}
+    supports: Dict[int, int] = {}
+    for class_id in range(num_classes):
+        if class_counts[class_id] > 0:
+            prototypes[class_id] = class_features_sum[class_id] / class_counts[class_id]
+            supports[class_id] = class_counts[class_id]
 
     del dual_model, feature_model
     model_wrapper._feature_model = None
+
+    return prototypes, supports
 
 
 class FedProto(DistillationStrategy):
@@ -167,8 +209,14 @@ class FedProto(DistillationStrategy):
         round_metrics: Dict[int, Dict[str, float]] = {}
         is_last_round = round_number == config.rounds
         do_eval = not config.skip_eval or is_last_round
+        cleanup_interval = getattr(config, 'cleanup_interval', 25)
 
         for client_idx, state in enumerate(context.client_states):
+            if client_idx > 0 and client_idx % cleanup_interval == 0:
+                tf.keras.backend.clear_session()
+                pool.refresh()
+                aggressive_memory_cleanup()
+
             print(f"\n{COLORS.BOLD}Client {state.client_id}{COLORS.ENDC}")
             model = pool.checkout(state.client_id)
 
@@ -179,19 +227,12 @@ class FedProto(DistillationStrategy):
                 context.num_classes,
                 config.batch_size,
             )
-            local_training_with_prototypes(
+            prototypes, supports = local_training_with_prototypes(
                 model, dataset, global_prototypes,
                 context.num_classes, config.epochs, config.gamma,
             )
             del dataset
-
-            prototypes, supports = extract_class_prototypes(
-                model,
-                state.paths["train_X"],
-                state.paths["train_y"],
-                context.num_classes,
-            )
-            model._feature_model = None
+            gc.collect()
 
             proto_dict: Dict[int, Dict[str, np.ndarray | int]] = {}
             for class_id, proto in prototypes.items():
@@ -200,7 +241,7 @@ class FedProto(DistillationStrategy):
             del prototypes, supports
 
             if do_eval:
-                metrics = evaluate_model(model, context.test_dataset, context.test_labels)
+                metrics = _evaluate_model(model, context.test_dataset, context.test_labels)
                 all_client_metrics.append(metrics)
                 round_metrics[state.client_id] = metrics
                 context.logger.info(
