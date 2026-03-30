@@ -36,6 +36,14 @@ def _gru_builder(
     strategy_runtime: StrategyRuntime,
     client_id: Optional[int]
 ):
+    strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
+    if strategy_name == 'fedmlb':
+        return fedmlb_wrapper.create_fedmlb_gru_model(
+            input_dim, num_classes, batch_size,
+            lambda1=strategy_runtime.client_strategy.lambda1,
+            lambda2=strategy_runtime.client_strategy.lambda2,
+            temperature=strategy_runtime.client_strategy.temperature,
+        )
     return gru.create_gru_model(input_dim, num_classes, batch_size)
 
 
@@ -46,6 +54,14 @@ def _dcblstm_builder(
     strategy_runtime: StrategyRuntime,
     client_id: Optional[int],
 ):
+    strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
+    if strategy_name == 'fedmlb':
+        return fedmlb_wrapper.create_fedmlb_dcblstm_model(
+            input_dim, num_classes, batch_size,
+            lambda1=strategy_runtime.client_strategy.lambda1,
+            lambda2=strategy_runtime.client_strategy.lambda2,
+            temperature=strategy_runtime.client_strategy.temperature,
+        )
     return dcblstm.create_dcblstm_model(input_dim, num_classes, batch_size)
 
 MODEL_REGISTRY: Dict[str, ModelBuilder] = {
