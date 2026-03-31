@@ -96,7 +96,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cleanup_interval", type=int, default=25, help="Run tf.keras.backend.clear_session + gc.collect every N clients")
 
     # checkpointing
-    parser.add_argument("--checkpoint", action="store_true", help="Enable round-level checkpointing (saves/resumes state to disk)")
+    parser.add_argument("--checkpoint", type=int, nargs='?', const=1, default=0, help="Checkpoint every N clients (0=disabled, bare flag=every client)")
 
     return parser
 

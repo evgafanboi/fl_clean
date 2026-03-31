@@ -95,35 +95,27 @@ def evaluate_model_with_metrics(
     partition_type: Optional[str] = None,
     collect_details: bool = True,
 ):
-    y_true = []
-    y_pred = []
-    total_loss = 0.0
-    total_samples = 0
-
     base_model = model.base_model if hasattr(model, 'base_model') else model
     if hasattr(base_model, 'model'):
         base_model = base_model.model
 
-    for batch_x, batch_y in test_dataset:
-        batch_preds = base_model.predict_on_batch(batch_x)
-        batch_y_pred = np.argmax(batch_preds, axis=1)
-        y_pred.extend(batch_y_pred)
+    all_preds = base_model.predict(test_dataset, verbose=0)
+    y_pred = np.argmax(all_preds, axis=1)
 
-        if len(batch_y.shape) > 1 and batch_y.shape[1] > 1:
-            batch_y_true = np.argmax(batch_y.numpy(), axis=1)
+    y_true_parts = []
+    y_cat_parts = []
+    for _, batch_y in test_dataset:
+        b = batch_y.numpy()
+        y_cat_parts.append(b)
+        if len(b.shape) > 1 and b.shape[1] > 1:
+            y_true_parts.append(np.argmax(b, axis=1))
         else:
-            batch_y_true = batch_y.numpy().astype(int)
-        y_true.extend(batch_y_true)
+            y_true_parts.append(b.astype(int))
+    y_true = np.concatenate(y_true_parts)
+    all_y_cat = np.concatenate(y_cat_parts, axis=0)
 
-        batch_loss = tf.keras.losses.categorical_crossentropy(batch_y, batch_preds).numpy().mean()
-        total_loss += batch_loss * len(batch_y_true)
-        total_samples += len(batch_y_true)
-
-        del batch_preds, batch_y_pred, batch_y_true
-
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-    test_loss = total_loss / total_samples if total_samples > 0 else 0.0
+    per_sample_loss = tf.keras.losses.categorical_crossentropy(all_y_cat, all_preds).numpy()
+    test_loss = per_sample_loss.mean()
     accuracy = np.mean(y_true == y_pred)
 
     f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)

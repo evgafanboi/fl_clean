@@ -75,7 +75,7 @@ class FLConfig:
     support: bool = False
     threshold: float = 0.3
     decentralized: Optional[str] = None
-    checkpoint: bool = False
+    checkpoint: int = 0
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -189,27 +189,7 @@ class FederatedLearningPipeline:
                 else:
                     layer.set_weights([aggregated_kernel])
 
-    @tf.function
-    def _compute_trust_score_tf(self, client_gradient_flat, global_gradient_flat):
-        """
-        TensorFlow-compiled trust score computation.
-        Trust score = max(0, cos(client_gradient, server_gradient))
-        Order: client gradient as reference, server gradient being tested.
-        """
-        dot_product = tf.reduce_sum(client_gradient_flat * global_gradient_flat)
-        norm_client = tf.norm(client_gradient_flat)
-        norm_global = tf.norm(global_gradient_flat)
-        
-        # Avoid division by zero
-        cos_sim = tf.cond(
-            tf.logical_and(norm_client > 0, norm_global > 0),
-            lambda: dot_product / (norm_client * norm_global),
-            lambda: tf.constant(0.0)
-        )
-        
-        # ReLU clip: max(0, cos_sim)
-        return tf.maximum(0.0, cos_sim)
-    
+
     def _compute_peer_trust_scores(self, client_weights_list, client_indices):
         """
         Compute peer trust scores between adjacent clients (id +-1).
@@ -252,16 +232,19 @@ class FederatedLearningPipeline:
         return peer_scores
     
     def _compute_cosine_similarity(self, weights1, weights2):
-        """Compute cosine similarity between two weight arrays"""
-        flat1 = np.concatenate([w.flatten() for w in weights1])
-        flat2 = np.concatenate([w.flatten() for w in weights2])
-        
-        dot_product = np.dot(flat1, flat2)
-        norm1 = np.linalg.norm(flat1)
-        norm2 = np.linalg.norm(flat2)
-        
+        dot_sum = 0.0
+        norm1_sq = 0.0
+        norm2_sq = 0.0
+        for w1, w2 in zip(weights1, weights2):
+            f1 = w1.ravel()
+            f2 = w2.ravel()
+            dot_sum += np.dot(f1, f2)
+            norm1_sq += np.dot(f1, f1)
+            norm2_sq += np.dot(f2, f2)
+        norm1 = np.sqrt(norm1_sq)
+        norm2 = np.sqrt(norm2_sq)
         if norm1 > 0 and norm2 > 0:
-            return float(dot_product / (norm1 * norm2))
+            return float(dot_sum / (norm1 * norm2))
         return 0.0
     
     def _init_secure_aggregation_keys(self, n_clients: int):
@@ -303,32 +286,20 @@ class FederatedLearningPipeline:
         return masked_weights
 
     def _compute_trust_score(self, client_weights, global_weights):
-        """
-        Compute FLTrust-style trust score (ReLU clipped cosine similarity).
-        Compares client gradient (client_weights - global_weights) vs server gradient.
-        
-        Note: Since this is called after training but before aggregation,
-        we treat the global model as the reference point (previous round's model).
-        """
-        # Client gradient: new_weights - old_weights (the update)
-        client_gradient = [c_w - g_w for c_w, g_w in zip(client_weights, global_weights)]
-        client_gradient_flat = tf.constant(
-            np.concatenate([g.flatten() for g in client_gradient]), 
-            dtype=tf.float32
-        )
-        
-        # Server gradient: for comparison, we use the global model direction
-        # (in FLTrust, this would be the server's gradient on root dataset)
-        # Here we approximate it as the global weights themselves as directional reference
-        global_gradient_flat = tf.constant(
-            np.concatenate([g_w.flatten() for g_w in global_weights]),
-            dtype=tf.float32
-        )
-        
-        # Compute trust score with TF compilation
-        trust_score = self._compute_trust_score_tf(client_gradient_flat, global_gradient_flat)
-        
-        return float(trust_score.numpy())
+        dot_sum = 0.0
+        norm_c_sq = 0.0
+        norm_g_sq = 0.0
+        for c_w, g_w in zip(client_weights, global_weights):
+            diff = c_w - g_w
+            d_flat = diff.ravel()
+            g_flat = g_w.ravel()
+            dot_sum += np.dot(d_flat, g_flat)
+            norm_c_sq += np.dot(d_flat, d_flat)
+            norm_g_sq += np.dot(g_flat, g_flat)
+        norm_c = np.sqrt(norm_c_sq)
+        norm_g = np.sqrt(norm_g_sq)
+        cos_sim = dot_sum / (norm_c * norm_g) if norm_c > 0 and norm_g > 0 else 0.0
+        return max(0.0, float(cos_sim))
 
     def _run_independent_learning(self, n_clients: int, input_dim: int, num_classes: int, paths_list: List[Dict[str, str]]):
         """
@@ -411,16 +382,76 @@ class FederatedLearningPipeline:
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
         return os.path.join("checkpoint", stem)
 
+    @staticmethod
+    def _atomic_pickle(path, obj):
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+
+    def _save_strategy_state(self, ckpt_dir):
+        strategy_obj = self.strategy_runtime.client_strategy
+        if hasattr(strategy_obj, '_grad_L'):
+            self._atomic_pickle(os.path.join(ckpt_dir, "strategy_state.bin"), {
+                '_grad_L': strategy_obj._grad_L,
+                '_prev_global': strategy_obj._prev_global,
+                '_h': strategy_obj._h,
+                '_n_clients_total': strategy_obj._n_clients_total,
+                'round_num': strategy_obj.round_num,
+            })
+
+    def _save_client_progress(self, round_num, client_idx, n_clients, latest_weights,
+                              stream, running_agg, total_samples_seen,
+                              client_result, sample_sizes, client_losses,
+                              participating_clients):
+        ckpt_dir = self._checkpoint_dir()
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        gw_path = os.path.join(ckpt_dir, "global_weights.bin")
+        if client_idx == 0 or not os.path.exists(gw_path):
+            self._atomic_pickle(gw_path, latest_weights)
+
+        if stream:
+            self._atomic_pickle(os.path.join(ckpt_dir, "stream_state.bin"), {
+                'running_agg': running_agg,
+                'total_samples_seen': total_samples_seen,
+            })
+        else:
+            results_dir = os.path.join(ckpt_dir, "client_results")
+            os.makedirs(results_dir, exist_ok=True)
+            self._atomic_pickle(os.path.join(results_dir, f"{client_idx}.bin"), client_result)
+
+        self._atomic_pickle(os.path.join(ckpt_dir, "round_meta.bin"), {
+            'sample_sizes': sample_sizes,
+            'client_losses': client_losses,
+            'participating_clients': participating_clients,
+        })
+
+        self._save_strategy_state(ckpt_dir)
+
+        info_lines = [
+            f"round: {round_num}",
+            f"round_complete: false",
+            f"last_client: {client_idx}",
+            f"stream: {stream}",
+            f"total_rounds: {self.config.rounds}",
+            f"config_hash: {_config_fingerprint(self.config)}",
+            f"strategy: {self.config.strategy}",
+            f"n_clients: {n_clients}",
+        ]
+        with open(os.path.join(ckpt_dir, "info.txt"), "w") as f:
+            f.write("\n".join(info_lines) + "\n")
+
     def _save_checkpoint(self, round_num, latest_weights, n_clients, round_times,
                          selected_server=None, ms_prev_scores=None):
         ckpt_dir = self._checkpoint_dir()
         os.makedirs(ckpt_dir, exist_ok=True)
 
-        with open(os.path.join(ckpt_dir, "global_weights.bin"), "wb") as f:
-            pickle.dump(latest_weights, f, protocol=pickle.HIGHEST_PROTOCOL)
+        self._atomic_pickle(os.path.join(ckpt_dir, "global_weights.bin"), latest_weights)
 
         info_lines = [
             f"round: {round_num}",
+            f"round_complete: true",
             f"total_rounds: {self.config.rounds}",
             f"config_hash: {_config_fingerprint(self.config)}",
             f"strategy: {self.config.strategy}",
@@ -440,22 +471,18 @@ class FederatedLearningPipeline:
             f.write("\n".join(info_lines) + "\n")
 
         if ms_prev_scores is not None:
-            with open(os.path.join(ckpt_dir, "ms_prev_scores.bin"), "wb") as f:
-                pickle.dump(ms_prev_scores, f, protocol=pickle.HIGHEST_PROTOCOL)
+            self._atomic_pickle(os.path.join(ckpt_dir, "ms_prev_scores.bin"), ms_prev_scores)
 
-        strategy_obj = self.strategy_runtime.client_strategy
-        if hasattr(strategy_obj, '_grad_L'):
-            state = {
-                '_grad_L': strategy_obj._grad_L,
-                '_prev_global': strategy_obj._prev_global,
-                '_h': strategy_obj._h,
-                '_n_clients_total': strategy_obj._n_clients_total,
-                'round_num': strategy_obj.round_num,
-            }
-            with open(os.path.join(ckpt_dir, "strategy_state.bin"), "wb") as f:
-                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-
+        self._save_strategy_state(ckpt_dir)
         self.results_df.to_pickle(os.path.join(ckpt_dir, "results_df.pkl"))
+
+        for artifact in ["round_meta.bin", "stream_state.bin"]:
+            p = os.path.join(ckpt_dir, artifact)
+            if os.path.exists(p):
+                os.remove(p)
+        results_dir = os.path.join(ckpt_dir, "client_results")
+        if os.path.isdir(results_dir):
+            shutil.rmtree(results_dir)
 
         print(f"{COLORS.OKCYAN}Checkpoint saved (round {round_num}) -> {ckpt_dir}{COLORS.ENDC}")
 
@@ -498,9 +525,50 @@ class FederatedLearningPipeline:
         if os.path.exists(df_path):
             self.results_df = pd.read_pickle(df_path)
 
-        resume_round = int(info["round"]) + 1
-        print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {info['round']}) -> starting round {resume_round}{COLORS.ENDC}")
-        return {"resume_round": resume_round, "latest_weights": latest_weights, "ms_prev_scores": ms_prev_scores}
+        round_complete = info.get("round_complete", "true") == "true"
+
+        if round_complete:
+            resume_round = int(info["round"]) + 1
+            print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {info['round']}) -> starting round {resume_round}{COLORS.ENDC}")
+            return {"resume_round": resume_round, "latest_weights": latest_weights, "ms_prev_scores": ms_prev_scores}
+
+        round_num = int(info["round"])
+        last_client = int(info["last_client"])
+        stream = info.get("stream", "False") == "True"
+
+        result = {
+            "resume_round": round_num,
+            "resume_client": last_client + 1,
+            "latest_weights": latest_weights,
+            "ms_prev_scores": ms_prev_scores,
+            "stream": stream,
+        }
+
+        meta_path = os.path.join(ckpt_dir, "round_meta.bin")
+        if os.path.exists(meta_path):
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
+            result['sample_sizes'] = meta['sample_sizes']
+            result['client_losses'] = meta['client_losses']
+            result['participating_clients'] = meta['participating_clients']
+
+        if stream:
+            ss_path = os.path.join(ckpt_dir, "stream_state.bin")
+            if os.path.exists(ss_path):
+                with open(ss_path, "rb") as f:
+                    ss = pickle.load(f)
+                result['running_agg'] = ss['running_agg']
+                result['total_samples_seen'] = ss['total_samples_seen']
+        else:
+            results_dir = os.path.join(ckpt_dir, "client_results")
+            client_results = []
+            for i in range(last_client + 1):
+                with open(os.path.join(results_dir, f"{i}.bin"), "rb") as f:
+                    client_results.append(pickle.load(f))
+            result['client_results'] = client_results
+
+        print(f"{COLORS.OKGREEN}Resuming round {round_num} from client {last_client + 1}{COLORS.ENDC}")
+        return result
 
     def _train_single_client(
         self,
@@ -683,6 +751,21 @@ class FederatedLearningPipeline:
         else:
             return aggregator.aggregate(weights_list, sample_sizes)
     
+    def _get_root_dataset(self, num_classes):
+        if hasattr(self, '_root_dataset_cache'):
+            return self._root_dataset_cache
+        partition_path = os.path.join("data", "partitions", f"{self.n_clients}_client", self.partition_label)
+        all_public_X = []
+        all_public_y = []
+        for client_idx in range(self.n_clients):
+            all_public_X.append(np.load(os.path.join(partition_path, f"client_{client_idx}_X_public.npy")))
+            all_public_y.append(np.load(os.path.join(partition_path, f"client_{client_idx}_y_public.npy")))
+        combined_X = np.concatenate(all_public_X, axis=0).astype(np.float32)
+        combined_y = np.concatenate(all_public_y, axis=0)
+        combined_y = tf.keras.utils.to_categorical(combined_y.astype(np.int32), num_classes).astype(np.float32)
+        self._root_dataset_cache = (combined_X, combined_y)
+        return self._root_dataset_cache
+
     def _train_server_on_root_dataset(self, current_weights, input_dim, num_classes):
         tf.keras.backend.clear_session()
         
@@ -698,21 +781,9 @@ class FederatedLearningPipeline:
         if current_weights is not None:
             model.set_weights(current_weights)
         
-        partition_path = os.path.join("data", "partitions", f"{self.n_clients}_client", self.partition_label)
-        
-        all_public_X = []
-        all_public_y = []
-        for client_idx in range(self.n_clients):
-            public_X = np.load(os.path.join(partition_path, f"client_{client_idx}_X_public.npy"))
-            public_y = np.load(os.path.join(partition_path, f"client_{client_idx}_y_public.npy"))
-            all_public_X.append(public_X)
-            all_public_y.append(public_y)
-        
-        combined_X = np.concatenate(all_public_X, axis=0)
-        combined_y = np.concatenate(all_public_y, axis=0)
+        combined_X, combined_y = self._get_root_dataset(num_classes)
         
         root_dataset = tf.data.Dataset.from_tensor_slices((combined_X, combined_y))
-        root_dataset = root_dataset.map(lambda x, y: (x, tf.keras.utils.to_categorical(y, num_classes)))
         root_dataset = root_dataset.batch(self.config.batch_size).prefetch(tf.data.AUTOTUNE)
         
         print(f"  [SERVER] Training on root dataset ({len(combined_X)} samples) for {self.config.root_iterations} iterations")
@@ -725,7 +796,7 @@ class FederatedLearningPipeline:
         else:
             global_update = [new_w - old_w for new_w, old_w in zip(new_weights, current_weights)]
         
-        del model, root_dataset, combined_X, combined_y
+        del model, root_dataset
         aggressive_memory_cleanup()
         
         return global_update
@@ -897,6 +968,8 @@ class FederatedLearningPipeline:
 
         latest_weights = None
         start_round = 1
+        _resume_client = 0
+        _resume_accum = None
         pipeline_start_time = time.time()
         log_timestamp(self.logger, "=== FL PIPELINE STARTED ===")
         log_timestamp(self.logger, f"Strategy: {self.config.strategy}, Clients: {n_clients}, Rounds: {self.config.rounds}")
@@ -907,8 +980,13 @@ class FederatedLearningPipeline:
             if ckpt:
                 latest_weights = ckpt["latest_weights"]
                 start_round = ckpt["resume_round"]
-                ms_prev_scores = ckpt["ms_prev_scores"]
-                log_timestamp(self.logger, f"Resumed from checkpoint, starting at round {start_round}")
+                ms_prev_scores = ckpt.get("ms_prev_scores")
+                if "resume_client" in ckpt:
+                    _resume_client = ckpt["resume_client"]
+                    _resume_accum = ckpt
+                    log_timestamp(self.logger, f"Resuming round {start_round} from client {_resume_client}")
+                else:
+                    log_timestamp(self.logger, f"Resumed from checkpoint, starting at round {start_round}")
 
         # Special handling for None strategy (independent learning)
         if self.config.strategy == "None":
@@ -994,8 +1072,7 @@ class FederatedLearningPipeline:
                         pred_labels = tf.argmax(predictions, axis=1).numpy()
                         true_labels = batch_y if len(batch_y.shape) == 1 else np.argmax(batch_y, axis=1)
                         
-                        for true_label, pred_label in zip(true_labels, pred_labels):
-                            cm[true_label, pred_label] += 1
+                        np.add.at(cm, (true_labels, pred_labels), 1)
                     
                     del X_train, y_train
                     
@@ -1041,18 +1118,27 @@ class FederatedLearningPipeline:
             sample_sizes: List[int] = []
             client_losses: List[float] = []
             participating_clients: List[int] = []
-
-            # Streaming aggregation accumulators (only used when stream=True)
             running_agg = None
             total_samples_seen = 0
-
-            # Only needed when stream=False
             client_results: List = [] if not stream else None
+
+            first_client = 0
+            if round_num == start_round and _resume_accum is not None:
+                first_client = _resume_client
+                sample_sizes = _resume_accum['sample_sizes']
+                client_losses = _resume_accum['client_losses']
+                participating_clients = _resume_accum['participating_clients']
+                if stream:
+                    running_agg = _resume_accum.get('running_agg')
+                    total_samples_seen = _resume_accum.get('total_samples_seen', 0)
+                else:
+                    client_results = _resume_accum.get('client_results', [])
+                _resume_accum = None
+                print(f"{COLORS.OKGREEN}Resuming round from client {first_client}{COLORS.ENDC}")
 
             _REFRESH_EVERY = self.config.cleanup_interval
 
-            for client_idx in range(n_clients):
-                # Periodic GPU memory defragmentation (CuDNN backward workspace grows until OOM)
+            for client_idx in range(first_client, n_clients):
                 if (can_reuse and reusable_model is not None
                         and client_idx > 0 and client_idx % _REFRESH_EVERY == 0):
                     del reusable_model
@@ -1090,6 +1176,17 @@ class FederatedLearningPipeline:
                     del result_data, w
                 else:
                     client_results.append(result_data)
+
+                if self.config.checkpoint and (
+                    client_idx == n_clients - 1
+                    or (client_idx + 1) % self.config.checkpoint == 0
+                ):
+                    self._save_client_progress(
+                        round_num, client_idx, n_clients, latest_weights,
+                        stream, running_agg, total_samples_seen,
+                        client_results[-1] if not stream else None,
+                        sample_sizes, client_losses, participating_clients,
+                    )
 
             if not participating_clients:
                 break

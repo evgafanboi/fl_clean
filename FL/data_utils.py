@@ -6,10 +6,11 @@ import tensorflow as tf
 
 from .colors import COLORS
 
-_TestDatasetCache = Optional[Tuple[np.ndarray, np.ndarray]]
-_test_dataset_cache: _TestDatasetCache = None
 _test_tf_dataset_cache = None
 _test_tf_dataset_batch_size = None
+_test_tf_num_classes = None
+
+_client_data_cache: dict = {}
 
 
 def parse_partition_type(partition_type: str) -> Tuple[str, int]:
@@ -78,16 +79,19 @@ def create_client_dataset(
     poison_loader=None,
     cache: bool = True,
 ) -> tf.data.Dataset:
-    X = np.array(np.load(X_path, mmap_mode='r'), dtype=np.float32)
-    y = np.array(np.load(y_path, mmap_mode='r'), dtype=np.int32)
-
-    if poison_loader is not None:
-        y = poison_loader.poison_labels(y)
-
-    if len(y.shape) == 1 or y.shape[1] == 1:
-        y = tf.keras.utils.to_categorical(
-            y.astype(np.int32), num_classes=num_classes
-        ).astype(np.float32)
+    cache_key = (X_path, y_path, num_classes, id(poison_loader))
+    if cache_key in _client_data_cache:
+        X, y = _client_data_cache[cache_key]
+    else:
+        X = np.load(X_path, mmap_mode='r').astype(np.float32, copy=False)
+        y = np.load(y_path, mmap_mode='r').astype(np.int32, copy=False)
+        if poison_loader is not None:
+            y = poison_loader.poison_labels(y)
+        if len(y.shape) == 1 or y.shape[1] == 1:
+            y = tf.keras.utils.to_categorical(
+                y.astype(np.int32), num_classes=num_classes
+            ).astype(np.float32)
+        _client_data_cache[cache_key] = (X, y)
 
     idx = np.random.permutation(len(X))
     dataset = tf.data.Dataset.from_tensor_slices((X[idx], y[idx]))
@@ -95,22 +99,21 @@ def create_client_dataset(
 
 
 def load_test_dataset(batch_size: int, num_classes: int) -> tf.data.Dataset:
-    global _test_dataset_cache, _test_tf_dataset_cache, _test_tf_dataset_batch_size
+    global _test_tf_dataset_cache, _test_tf_dataset_batch_size, _test_tf_num_classes
 
-    if _test_dataset_cache is None:
-        X_test = np.load("data/X_test.npy")
+    if (_test_tf_dataset_cache is None
+            or _test_tf_dataset_batch_size != batch_size
+            or _test_tf_num_classes != num_classes):
+        X_test = np.load("data/X_test.npy").astype(np.float32, copy=False)
         y_test = np.load("data/y_test.npy")
-        X_test = np.asarray(X_test, dtype=np.float32)
-        y_test = np.asarray(y_test, dtype=np.float32)
-        if len(y_test.shape) == 1:
+        if y_test.ndim == 1 or y_test.shape[1] == 1:
             y_test = tf.keras.utils.to_categorical(y_test.astype(np.int32), num_classes).astype(np.float32)
-        _test_dataset_cache = (X_test, y_test)
-        print(f"{COLORS.OKGREEN}Test dataset cached ({X_test.shape[0]} samples){COLORS.ENDC}")
-
-    if _test_tf_dataset_cache is None or _test_tf_dataset_batch_size != batch_size:
-        X_test, y_test = _test_dataset_cache
-        dataset = tf.data.Dataset.from_tensor_slices((X_test, y_test))
-        _test_tf_dataset_cache = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        else:
+            y_test = y_test.astype(np.float32, copy=False)
+        _test_tf_dataset_cache = (tf.data.Dataset.from_tensor_slices((X_test, y_test))
+                                  .batch(batch_size).prefetch(tf.data.AUTOTUNE))
         _test_tf_dataset_batch_size = batch_size
+        _test_tf_num_classes = num_classes
+        print(f"{COLORS.OKGREEN}Test dataset cached ({X_test.shape[0]} samples){COLORS.ENDC}")
 
     return _test_tf_dataset_cache

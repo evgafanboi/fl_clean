@@ -30,7 +30,7 @@ class FDConfig:
     exp2_temperature: float = 4.0
     robust_epsilon: float = 0.2
     remove_dis: bool = False
-    checkpoint: bool = False
+    checkpoint: int = 0
     cleanup_interval: int = 10
     skip_eval: bool = False
 

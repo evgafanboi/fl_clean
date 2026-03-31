@@ -46,8 +46,8 @@ def create_private_dataset(
     poison_loader=None,
     cache: bool = True,
 ) -> tf.data.Dataset:
-    X = np.array(np.load(X_path, mmap_mode="r"), dtype=np.float32)
-    y = np.array(np.load(y_path, mmap_mode="r"), dtype=np.int32)
+    X = np.load(X_path, mmap_mode="r").astype(np.float32, copy=False)
+    y = np.load(y_path, mmap_mode="r").astype(np.int32, copy=False)
 
     if poison_loader is not None:
         y = poison_loader.poison_labels(y)
