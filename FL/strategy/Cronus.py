@@ -47,12 +47,13 @@ def _predict_to_file(model, X: np.ndarray, num_classes: int,
 
 def _robust_filter(pred_files: List[str], n_samples: int,
                    num_classes: int, epsilon: float,
-                   ) -> Tuple[np.ndarray, Optional[float], Set[int]]:
+                   ) -> Tuple[np.ndarray, Optional[float], Optional[float], Set[int]]:
     rf = RobustFilter(epsilon=epsilon, tau=0.1, preset="logits")
     row_bytes = num_classes * 4
     CHUNK = 200_000
     pseudo = np.empty(n_samples, dtype=np.int32)
     max_eig: Optional[float] = None
+    max_threshold: Optional[float] = None
     removed: Set[int] = set()
     handles = [open(f, "rb") for f in pred_files]
     boundary = 1.0 / num_classes
@@ -66,9 +67,11 @@ def _robust_filter(pred_files: List[str], n_samples: int,
             for h in handles
         ])
         for i in range(rows):
-            mean, eig, rm = rf.compute_robust_mean_debug(chunks[:, i, :])
+            mean, eig, rm, thr = rf.compute_robust_mean_debug(chunks[:, i, :])
             if eig is not None and (max_eig is None or eig > max_eig):
                 max_eig = eig
+            if thr is not None and (max_threshold is None or thr > max_threshold):
+                max_threshold = thr
             removed.update(rm)
             pseudo[off + i] = int(np.argmax(mean)) if float(np.max(mean)) > boundary else -1
         pbar.update(rows)
@@ -76,7 +79,7 @@ def _robust_filter(pred_files: List[str], n_samples: int,
     pbar.close()
     for h in handles:
         h.close()
-    return pseudo, max_eig, removed
+    return pseudo, max_eig, max_threshold, removed
 
 
 # ── merged dataset (round 2+) ─────────────────────────────────────────
@@ -235,17 +238,18 @@ class Cronus(DistillationStrategy):
         # ---- robust filter ----
         print(f"\n{COLORS.HEADER}Robust filtering{COLORS.ENDC}")
         eps = getattr(cfg, "robust_epsilon", 0.2)
-        pseudo, max_eig, removed_idx = _robust_filter(
+        pseudo, max_eig, max_threshold, removed_idx = _robust_filter(
             pred_files, n_pub, context.num_classes, eps)
 
         removed_cids = sorted({pred_cids[i] for i in removed_idx})
         eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
+        thr_s = f"{max_threshold:.6f}" if max_threshold is not None else "N/A"
         valid_n = int(np.sum(pseudo >= 0))
-        print(f"  epsilon={eps}  max_eig={eig_s}  removed={removed_cids or 'none'}")
+        print(f"  epsilon={eps}  max_eig={eig_s}  max_threshold={thr_s}  removed={removed_cids or 'none'}")
         print(f"  {valid_n}/{n_pub} pseudo-labeled")
         context.logger.info(
-            "Round %s | RobustFilter | eps=%.4f | max_eig=%s | removed=%s | valid=%d/%d",
-            round_number, eps, eig_s, removed_cids or "none", valid_n, n_pub)
+            "Round %s | RobustFilter | eps=%.4f | max_eig=%s | max_threshold=%s | removed=%s | valid=%d/%d",
+            round_number, eps, eig_s, thr_s, removed_cids or "none", valid_n, n_pub)
 
         pseudo_file = _pseudo_path(round_number)
         np.save(pseudo_file, pseudo)

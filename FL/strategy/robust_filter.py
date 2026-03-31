@@ -128,22 +128,24 @@ class RobustFilter:
         self,
         samples: List[np.ndarray],
         weights: Optional[List[float]] = None,
-    ) -> Tuple[np.ndarray, Optional[float], List[int]]:
+    ) -> Tuple[np.ndarray, Optional[float], List[int], Optional[float]]:
         """
         Like compute_robust_mean but also returns debug information.
 
         Returns:
-            (robust_mean, max_eigenvalue, removed_indices)
+            (robust_mean, max_eigenvalue, removed_indices, computed_threshold)
             max_eigenvalue: largest absolute eigenvalue of the covariance matrix,
                             or None when spectral norm was below threshold.
             removed_indices: 0-based indices of samples filtered out (empty list
                              when nothing was removed).
+            computed_threshold: T + delta used for filtering, or None when
+                                spectral norm was below threshold (no filtering).
         """
         if len(samples) == 0:
             raise ValueError("Empty sample list")
 
         if len(samples) == 1:
-            return samples[0], None, []
+            return samples[0], None, [], None
 
         n = len(samples)
         d = samples[0].shape[0]
@@ -173,24 +175,25 @@ class RobustFilter:
         threshold = self.threshold(self.epsilon, d)
 
         if spectral_norm <= threshold:
-            return mu_S, max_eigenvalue, []
+            return mu_S, max_eigenvalue, [], None
 
         projections = np.dot(centered, v_star)
         delta = self.slack_function(self.epsilon, spectral_norm)
         T = self._find_threshold(projections, w, d, delta)
+        computed_threshold = T + delta
 
-        filtered_mask = np.abs(projections) <= (T + delta)
+        filtered_mask = np.abs(projections) <= computed_threshold
         removed_indices = list(np.where(~filtered_mask)[0])
 
         if np.sum(filtered_mask) == 0:
-            return mu_S, max_eigenvalue, removed_indices
+            return mu_S, max_eigenvalue, removed_indices, computed_threshold
 
         filtered_samples = S[filtered_mask]
         filtered_weights = w[filtered_mask]
         filtered_weights = filtered_weights / np.sum(filtered_weights)
         robust_mean = np.average(filtered_samples, axis=0, weights=filtered_weights)
 
-        return robust_mean, max_eigenvalue, removed_indices
+        return robust_mean, max_eigenvalue, removed_indices, computed_threshold
 
     def _find_threshold(
         self,
