@@ -53,7 +53,7 @@ def main():
                         help='EWC regularization strength (normalized, typical range: 0.1-10)')
     parser.add_argument('--mas_lambda', type=float, default=1.0,
                         help='MAS regularization strength')
-    parser.add_argument('--lwf_alpha', type=float, default=0.001,
+    parser.add_argument('--lwf_alpha', type=float, default=0.5,
                         help='LwF distillation weight')
     parser.add_argument('--lwf_temperature', type=float, default=2.0,
                         help='LwF distillation temperature')
