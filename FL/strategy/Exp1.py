@@ -10,6 +10,7 @@ import tensorflow as tf
 from ..colors import COLORS
 from ..context import PipelineContext, evaluate_model
 from .base import DistillationStrategy
+from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
 
 
@@ -161,7 +162,20 @@ class Exp1(DistillationStrategy):
         all_client_metrics = []
         round_metrics: Dict[int, Dict[str, float]] = {}
 
-        for state in context.client_states:
+        _ckpt = getattr(config, "checkpoint", 0)
+        first_client = 0
+        if _ckpt:
+            mid = load_mid_round(context, "exp1", round_number)
+            if mid is not None:
+                first_client = mid["last_client_idx"] + 1
+                all_stats = mid.get("all_stats", {})
+                all_client_metrics = mid.get("all_client_metrics", [])
+                round_metrics = mid.get("round_metrics", {})
+                print(f"{COLORS.OKGREEN}Resuming round {round_number} from client {first_client}{COLORS.ENDC}")
+
+        for client_idx, state in enumerate(context.client_states):
+            if client_idx < first_client:
+                continue
             print(f"\n{COLORS.BOLD}Client {state.client_id}{COLORS.ENDC}")
             poison_loader = context.poison_loader if state.client_id in context.poisoned_clients else None
 
@@ -230,6 +244,19 @@ class Exp1(DistillationStrategy):
 
             gc.collect()
 
+            # Per-client checkpoint
+            if _ckpt and (
+                client_idx == len(context.client_states) - 1
+                or (client_idx + 1) % _ckpt == 0
+            ):
+                save_mid_round(context, "exp1", {
+                    "round": round_number,
+                    "last_client_idx": client_idx,
+                    "all_stats": all_stats,
+                    "all_client_metrics": all_client_metrics,
+                    "round_metrics": round_metrics,
+                })
+
         print(f"\n{COLORS.OKCYAN}[STEP 2/3] Aggregating logits{COLORS.ENDC}")
 
         global_logits = aggregate_logits(all_stats, context.num_classes)
@@ -261,5 +288,8 @@ class Exp1(DistillationStrategy):
         )
         context.logger.info("Round %s completed in %.2fs", round_number, round_time)
         print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
+
+        if _ckpt:
+            clear_mid_round(context, "exp1")
 
         return round_metrics

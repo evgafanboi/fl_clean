@@ -13,6 +13,7 @@ from ..colors import COLORS
 from ..context import PipelineContext
 from ..memory import aggressive_memory_cleanup
 from .base import DistillationStrategy
+from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
 
 
@@ -211,7 +212,20 @@ class FedProto(DistillationStrategy):
         do_eval = not config.skip_eval or is_last_round
         cleanup_interval = getattr(config, 'cleanup_interval', 25)
 
+        _ckpt = getattr(config, "checkpoint", 0)
+        first_client = 0
+        if _ckpt:
+            mid = load_mid_round(context, "fedproto", round_number)
+            if mid is not None:
+                first_client = mid["last_client_idx"] + 1
+                all_client_prototypes = mid.get("all_client_prototypes", {})
+                all_client_metrics = mid.get("all_client_metrics", [])
+                round_metrics = mid.get("round_metrics", {})
+                print(f"{COLORS.OKGREEN}Resuming round {round_number} from client {first_client}{COLORS.ENDC}")
+
         for client_idx, state in enumerate(context.client_states):
+            if client_idx < first_client:
+                continue
             if client_idx > 0 and client_idx % cleanup_interval == 0:
                 tf.keras.backend.clear_session()
                 pool.refresh()
@@ -257,6 +271,19 @@ class FedProto(DistillationStrategy):
             pool.checkin(state.client_id, model)
             gc.collect()
 
+            # Per-client checkpoint
+            if _ckpt and (
+                client_idx == len(context.client_states) - 1
+                or (client_idx + 1) % _ckpt == 0
+            ):
+                save_mid_round(context, "fedproto", {
+                    "round": round_number,
+                    "last_client_idx": client_idx,
+                    "all_client_prototypes": all_client_prototypes,
+                    "all_client_metrics": all_client_metrics,
+                    "round_metrics": round_metrics,
+                })
+
         print(f"\n{COLORS.OKCYAN}[STEP 2/2] Aggregating prototypes & summary{COLORS.ENDC}")
 
         global_prototypes = aggregate_prototypes(all_client_prototypes, context.num_classes)
@@ -286,5 +313,8 @@ class FedProto(DistillationStrategy):
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
         context.logger.info("Round %s completed in %.2fs", round_number, round_time)
         print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
+
+        if _ckpt:
+            clear_mid_round(context, "fedproto")
 
         return round_metrics

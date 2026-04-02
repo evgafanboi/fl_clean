@@ -11,6 +11,7 @@ from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, ModelPool, evaluate_model
 from .base import DistillationStrategy
+from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import (
     create_model,
     create_private_dataset,
@@ -240,10 +241,8 @@ class SSFLIDS(DistillationStrategy):
 
     def setup(self, context: PipelineContext) -> None:
         config = context.config
-        if config.model_type.lower() != "dense":
-            raise ValueError("SSFL-IDS currently supports only the 'dense' model_type")
 
-        is_sequence = False  # Current discriminator expects flat features
+        is_sequence = False 
 
         _ensure_cache_dir()
 
@@ -311,8 +310,25 @@ class SSFLIDS(DistillationStrategy):
         pool = context.model_pool
         disc_pool = context.shared_state["disc_pool"]
 
+        _ckpt = getattr(config, "checkpoint", 0)
+        first_s1 = 0
+        first_s2 = 0
+        if _ckpt:
+            mid = load_mid_round(context, "ssflids", round_number)
+            if mid is not None:
+                stage = mid.get("stage", 1)
+                pred_files = mid.get("pred_files", [])
+                if stage >= 2:
+                    first_s1 = len(context.client_states)  # skip Stage I entirely
+                    first_s2 = mid["last_client_idx"] + 1
+                else:
+                    first_s1 = mid["last_client_idx"] + 1
+                print(f"{COLORS.OKGREEN}Resuming round {round_number} stage {stage} from client {mid['last_client_idx'] + 1}{COLORS.ENDC}")
+
         cleanup_interval = getattr(config, 'cleanup_interval', 10)
         for client_idx, state in enumerate(context.client_states):
+            if client_idx < first_s1:
+                continue
             # Periodic full refresh to defrag GPU memory (matches Cronus/FedAvg)
             if client_idx > 0 and client_idx % cleanup_interval == 0:
                 tf.keras.backend.clear_session()
@@ -376,6 +392,18 @@ class SSFLIDS(DistillationStrategy):
             del private_dataset
             aggressive_memory_cleanup()
 
+            # Per-client checkpoint (Stage I)
+            if _ckpt and (
+                client_idx == len(context.client_states) - 1
+                or (client_idx + 1) % _ckpt == 0
+            ):
+                save_mid_round(context, "ssflids", {
+                    "round": round_number,
+                    "stage": 1,
+                    "last_client_idx": client_idx,
+                    "pred_files": pred_files,
+                })
+
         del open_feature
         aggressive_memory_cleanup()
 
@@ -400,6 +428,8 @@ class SSFLIDS(DistillationStrategy):
         aggressive_memory_cleanup()
 
         for s2_idx, state in enumerate(context.client_states):
+            if s2_idx < first_s2:
+                continue
             if s2_idx > 0 and s2_idx % cleanup_interval == 0:
                 tf.keras.backend.clear_session()
                 aggressive_memory_cleanup()
@@ -416,6 +446,18 @@ class SSFLIDS(DistillationStrategy):
             )
             pool.checkin(state.client_id, model)
             aggressive_memory_cleanup()
+
+            # Per-client checkpoint (Stage II)
+            if _ckpt and (
+                s2_idx == len(context.client_states) - 1
+                or (s2_idx + 1) % _ckpt == 0
+            ):
+                save_mid_round(context, "ssflids", {
+                    "round": round_number,
+                    "stage": 2,
+                    "last_client_idx": s2_idx,
+                    "pred_files": pred_files,
+                })
 
         for name in os.listdir(SSFLIDS_CACHE_DIR):
             if name.startswith(f"r{round_number}_"):
@@ -465,6 +507,9 @@ class SSFLIDS(DistillationStrategy):
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
         context.logger.info("Round %s completed in %.2fs", round_number, round_time)
         print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
+
+        if _ckpt:
+            clear_mid_round(context, "ssflids")
 
         return round_metrics
 

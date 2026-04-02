@@ -12,6 +12,7 @@ from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, evaluate_model, ModelPool
 from .base import DistillationStrategy
+from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import (
     create_model,
     create_private_dataset,
@@ -339,7 +340,7 @@ class Exp2(DistillationStrategy):
             context.add_client_state(client_id, None, paths)
             aggressive_memory_cleanup()
 
-    def _generate_logits(self, context, public_features):
+    def _generate_logits(self, context, public_features, first_client=0):
         config = context.config
         use_dis = context.shared_state["use_dis"]
         disc_pool = context.shared_state.get("disc_pool")
@@ -348,7 +349,15 @@ class Exp2(DistillationStrategy):
         logit_shape = None
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
 
+        # Recover already-generated logit files for skipped clients
+        for skipped_idx in range(first_client):
+            fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{context.client_states[skipped_idx].client_id}.bin")
+            if os.path.exists(fpath):
+                logit_files.append(fpath)
+
         for client_idx, state in enumerate(context.client_states):
+            if client_idx < first_client:
+                continue
             fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{state.client_id}.bin")
             model = pool.checkout(state.client_id)
 
@@ -376,15 +385,29 @@ class Exp2(DistillationStrategy):
             if (client_idx + 1) % cleanup_interval == 0:
                 aggressive_memory_cleanup()
 
+            # Per-client checkpoint (logit generation stage)
+            if self._ckpt and (
+                client_idx == len(context.client_states) - 1
+                or (client_idx + 1) % self._ckpt == 0
+            ):
+                save_mid_round(context, "exp2", {
+                    "round": self._cur_round,
+                    "stage": "logits",
+                    "last_client_idx": client_idx,
+                    "logit_files": logit_files,
+                })
+
         return logit_files, logit_shape
 
-    def _run_kd_stage(self, context, consensus_logits, public_features):
+    def _run_kd_stage(self, context, consensus_logits, public_features, first_client=0):
         config = context.config
         kd_method = getattr(config, "exp2_kd", "ekd")
         pool = context.model_pool
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
 
         for client_idx, state in enumerate(context.client_states):
+            if client_idx < first_client:
+                continue
             print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 1 ({kd_method.upper()}){COLORS.ENDC}")
             model = pool.checkout(state.client_id)
             if kd_method == "abkd":
@@ -403,11 +426,24 @@ class Exp2(DistillationStrategy):
             if (client_idx + 1) % cleanup_interval == 0:
                 aggressive_memory_cleanup()
 
-    def _run_ce_stage(self, context):
+            # Per-client checkpoint (KD stage)
+            if self._ckpt and (
+                client_idx == len(context.client_states) - 1
+                or (client_idx + 1) % self._ckpt == 0
+            ):
+                save_mid_round(context, "exp2", {
+                    "round": self._cur_round,
+                    "stage": "kd",
+                    "last_client_idx": client_idx,
+                })
+
+    def _run_ce_stage(self, context, first_client=0):
         config = context.config
         pool = context.model_pool
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
         for client_idx, state in enumerate(context.client_states):
+            if client_idx < first_client:
+                continue
             print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 2 (CE){COLORS.ENDC}")
             model = pool.checkout(state.client_id)
             private_dataset = create_private_dataset(
@@ -419,6 +455,17 @@ class Exp2(DistillationStrategy):
             del private_dataset
             if (client_idx + 1) % cleanup_interval == 0:
                 aggressive_memory_cleanup()
+
+            # Per-client checkpoint (CE stage)
+            if self._ckpt and (
+                client_idx == len(context.client_states) - 1
+                or (client_idx + 1) % self._ckpt == 0
+            ):
+                save_mid_round(context, "exp2", {
+                    "round": self._cur_round,
+                    "stage": "ce",
+                    "last_client_idx": client_idx,
+                })
 
     def _evaluate(self, context, round_number):
         pool = context.model_pool
@@ -471,22 +518,65 @@ class Exp2(DistillationStrategy):
 
         os.makedirs(LOGITS_CACHE_DIR, exist_ok=True)
 
+        self._ckpt = getattr(config, "checkpoint", 0)
+        self._cur_round = round_number
+
+        # ── mid-round resume ──
+        skip_ce = False
+        skip_logits = False
+        skip_kd = False
+        first_ce = 0
+        first_logit = 0
+        first_kd = 0
+        saved_logit_files = None
+
+        if self._ckpt:
+            mid = load_mid_round(context, "exp2", round_number)
+            if mid is not None:
+                stage = mid.get("stage", "ce")
+                last = mid["last_client_idx"]
+                if stage == "ce":
+                    first_ce = last + 1
+                elif stage == "logits":
+                    skip_ce = True
+                    first_logit = last + 1
+                    saved_logit_files = mid.get("logit_files", [])
+                elif stage == "kd":
+                    skip_ce = True
+                    skip_logits = True
+                    first_kd = last + 1
+                print(f"{COLORS.OKGREEN}Resuming round {round_number} stage={stage} from client {last + 1}{COLORS.ENDC}")
+
         # CE -> Logits -> KD -> Eval (every round)
-        self._run_ce_stage(context)
+        if not skip_ce:
+            self._run_ce_stage(context, first_client=first_ce)
 
-        print(f"\n{COLORS.OKCYAN}Generating public logits{COLORS.ENDC}")
-        logit_files, logit_shape = self._generate_logits(context, public_features)
+        if not skip_logits:
+            print(f"\n{COLORS.OKCYAN}Generating public logits{COLORS.ENDC}")
+            logit_files, logit_shape = self._generate_logits(context, public_features, first_client=first_logit)
+        else:
+            # Recover logit files from checkpoint
+            logit_files = saved_logit_files or []
+            # Need to determine shape from first logit file
+            if logit_files:
+                row_bytes_test = os.path.getsize(logit_files[0])
+                # shape[1] = num_classes from first file
+                n_classes = context.num_classes
+                logit_shape = (row_bytes_test // (n_classes * 4), n_classes)
 
-        print(f"\n{COLORS.OKCYAN}Computing consensus logits{COLORS.ENDC}")
-        consensus_logits = compute_consensus_from_files(logit_files, logit_shape)
-        print(f"  Consensus shape: {consensus_logits.shape}")
+        if not skip_kd:
+            print(f"\n{COLORS.OKCYAN}Computing consensus logits{COLORS.ENDC}")
+            consensus_logits = compute_consensus_from_files(logit_files, logit_shape)
+            print(f"  Consensus shape: {consensus_logits.shape}")
 
-        for fpath in logit_files:
-            os.remove(fpath)
+            for fpath in logit_files:
+                if os.path.exists(fpath):
+                    os.remove(fpath)
 
-        self._run_kd_stage(context, consensus_logits, public_features)
+            self._run_kd_stage(context, consensus_logits, public_features, first_client=first_kd)
 
-        del consensus_logits, public_features
+            del consensus_logits
+        del public_features
         aggressive_memory_cleanup()
 
         is_last_round = round_number == config.rounds
@@ -497,5 +587,8 @@ class Exp2(DistillationStrategy):
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
         context.logger.info("Round %s completed in %.2fs", round_number, round_time)
         print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
+
+        if self._ckpt:
+            clear_mid_round(context, "exp2")
 
         return round_metrics

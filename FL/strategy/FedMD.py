@@ -11,6 +11,7 @@ from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, evaluate_model
 from .base import DistillationStrategy
+from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import (
     create_model,
     create_private_dataset,
@@ -190,19 +191,64 @@ class FedMD(DistillationStrategy):
 
         os.makedirs(LOGITS_CACHE_DIR, exist_ok=True)
 
+        _ckpt = getattr(config, "checkpoint", 0)
+        first_logit = 0
+        first_digest = 0
+        skip_logits = False
+        saved_logit_files = None
+        if _ckpt:
+            mid = load_mid_round(context, "fedmd", round_number)
+            if mid is not None:
+                stage = mid.get("stage", "logits")
+                last = mid["last_client_idx"]
+                if stage == "logits":
+                    first_logit = last + 1
+                    saved_logit_files = mid.get("logit_files", [])
+                elif stage == "digest":
+                    skip_logits = True
+                    first_digest = last + 1
+                print(f"{COLORS.OKGREEN}Resuming round {round_number} stage={stage} from client {last + 1}{COLORS.ENDC}")
+
         print(f"\n{COLORS.OKCYAN}[STEP 1/3] Generating public logits{COLORS.ENDC}")
         logit_files = []
         logit_shape = None
         pool = context.model_pool
-        for state in context.client_states:
-            fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{state.client_id}.bin")
-            model = pool.checkout(state.client_id)
-            _, shape = generate_public_logits_to_file(model, public_features, config.batch_size, fpath)
-            pool.release(model)
-            logit_files.append(fpath)
-            logit_shape = shape
-            print(f"  Client {state.client_id}: logits {shape} -> {fpath}")
-            aggressive_memory_cleanup()
+
+        if not skip_logits:
+            # Recover already-generated logit files for skipped clients
+            for skipped_idx in range(first_logit):
+                fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{context.client_states[skipped_idx].client_id}.bin")
+                if os.path.exists(fpath):
+                    logit_files.append(fpath)
+
+            for client_idx, state in enumerate(context.client_states):
+                if client_idx < first_logit:
+                    continue
+                fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{state.client_id}.bin")
+                model = pool.checkout(state.client_id)
+                _, shape = generate_public_logits_to_file(model, public_features, config.batch_size, fpath)
+                pool.release(model)
+                logit_files.append(fpath)
+                logit_shape = shape
+                print(f"  Client {state.client_id}: logits {shape} -> {fpath}")
+                aggressive_memory_cleanup()
+
+                if _ckpt and (
+                    client_idx == len(context.client_states) - 1
+                    or (client_idx + 1) % _ckpt == 0
+                ):
+                    save_mid_round(context, "fedmd", {
+                        "round": round_number,
+                        "stage": "logits",
+                        "last_client_idx": client_idx,
+                        "logit_files": logit_files,
+                    })
+        else:
+            logit_files = saved_logit_files or []
+            if logit_files:
+                n_classes = context.num_classes
+                row_bytes_test = os.path.getsize(logit_files[0])
+                logit_shape = (row_bytes_test // (n_classes * 4), n_classes)
 
         print(f"\n{COLORS.OKCYAN}[STEP 2/3] Computing consensus logits{COLORS.ENDC}")
         consensus_logits = compute_consensus_from_files(logit_files, logit_shape)
@@ -213,7 +259,9 @@ class FedMD(DistillationStrategy):
 
         print(f"\n{COLORS.OKCYAN}[STEP 3/3] Digest and revisit phases{COLORS.ENDC}")
 
-        for state in context.client_states:
+        for client_idx, state in enumerate(context.client_states):
+            if client_idx < first_digest:
+                continue
             print(f"\n{COLORS.BOLD}Client {state.client_id}{COLORS.ENDC}")
             model = pool.checkout(state.client_id)
             digest_phase(model, consensus_logits, public_features, config.batch_size, self.digest_epochs)
@@ -229,6 +277,16 @@ class FedMD(DistillationStrategy):
             pool.checkin(state.client_id, model)
             del private_dataset
             aggressive_memory_cleanup()
+
+            if _ckpt and (
+                client_idx == len(context.client_states) - 1
+                or (client_idx + 1) % _ckpt == 0
+            ):
+                save_mid_round(context, "fedmd", {
+                    "round": round_number,
+                    "stage": "digest",
+                    "last_client_idx": client_idx,
+                })
 
         del consensus_logits, public_features
         aggressive_memory_cleanup()
@@ -289,5 +347,8 @@ class FedMD(DistillationStrategy):
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
         context.logger.info("Round %s completed in %.2fs", round_number, round_time)
         print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
+
+        if _ckpt:
+            clear_mid_round(context, "fedmd")
 
         return round_metrics

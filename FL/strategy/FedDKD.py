@@ -10,6 +10,7 @@ from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, evaluate_model
 from .base import DistillationStrategy
+from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
 
 
@@ -179,8 +180,18 @@ class FedDKD(DistillationStrategy):
         
         global_weights = global_model.get_weights()
         pool = context.model_pool
+
+        _ckpt = getattr(config, "checkpoint", 0)
+        first_client = 0
+        if _ckpt:
+            mid = load_mid_round(context, "feddkd", round_number)
+            if mid is not None:
+                first_client = mid["last_client_idx"] + 1
+                print(f"{COLORS.OKGREEN}Resuming round {round_number} from client {first_client}{COLORS.ENDC}")
         
-        for state in context.client_states:
+        for client_idx, state in enumerate(context.client_states):
+            if client_idx < first_client:
+                continue
             print(f"\n{COLORS.BOLD}Training Expert {state.client_id}{COLORS.ENDC}")
             model = pool.checkout(state.client_id)
             model.set_weights(global_weights)
@@ -198,6 +209,16 @@ class FedDKD(DistillationStrategy):
             
             del train_dataset
             aggressive_memory_cleanup()
+
+            # Per-client checkpoint (expert training)
+            if _ckpt and (
+                client_idx == len(context.client_states) - 1
+                or (client_idx + 1) % _ckpt == 0
+            ):
+                save_mid_round(context, "feddkd", {
+                    "round": round_number,
+                    "last_client_idx": client_idx,
+                })
         
         context.logger.info(f"All experts trained for {self.expert_epochs} epochs from global model")
         
@@ -270,5 +291,8 @@ class FedDKD(DistillationStrategy):
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
         context.logger.info("Round %s completed in %.2fs", round_number, round_time)
+
+        if _ckpt:
+            clear_mid_round(context, "feddkd")
         
         return round_metrics

@@ -10,6 +10,7 @@ from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, evaluate_model
 from .base import DistillationStrategy
+from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
 
 
@@ -257,7 +258,21 @@ class FederatedDistillation(DistillationStrategy):
         round_metrics: Dict[int, Dict[str, float]] = {}
         pool = context.model_pool
 
-        for state in context.client_states:
+        _ckpt = getattr(config, "checkpoint", 0)
+        first_client = 0
+        if _ckpt:
+            mid = load_mid_round(context, "fd", round_number)
+            if mid is not None:
+                first_client = mid["last_client_idx"] + 1
+                all_client_logits = mid.get("all_client_logits", {})
+                all_client_counts_for_round = mid.get("all_client_counts_for_round", {})
+                all_client_metrics = mid.get("all_client_metrics", [])
+                round_metrics = mid.get("round_metrics", {})
+                print(f"{COLORS.OKGREEN}Resuming round {round_number} from client {first_client}{COLORS.ENDC}")
+
+        for client_idx, state in enumerate(context.client_states):
+            if client_idx < first_client:
+                continue
             print(f"\n{COLORS.BOLD}Client {state.client_id}{COLORS.ENDC}")
 
             if counts_cache is not None:
@@ -334,6 +349,20 @@ class FederatedDistillation(DistillationStrategy):
             del private_dataset
             aggressive_memory_cleanup()
 
+            # Per-client checkpoint
+            if _ckpt and (
+                client_idx == len(context.client_states) - 1
+                or (client_idx + 1) % _ckpt == 0
+            ):
+                save_mid_round(context, "fd", {
+                    "round": round_number,
+                    "last_client_idx": client_idx,
+                    "all_client_logits": all_client_logits,
+                    "all_client_counts_for_round": all_client_counts_for_round,
+                    "all_client_metrics": all_client_metrics,
+                    "round_metrics": round_metrics,
+                })
+
         print(f"\n{COLORS.OKCYAN}[STEP 2/3] Aggregating logits per client{COLORS.ENDC}")
         new_global_logits: Dict[int, Dict[int, np.ndarray]] = {}
 
@@ -392,5 +421,8 @@ class FederatedDistillation(DistillationStrategy):
         )
         context.logger.info("Round %s completed in %.2fs", round_number, round_time)
         print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
+
+        if _ckpt:
+            clear_mid_round(context, "fd")
 
         return round_metrics

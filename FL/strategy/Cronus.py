@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pickle
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -111,6 +112,62 @@ def _make_merged_dataset(priv_X_path, priv_y_path, pub_X_path, pseudo_y_path,
               .batch(batch_size).prefetch(tf.data.AUTOTUNE))
 
 
+# ── checkpoint helpers ──────────────────────────────────────────────────
+
+def _ckpt_dir(context: PipelineContext) -> str:
+    stem = os.path.splitext(os.path.basename(context.log_filename))[0]
+    return os.path.join("checkpoint", stem)
+
+
+def _save_mid_round(context: PipelineContext, round_number: int,
+                    last_client_idx: int, pred_files: List[str],
+                    pred_cids: List[int], pub_X_file: str) -> None:
+    d = _ckpt_dir(context)
+    os.makedirs(d, exist_ok=True)
+    payload = {
+        "round": round_number,
+        "last_client_idx": last_client_idx,
+        "pred_files": pred_files,
+        "pred_cids": pred_cids,
+        "pub_X_file": pub_X_file,
+        "client_weights": {
+            st.client_id: st.data["w"]
+            for st in context.client_states
+            if st.data.get("w") is not None
+        },
+    }
+    tmp = os.path.join(d, "cronus_mid.bin.tmp")
+    dst = os.path.join(d, "cronus_mid.bin")
+    with open(tmp, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, dst)
+    print(f"{COLORS.OKCYAN}  Mid-round checkpoint saved (client {last_client_idx}){COLORS.ENDC}")
+
+
+def _load_mid_round(context: PipelineContext, round_number: int):
+    d = _ckpt_dir(context)
+    path = os.path.join(d, "cronus_mid.bin")
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        payload = pickle.load(f)
+    if payload.get("round") != round_number:
+        return None
+    # Restore per-client weights
+    for st in context.client_states:
+        w = payload["client_weights"].get(st.client_id)
+        if w is not None:
+            st.data["w"] = w
+    return payload
+
+
+def _clear_mid_round(context: PipelineContext) -> None:
+    d = _ckpt_dir(context)
+    path = os.path.join(d, "cronus_mid.bin")
+    if os.path.exists(path):
+        os.remove(path)
+
+
 # ── strategy ───────────────────────────────────────────────────────────
 
 class Cronus(DistillationStrategy):
@@ -185,9 +242,22 @@ class Cronus(DistillationStrategy):
 
         pred_files: List[str] = []
         pred_cids:  List[int] = []
+        first_client = 0
+
+        # ---- mid-round resume ----
+        _ckpt_interval = getattr(cfg, "checkpoint", 0)
+        if _ckpt_interval:
+            mid = _load_mid_round(context, round_number)
+            if mid is not None:
+                first_client = mid["last_client_idx"] + 1
+                pred_files = mid["pred_files"]
+                pred_cids = mid["pred_cids"]
+                print(f"{COLORS.OKGREEN}Resuming round {round_number} from client {first_client}{COLORS.ENDC}")
 
         # ---- per-client: reuse model → set_weights → train → predict ----
         for idx, st in enumerate(context.client_states):
+            if idx < first_client:
+                continue
             cid = st.client_id
             poisoned = cid in context.poisoned_clients
 
@@ -233,6 +303,14 @@ class Cronus(DistillationStrategy):
 
             del ds
             aggressive_memory_cleanup()
+
+            # Per-client checkpoint (matches FedAvg pipeline pattern)
+            if _ckpt_interval and (
+                idx == len(context.client_states) - 1
+                or (idx + 1) % _ckpt_interval == 0
+            ):
+                _save_mid_round(context, round_number, idx,
+                                pred_files, pred_cids, pub_X_file)
 
         del open_X
         aggressive_memory_cleanup()
@@ -288,6 +366,10 @@ class Cronus(DistillationStrategy):
                     "Round %s | Client %s | Acc: %.4f | F1: %.4f",
                     round_number, st.client_id, ev["Acc"], ev["F1"])
                 print(f"  Client {st.client_id}: Acc={ev['Acc']:.4f} F1={ev['F1']:.4f}")
+
+        # Clear mid-round checkpoint now that the round completed successfully
+        if getattr(cfg, "checkpoint", 0):
+            _clear_mid_round(context)
 
         dt = time.time() - t0
         context.shared_state["pipeline_elapsed_s"] = (
