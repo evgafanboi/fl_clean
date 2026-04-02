@@ -121,7 +121,8 @@ def train_on_pseudo_labeled_public(
                 predictions = keras_model(batch_X, training=True)
                 loss = ce_loss_fn(batch_y, predictions)
             gradients = tape.gradient(loss, keras_model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+            optimizer.apply_gradients(zip(gradients, keras_model.trainable_variables))
+            return loss
 
         model_wrapper._ssflids_train_step = train_step
 
@@ -211,12 +212,23 @@ def train_discriminator(
     indices = np.random.permutation(len(dis_X))
     dis_X = dis_X[indices]
     dis_y = dis_y[indices]
+    del indices
 
-    dataset = tf.data.Dataset.from_tensor_slices((dis_X, dis_y)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    def disc_gen():
+        for s in range(0, len(dis_X), batch_size):
+            yield dis_X[s:s + batch_size], dis_y[s:s + batch_size]
+
+    disc_sig = (
+        tf.TensorSpec(shape=(None, dis_X.shape[1]), dtype=tf.float32),
+        tf.TensorSpec(shape=(None,), dtype=tf.float32),
+    )
+    dataset = (tf.data.Dataset.from_generator(disc_gen, output_signature=disc_sig)
+               .prefetch(tf.data.AUTOTUNE))
 
     for _ in range(dis_rounds):
         discri_model.fit(dataset, epochs=1, verbose=0)
 
+    del dataset, dis_X, dis_y
     return True
 
 
@@ -281,6 +293,11 @@ class SSFLIDS(DistillationStrategy):
         config = context.config
         n_public = context.shared_state["public_sample_count"]
 
+        # Round-boundary refresh: reset TF graph state (matches Cronus)
+        if round_number > 1:
+            tf.keras.backend.clear_session()
+            aggressive_memory_cleanup()
+
         base_mmap = np.load(_base_public_path(), mmap_mode="r")
         permutation = np.random.permutation(n_public)
         open_feature = np.array(base_mmap[permutation], dtype=np.float32)
@@ -294,8 +311,13 @@ class SSFLIDS(DistillationStrategy):
         pool = context.model_pool
         disc_pool = context.shared_state["disc_pool"]
 
-        cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
+        cleanup_interval = getattr(config, 'cleanup_interval', 10)
         for client_idx, state in enumerate(context.client_states):
+            # Periodic full refresh to defrag GPU memory (matches Cronus/FedAvg)
+            if client_idx > 0 and client_idx % cleanup_interval == 0:
+                tf.keras.backend.clear_session()
+                aggressive_memory_cleanup()
+
             cid = state.client_id
             print(f"\n{COLORS.BOLD}Client {cid} Stage I training{COLORS.ENDC}")
             private_dataset = create_private_dataset(
@@ -316,8 +338,7 @@ class SSFLIDS(DistillationStrategy):
                 print("  Skipping discriminator (insufficient classes)")
                 pool.checkin(cid, model)
                 del private_dataset
-                if (client_idx + 1) % cleanup_interval == 0:
-                    aggressive_memory_cleanup()
+                aggressive_memory_cleanup()
                 continue
 
             disc = disc_pool.checkout(cid)
@@ -336,8 +357,7 @@ class SSFLIDS(DistillationStrategy):
                 disc_pool.checkin(cid, disc)
                 pool.checkin(cid, model)
                 del private_dataset
-                if (client_idx + 1) % cleanup_interval == 0:
-                    aggressive_memory_cleanup()
+                aggressive_memory_cleanup()
                 continue
 
             pred_path = _pred_path(cid, round_number)
@@ -354,8 +374,7 @@ class SSFLIDS(DistillationStrategy):
             pred_files.append(pred_path)
 
             del private_dataset
-            if (client_idx + 1) % cleanup_interval == 0:
-                aggressive_memory_cleanup()
+            aggressive_memory_cleanup()
 
         del open_feature
         aggressive_memory_cleanup()
@@ -380,7 +399,11 @@ class SSFLIDS(DistillationStrategy):
             os.remove(f)
         aggressive_memory_cleanup()
 
-        for state in context.client_states:
+        for s2_idx, state in enumerate(context.client_states):
+            if s2_idx > 0 and s2_idx % cleanup_interval == 0:
+                tf.keras.backend.clear_session()
+                aggressive_memory_cleanup()
+
             print(f"Client {state.client_id}: training on pseudo-labeled public data")
             model = pool.checkout(state.client_id)
             train_on_pseudo_labeled_public(
@@ -446,6 +469,10 @@ class SSFLIDS(DistillationStrategy):
         return round_metrics
 
     def finalize(self, context: PipelineContext) -> None:
+        tf.keras.backend.clear_session()
         if os.path.isdir(SSFLIDS_CACHE_DIR):
             for name in os.listdir(SSFLIDS_CACHE_DIR):
                 os.remove(os.path.join(SSFLIDS_CACHE_DIR, name))
+        if os.path.isdir(SSFLIDS_DISC_DIR):
+            for name in os.listdir(SSFLIDS_DISC_DIR):
+                os.remove(os.path.join(SSFLIDS_DISC_DIR, name))

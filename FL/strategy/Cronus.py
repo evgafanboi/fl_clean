@@ -79,6 +79,8 @@ def _robust_filter(pred_files: List[str], n_samples: int,
     pbar.close()
     for h in handles:
         h.close()
+    if max_threshold is None:
+        max_threshold = rf.threshold(epsilon, num_classes)
     return pseudo, max_eig, max_threshold, removed
 
 
