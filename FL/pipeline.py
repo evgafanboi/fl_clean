@@ -376,7 +376,7 @@ class FederatedLearningPipeline:
         log_timestamp(self.logger, "Independent learning completed")
         print(f"{COLORS.OKGREEN}Independent learning completed!{COLORS.ENDC}")
 
-    _WRAPPER_STRATEGIES = frozenset({'fedmlb', 'fedora'})
+    _WRAPPER_STRATEGIES = frozenset({'fedora'})
 
     def _checkpoint_dir(self) -> str:
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
@@ -711,6 +711,7 @@ class FederatedLearningPipeline:
         del train_dataset, trained_weights
         if reuse_model is None:
             del model
+            tf.keras.backend.clear_session()
         del history
         aggressive_memory_cleanup()
 
