@@ -99,23 +99,29 @@ def evaluate_model_with_metrics(
     if hasattr(base_model, 'model'):
         base_model = base_model.model
 
-    all_preds = base_model.predict(test_dataset, verbose=0)
-    y_pred = np.argmax(all_preds, axis=1)
-
+    ce = tf.keras.losses.CategoricalCrossentropy(reduction="none")
+    total_loss = 0.0
+    n_samples = 0
+    y_pred_parts = []
     y_true_parts = []
-    y_cat_parts = []
-    for _, batch_y in test_dataset:
+
+    for batch_x, batch_y in test_dataset:
+        preds = base_model(batch_x, training=False)
+        batch_loss = ce(batch_y, preds).numpy()
+        total_loss += float(np.sum(batch_loss))
+        y_pred_parts.append(np.argmax(preds.numpy(), axis=1))
         b = batch_y.numpy()
-        y_cat_parts.append(b)
         if len(b.shape) > 1 and b.shape[1] > 1:
             y_true_parts.append(np.argmax(b, axis=1))
         else:
             y_true_parts.append(b.astype(int))
-    y_true = np.concatenate(y_true_parts)
-    all_y_cat = np.concatenate(y_cat_parts, axis=0)
+        n_samples += int(batch_x.shape[0])
 
-    per_sample_loss = tf.keras.losses.categorical_crossentropy(all_y_cat, all_preds).numpy()
-    test_loss = per_sample_loss.mean()
+    y_pred = np.concatenate(y_pred_parts)
+    y_true = np.concatenate(y_true_parts)
+    del y_pred_parts, y_true_parts
+
+    test_loss = total_loss / n_samples
     accuracy = np.mean(y_true == y_pred)
 
     f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
