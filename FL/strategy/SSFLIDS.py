@@ -75,6 +75,7 @@ def predict_with_discriminator(
 
         del logits_batch, probs_batch, dis_pred, X_batch
 
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     np.save(output_path, np.array(hard_labels, dtype=np.int32))
     del hard_labels
 
@@ -292,23 +293,27 @@ class SSFLIDS(DistillationStrategy):
         config = context.config
         n_public = context.shared_state["public_sample_count"]
 
+        pool = context.model_pool
+        disc_pool = context.shared_state["disc_pool"]
+
         # Round-boundary refresh: reset TF graph state (matches Cronus)
         if round_number > 1:
             tf.keras.backend.clear_session()
             aggressive_memory_cleanup()
+            pool.refresh()
+            disc_pool.refresh()
 
         base_mmap = np.load(_base_public_path(), mmap_mode="r")
         permutation = np.random.permutation(n_public)
         open_feature = np.array(base_mmap[permutation], dtype=np.float32)
         del base_mmap
 
+        _ensure_cache_dir()
         pub_X_path = _round_public_path(round_number)
         np.save(pub_X_path, open_feature)
 
         print(f"\n{COLORS.HEADER}Round {round_number} Stage I{COLORS.ENDC}")
         pred_files: List[str] = []
-        pool = context.model_pool
-        disc_pool = context.shared_state["disc_pool"]
 
         _ckpt = getattr(config, "checkpoint", 0)
         first_s1 = 0
@@ -333,6 +338,8 @@ class SSFLIDS(DistillationStrategy):
             if client_idx > 0 and client_idx % cleanup_interval == 0:
                 tf.keras.backend.clear_session()
                 aggressive_memory_cleanup()
+                pool.refresh()
+                disc_pool.refresh()
 
             cid = state.client_id
             print(f"\n{COLORS.BOLD}Client {cid} Stage I training{COLORS.ENDC}")
@@ -433,6 +440,7 @@ class SSFLIDS(DistillationStrategy):
             if s2_idx > 0 and s2_idx % cleanup_interval == 0:
                 tf.keras.backend.clear_session()
                 aggressive_memory_cleanup()
+                pool.refresh()
 
             print(f"Client {state.client_id}: training on pseudo-labeled public data")
             model = pool.checkout(state.client_id)
@@ -469,6 +477,10 @@ class SSFLIDS(DistillationStrategy):
         do_eval = not getattr(config, "skip_eval", False) or is_last_round
 
         if do_eval:
+            tf.keras.backend.clear_session()
+            aggressive_memory_cleanup()
+            pool.refresh()
+
             print(f"\n{COLORS.HEADER}Per-client evaluation{COLORS.ENDC}")
             all_client_metrics = []
             for state in context.client_states:

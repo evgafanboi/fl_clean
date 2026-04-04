@@ -42,6 +42,7 @@ def _pseudo_path(rnd: int) -> str:
 def _predict_to_file(model, X: np.ndarray, num_classes: int,
                      batch_size: int, path: str) -> None:
     preds = model.predict(X, verbose=0, batch_size=batch_size)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as fp:
         fp.write(preds.astype(np.float32).tobytes())
 
@@ -228,6 +229,7 @@ class Cronus(DistillationStrategy):
         open_X = np.array(base[perm], dtype=np.float32)
         del base
         pub_X_file = _pub_path(round_number)
+        os.makedirs(CACHE_DIR, exist_ok=True)
         np.save(pub_X_file, open_X)
 
         attack_type, poison_value, _ = parse_poison_config(
