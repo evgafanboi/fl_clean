@@ -10,7 +10,7 @@ import tensorflow as tf
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
-from ..context import PipelineContext, evaluate_model, ModelPool
+from ..context import PipelineContext, evaluate_model
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import (
@@ -19,10 +19,8 @@ from .common import (
     load_public_dataset_from_clients,
     numpy_from_dataset,
 )
-from models.dense_discri import create_discriminator as create_disc_model
 
-LOGITS_CACHE_DIR = os.path.join("temp_weights", "exp2_cache")
-DISC_WEIGHTS_DIR = os.path.join("temp_weights", "exp2_disc_weights")
+LOGITS_CACHE_DIR = os.path.join("temp_weights", "ours_cache")
 
 
 # ── Logit generation (chunked to disk) ──────────────────────────────────────
@@ -42,73 +40,6 @@ def generate_logits_to_file(model_wrapper, public_features: np.ndarray, batch_si
             total_rows += logits.shape[0]
             del logits, chunk
     return output_path, (total_rows, num_classes)
-
-
-def generate_logits_to_file_with_disc(
-    model_wrapper, disc_model, public_features: np.ndarray,
-    batch_size: int, num_classes: int, output_path: str,
-) -> tuple:
-    logits_model = model_wrapper.get_logits_model() if hasattr(model_wrapper, "get_logits_model") else model_wrapper
-    disc_net = disc_model.model if hasattr(disc_model, "model") else disc_model
-    chunk_size = 500_000
-    total_rows = 0
-    with open(output_path, "wb") as fp:
-        for start in range(0, len(public_features), chunk_size):
-            chunk = public_features[start : start + chunk_size]
-            logits = logits_model.predict(chunk, batch_size=batch_size, verbose=0)
-            dis_pred = disc_net.predict(chunk, batch_size=batch_size, verbose=0).reshape(-1)
-            uncertain_mask = dis_pred > 0.5
-            if np.any(uncertain_mask):
-                logits[uncertain_mask] = 0.0
-            fp.write(logits.astype(np.float32).tobytes())
-            total_rows += logits.shape[0]
-            del logits, dis_pred, chunk
-    return output_path, (total_rows, num_classes)
-
-
-def train_discriminator(
-    classify_model, disc_model, public_features: np.ndarray,
-    dis_rounds: int, batch_size: int, num_classes: int, private_X_path: str,
-) -> bool:
-    logits_model = classify_model.get_logits_model() if hasattr(classify_model, "get_logits_model") else classify_model
-
-    chunk_size = 500_000
-    max_probs = np.empty(len(public_features), dtype=np.float32)
-    for start in range(0, len(public_features), chunk_size):
-        end = min(start + chunk_size, len(public_features))
-        logits = logits_model.predict(public_features[start:end], batch_size=batch_size, verbose=0)
-        probs = tf.nn.softmax(logits).numpy()
-        max_probs[start:end] = np.max(probs, axis=1)
-        del logits, probs
-
-    theta = float(np.median(max_probs))
-    sure_unknown_mask = max_probs < theta
-    sure_unknown_feature = public_features[sure_unknown_mask]
-    del max_probs
-
-    if sure_unknown_feature.size == 0:
-        return False
-
-    X_mmap = np.load(private_X_path, mmap_mode="r")
-    sure_known = np.array(X_mmap[: len(sure_unknown_feature)], dtype=np.float32)
-    del X_mmap
-
-    dis_X = np.vstack([sure_known, sure_unknown_feature])
-    dis_y = np.concatenate([
-        np.zeros(len(sure_known), dtype=np.float32),
-        np.ones(len(sure_unknown_feature), dtype=np.float32),
-    ])
-    del sure_known, sure_unknown_feature
-
-    indices = np.random.permutation(len(dis_X))
-    dis_X, dis_y = dis_X[indices], dis_y[indices]
-
-    dataset = tf.data.Dataset.from_tensor_slices((dis_X, dis_y)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    for _ in range(dis_rounds):
-        disc_model.fit(dataset, epochs=1, verbose=0)
-
-    del dis_X, dis_y, dataset
-    return True
 
 
 # ── Consensus ────────────────────────────────────────────────────────────────
@@ -287,8 +218,8 @@ def ce_stage(model_wrapper, private_dataset: tf.data.Dataset, epochs: int) -> No
 
 # ── Strategy ─────────────────────────────────────────────────────────────────
 
-class Exp2(DistillationStrategy):
-    name = "Exp2"
+class Ours(DistillationStrategy):
+    name = "Ours"
 
     def __init__(self, config) -> None:
         super().__init__(config)
@@ -296,19 +227,16 @@ class Exp2(DistillationStrategy):
         self.ce_epochs = config.epochs
 
     def extra_log_tokens(self) -> Dict[str, float]:
-        tokens = {"kd": self.config.exp2_kd, "ekd_lambda": self.config.exp2_ekd_lambda}
-        if self.config.exp2_kd == "abkd":
-            tokens.update({"ab_alpha": self.config.ab_alpha, "ab_beta": self.config.ab_beta, "temperature": self.config.exp2_temperature})
-        if not getattr(self.config, "remove_dis", False):
-            tokens["dis_rounds"] = self.config.dis_rounds
+        tokens = {"kd": self.config.ours_kd, "ekd_lambda": self.config.ours_ekd_lambda}
+        if self.config.ours_kd == "abkd":
+            tokens.update({"ab_alpha": self.config.ab_alpha, "ab_beta": self.config.ab_beta, "temperature": self.config.ours_temperature})
         return tokens
 
     def setup(self, context: PipelineContext) -> None:
         config = context.config
-        use_dis = not getattr(config, "remove_dis", False)
-        kd_method = getattr(config, "exp2_kd", "ekd")
+        kd_method = getattr(config, "ours_kd", "ekd")
 
-        print(f"{COLORS.OKGREEN}Preparing Exp2 ({kd_method.upper()} + discriminator){COLORS.ENDC}")
+        print(f"{COLORS.OKGREEN}Preparing Ours ({kd_method.upper()}){COLORS.ENDC}")
 
         public_unlabeled_ds, total_public = load_public_dataset_from_clients(
             context.paths, batch_size=config.batch_size, num_classes=context.num_classes,
@@ -325,16 +253,7 @@ class Exp2(DistillationStrategy):
         context.shared_state.update({
             "public_features_path": pub_path,
             "public_sample_count": total_public,
-            "use_dis": use_dis,
         })
-
-        if use_dis:
-            disc_pool = ModelPool(
-                pool_size=min(5, context.n_clients),
-                factory_fn=lambda: create_disc_model(context.input_dim),
-                weights_dir=DISC_WEIGHTS_DIR,
-            )
-            context.shared_state["disc_pool"] = disc_pool
 
         for client_id, paths in enumerate(context.paths):
             context.add_client_state(client_id, None, paths)
@@ -342,14 +261,11 @@ class Exp2(DistillationStrategy):
 
     def _generate_logits(self, context, public_features, first_client=0):
         config = context.config
-        use_dis = context.shared_state["use_dis"]
-        disc_pool = context.shared_state.get("disc_pool")
         pool = context.model_pool
         logit_files = []
         logit_shape = None
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
 
-        # Recover already-generated logit files for skipped clients
         for skipped_idx in range(first_client):
             fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{context.client_states[skipped_idx].client_id}.bin")
             if os.path.exists(fpath):
@@ -361,22 +277,9 @@ class Exp2(DistillationStrategy):
             fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{state.client_id}.bin")
             model = pool.checkout(state.client_id)
 
-            if use_dis:
-                disc = disc_pool.checkout(state.client_id)
-                train_discriminator(
-                    model, disc, public_features,
-                    config.dis_rounds, config.batch_size, context.num_classes,
-                    state.paths["train_X"],
-                )
-                _, shape = generate_logits_to_file_with_disc(
-                    model, disc, public_features,
-                    config.batch_size, context.num_classes, fpath,
-                )
-                disc_pool.checkin(state.client_id, disc)
-            else:
-                _, shape = generate_logits_to_file(
-                    model, public_features, config.batch_size, fpath,
-                )
+            _, shape = generate_logits_to_file(
+                model, public_features, config.batch_size, fpath,
+            )
 
             pool.release(model)
             logit_files.append(fpath)
@@ -385,12 +288,11 @@ class Exp2(DistillationStrategy):
             if (client_idx + 1) % cleanup_interval == 0:
                 aggressive_memory_cleanup()
 
-            # Per-client checkpoint (logit generation stage)
             if self._ckpt and (
                 client_idx == len(context.client_states) - 1
                 or (client_idx + 1) % self._ckpt == 0
             ):
-                save_mid_round(context, "exp2", {
+                save_mid_round(context, "ours", {
                     "round": self._cur_round,
                     "stage": "logits",
                     "last_client_idx": client_idx,
@@ -401,7 +303,7 @@ class Exp2(DistillationStrategy):
 
     def _run_kd_stage(self, context, consensus_logits, public_features, first_client=0):
         config = context.config
-        kd_method = getattr(config, "exp2_kd", "ekd")
+        kd_method = getattr(config, "ours_kd", "ekd")
         pool = context.model_pool
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
 
@@ -414,24 +316,23 @@ class Exp2(DistillationStrategy):
                 abkd_stage(
                     model, consensus_logits, public_features,
                     config.batch_size, self.kd_epochs,
-                    config.ab_alpha, config.ab_beta, config.exp2_temperature,
+                    config.ab_alpha, config.ab_beta, config.ours_temperature,
                 )
             else:
                 ekd_stage(
                     model, consensus_logits, public_features,
                     config.batch_size, self.kd_epochs,
-                    getattr(config, "exp2_ekd_lambda", 1.0),
+                    getattr(config, "ours_ekd_lambda", 1.0),
                 )
             pool.checkin(state.client_id, model)
             if (client_idx + 1) % cleanup_interval == 0:
                 aggressive_memory_cleanup()
 
-            # Per-client checkpoint (KD stage)
             if self._ckpt and (
                 client_idx == len(context.client_states) - 1
                 or (client_idx + 1) % self._ckpt == 0
             ):
-                save_mid_round(context, "exp2", {
+                save_mid_round(context, "ours", {
                     "round": self._cur_round,
                     "stage": "kd",
                     "last_client_idx": client_idx,
@@ -456,12 +357,11 @@ class Exp2(DistillationStrategy):
             if (client_idx + 1) % cleanup_interval == 0:
                 aggressive_memory_cleanup()
 
-            # Per-client checkpoint (CE stage)
             if self._ckpt and (
                 client_idx == len(context.client_states) - 1
                 or (client_idx + 1) % self._ckpt == 0
             ):
-                save_mid_round(context, "exp2", {
+                save_mid_round(context, "ours", {
                     "round": self._cur_round,
                     "stage": "ce",
                     "last_client_idx": client_idx,
@@ -521,7 +421,6 @@ class Exp2(DistillationStrategy):
         self._ckpt = getattr(config, "checkpoint", 0)
         self._cur_round = round_number
 
-        # ── mid-round resume ──
         skip_ce = False
         skip_logits = False
         skip_kd = False
@@ -531,7 +430,7 @@ class Exp2(DistillationStrategy):
         saved_logit_files = None
 
         if self._ckpt:
-            mid = load_mid_round(context, "exp2", round_number)
+            mid = load_mid_round(context, "ours", round_number)
             if mid is not None:
                 stage = mid.get("stage", "ce")
                 last = mid["last_client_idx"]
@@ -547,7 +446,6 @@ class Exp2(DistillationStrategy):
                     first_kd = last + 1
                 print(f"{COLORS.OKGREEN}Resuming round {round_number} stage={stage} from client {last + 1}{COLORS.ENDC}")
 
-        # CE -> Logits -> KD -> Eval (every round)
         if not skip_ce:
             self._run_ce_stage(context, first_client=first_ce)
 
@@ -555,12 +453,9 @@ class Exp2(DistillationStrategy):
             print(f"\n{COLORS.OKCYAN}Generating public logits{COLORS.ENDC}")
             logit_files, logit_shape = self._generate_logits(context, public_features, first_client=first_logit)
         else:
-            # Recover logit files from checkpoint
             logit_files = saved_logit_files or []
-            # Need to determine shape from first logit file
             if logit_files:
                 row_bytes_test = os.path.getsize(logit_files[0])
-                # shape[1] = num_classes from first file
                 n_classes = context.num_classes
                 logit_shape = (row_bytes_test // (n_classes * 4), n_classes)
 
@@ -589,6 +484,6 @@ class Exp2(DistillationStrategy):
         print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
 
         if self._ckpt:
-            clear_mid_round(context, "exp2")
+            clear_mid_round(context, "ours")
 
         return round_metrics

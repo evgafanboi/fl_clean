@@ -11,7 +11,7 @@ from .pipeline import FLConfig, run_pipeline
 
 
 WEIGHT_AGGREGATION_STRATEGIES = {"FedAvg", "FedProx", "FedDyn", "FedCoMed", "RobustFilter", "DeepFed", "FLTrust", "SecureAggregation", "FedSSD1", "FedSSDexp", "FedSSD2", "None"}
-DISTILLATION_STRATEGIES = {"FD", "FedDKD", "FedProto", "FedMD", "FedSSD", "SSFL-IDS", "Exp1", "Exp2", "Cronus"}
+DISTILLATION_STRATEGIES = {"FD", "FedDKD", "FedProto", "FedMD", "FedSSD", "SSFL-IDS", "Exp1", "Ours", "Cronus"}
 ALL_STRATEGIES = sorted(WEIGHT_AGGREGATION_STRATEGIES | DISTILLATION_STRATEGIES)
 
 
@@ -37,7 +37,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # robust filter
     parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (Byzantine ratio)")
     # cronus
-    parser.add_argument("--remove_dis", action="store_true", help="Cronus: remove discriminator, use plain softmax predictions")
+    parser.add_argument("--remove_dis", action="store_true", help="Cronus: use plain softmax predictions")
     # fedssd
     parser.add_argument("--m_max", type=float, default=1.0, help="M_max value for FedSSD")
     parser.add_argument("--support", action="store_true", help="Use support-weighted aggregation (FedSSD1/FedSSDexp)")
@@ -53,12 +53,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # exp1
     parser.add_argument("--exp1_lambda", type=float, default=1.0, help="Lambda for KLD loss in Exp1 (L = CE + lambda * KLD)")
     parser.add_argument("--exp1_temperature", type=float, default=3.0, help="Temperature for KL divergence in Exp1")
-    # exp2
-    parser.add_argument("--exp2_ekd_lambda", type=float, default=1.0, help="Lambda weighting L_2nd in EKD (Exp2)")
-    parser.add_argument("--kd", type=str, default="ekd", choices=["ekd", "abkd"], help="KD method for Exp2 (ekd or abkd)")
+    # ours
+    parser.add_argument("--ours_ekd_lambda", type=float, default=1.0, help="Lambda weighting L_2nd in EKD (Ours)")
+    parser.add_argument("--kd", type=str, default="ekd", choices=["ekd", "abkd"], help="KD method for Ours (ekd or abkd)")
     parser.add_argument("--ab_alpha", type=float, default=1.0, help="Alpha for ABKD divergence")
     parser.add_argument("--ab_beta", type=float, default=0.0, help="Beta for ABKD divergence")
-    parser.add_argument("--exp2_temperature", type=float, default=4.0, help="Temperature for ABKD softmax scaling")
+    parser.add_argument("--ours_temperature", type=float, default=4.0, help="Temperature for ABKD softmax scaling")
 
     # distillation hyperparameters
     parser.add_argument("--gamma", type=float, default=1.0, help="Distillation temperature / weighting factor (for FD, FedMD, FedProto)")
@@ -78,7 +78,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trust_score", action="store_true", help="Enable trust score logging (FLTrust cosine similarity) after local training")
     parser.add_argument("--peer_trust", action="store_true", help="Enable peer trust score logging (cosine similarity with adjacent neighbors +-1)")
     parser.add_argument("--personalized_eval", action="store_true", help="Evaluate individual client models in addition to global model (for FedMD, FD, FedProto)")
-    parser.add_argument("--skip_eval", action="store_true", help="Skip per-client evaluation on non-final rounds (FedProto, Cronus, Exp2, FedMD, SSFL-IDS)")
+    parser.add_argument("--skip_eval", action="store_true", help="Skip per-client evaluation on non-final rounds (FedProto, Cronus, Ours, FedMD, SSFL-IDS)")
     
     # poisoning
     parser.add_argument(
@@ -106,7 +106,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.strategy in DISTILLATION_STRATEGIES:
-        from .strategy import FD, FedDKD, FedProto, FedMD, FedSSD, SSFLIDS, Exp1, Exp2, Cronus
+        from .strategy import FD, FedDKD, FedProto, FedMD, FedSSD, SSFLIDS, Exp1, ours, Cronus
         from .config import FDConfig
         from .pipeline import run_distillation_pipeline
         
@@ -118,7 +118,7 @@ def main(argv=None):
             "FedSSD": FedSSD.FedSSD,
             "SSFL-IDS": SSFLIDS.SSFLIDS,
             "Exp1": Exp1.Exp1,
-            "Exp2": Exp2.Exp2,
+            "Ours": ours.Ours,
             "Cronus": Cronus.Cronus,
         }
         
@@ -143,11 +143,11 @@ def main(argv=None):
             poison=" ".join(args.poison) if args.poison else None,
             exp1_lambda=args.exp1_lambda,
             exp1_temperature=args.exp1_temperature,
-            exp2_ekd_lambda=args.exp2_ekd_lambda,
-            exp2_kd=args.kd,
+            ours_ekd_lambda=args.ours_ekd_lambda,
+            ours_kd=args.kd,
             ab_alpha=args.ab_alpha,
             ab_beta=args.ab_beta,
-            exp2_temperature=args.exp2_temperature,
+            ours_temperature=args.ours_temperature,
             robust_epsilon=args.robust_epsilon,
             remove_dis=args.remove_dis,
             checkpoint=args.checkpoint,
