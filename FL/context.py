@@ -125,20 +125,31 @@ class PipelineContext:
 
 
 def evaluate_model(model: Any, test_dataset: tf.data.Dataset, reference_labels: np.ndarray) -> Dict[str, float]:
-    predictions = model.predict(test_dataset, verbose=1)
-    if isinstance(predictions, list):
-        predictions = predictions[0]
-    pred_labels = np.argmax(predictions, axis=1)
+    base = model.base_model if hasattr(model, "base_model") else model
+    if hasattr(base, "model"):
+        base = base.model
+
+    ce = tf.keras.losses.CategoricalCrossentropy(reduction="none")
+    total_loss = 0.0
+    n_samples = 0
+    pred_parts = []
+
+    for batch_x, batch_y in test_dataset:
+        preds = base(batch_x, training=False)
+        total_loss += float(tf.reduce_sum(ce(batch_y, preds)))
+        pred_parts.append(tf.argmax(preds, axis=1).numpy())
+        n_samples += int(batch_x.shape[0])
+
+    pred_labels = np.concatenate(pred_parts)
+    del pred_parts
     true_labels = reference_labels[:len(pred_labels)]
-    
-    y_true_onehot = tf.keras.utils.to_categorical(true_labels, predictions.shape[1])
-    loss = float(-np.mean(np.sum(y_true_onehot * np.log(np.clip(predictions, 1e-7, 1.0)), axis=1)))
-    
+
+    loss = total_loss / n_samples
     accuracy = float(np.mean(pred_labels == true_labels))
     f1 = float(f1_score(true_labels, pred_labels, average="macro", zero_division=0))
     precision = float(precision_score(true_labels, pred_labels, average="macro", zero_division=0))
     recall = float(recall_score(true_labels, pred_labels, average="macro", zero_division=0))
-    
+
     return {
         "Acc": accuracy,
         "F1": f1,
