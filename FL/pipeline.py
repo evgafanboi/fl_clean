@@ -899,7 +899,8 @@ class FederatedLearningPipeline:
 
     def run(self):
         configure_gpu_memory()
-        os.makedirs(self.config.weights_cache_dir, exist_ok=True)
+        if not os.path.islink(self.config.weights_cache_dir):
+            os.makedirs(self.config.weights_cache_dir, exist_ok=True)
 
         self.strategy_runtime = build_strategy(
             self.config.strategy,
