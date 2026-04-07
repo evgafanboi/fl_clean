@@ -304,12 +304,13 @@ class SSFLIDS(DistillationStrategy):
 
         print(f"\n{COLORS.HEADER}Round {round_number} Stage II{COLORS.ENDC}")
         pseudo_y_path = os.path.join(SSFLIDS_CACHE_DIR, f"r{round_number}_pseudo_y.npy")
-        if not skip_stage2_init:
+        if not skip_stage2_init and not os.path.exists(pseudo_y_path):
             global_labels_np = hard_label_vote(pred_files, context.num_classes)
             np.save(pseudo_y_path, global_labels_np)
             del global_labels_np
             for f in pred_files:
-                os.remove(f)
+                if os.path.exists(f):
+                    os.remove(f)
             aggressive_memory_cleanup()
 
         pub_X = np.array(np.load(pub_X_path, mmap_mode="r"), dtype=np.float32)
@@ -351,7 +352,7 @@ class SSFLIDS(DistillationStrategy):
                     "round": round_number,
                     "stage": 2,
                     "last_client_idx": s2_idx,
-                    "pred_files": pred_files,
+                    "pred_files": [],
                     "client_weights": {
                         st.client_id: st.data["w"]
                         for st in context.client_states

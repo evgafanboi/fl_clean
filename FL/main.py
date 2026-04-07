@@ -78,7 +78,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trust_score", action="store_true", help="Enable trust score logging (FLTrust cosine similarity) after local training")
     parser.add_argument("--peer_trust", action="store_true", help="Enable peer trust score logging (cosine similarity with adjacent neighbors +-1)")
     parser.add_argument("--personalized_eval", action="store_true", help="Evaluate individual client models in addition to global model (for FedMD, FD, FedProto)")
-    parser.add_argument("--skip_mid_eval", action="store_true", help="Only evaluate the final round's weight records (skip intermediate rounds)")
+    parser.add_argument("--skip_eval", action="store_true", help="Only evaluate the final round's weight records (skip intermediate rounds)")
     
     # poisoning
     parser.add_argument(
@@ -152,7 +152,7 @@ def main(argv=None):
             remove_dis=args.remove_dis,
             checkpoint=args.checkpoint,
             cleanup_interval=args.cleanup_interval,
-            skip_mid_eval=args.skip_mid_eval,
+            skip_eval=args.skip_eval,
         )
         
         strategy = strategy_registry[args.strategy](config)
@@ -185,7 +185,7 @@ def main(argv=None):
             decentralized=args.decentralized,
             checkpoint=args.checkpoint,
             cleanup_interval=args.cleanup_interval,
-            skip_mid_eval=args.skip_mid_eval,
+            skip_eval=args.skip_eval,
         )
         run_pipeline(config)
 

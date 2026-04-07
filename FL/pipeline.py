@@ -81,7 +81,7 @@ def _config_fingerprint(config) -> str:
     d = dataclasses.asdict(config)
     d.pop('checkpoint', None)
     d.pop('rounds', None)
-    d.pop('skip_mid_eval', None)
+    d.pop('skip_eval', None)
     raw = str(sorted(d.items()))
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -119,7 +119,7 @@ class FLConfig:
     threshold: float = 0.3
     decentralized: Optional[str] = None
     checkpoint: int = 0
-    skip_mid_eval: bool = False
+    skip_eval: bool = False
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -1376,7 +1376,7 @@ class FederatedLearningPipeline:
                 print(f"{COLORS.WARNING}Round {round_num}: skipped (no weight record){COLORS.ENDC}")
                 continue
 
-            if self.config.skip_mid_eval and round_num != self.config.rounds:
+            if self.config.skip_eval and round_num != self.config.rounds:
                 continue
 
             with open(weight_path, "rb") as f:
@@ -1654,7 +1654,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     for round_number in range(1, config.rounds + 1):
         round_dir = os.path.join(record_base, f"round_{round_number}")
 
-        if config.skip_mid_eval and round_number != config.rounds:
+        if config.skip_eval and round_number != config.rounds:
             continue
 
         if global_model_eval:
