@@ -367,7 +367,7 @@ class FederatedLearningPipeline:
                 f"Client {client_idx} | PERSONALIZED | Acc: {accuracy:.4f} | F1: {f1:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f} | Loss: {test_loss:.4f}"
             )
             print(
-                f"{COLORS.OKGREEN}Client {client_idx}: Acc={accuracy:.4f}, F1={f1:.4f}, Loss={test_loss:.4f}{COLORS.ENDC}"
+                f"{COLORS.OKGREEN}Client {client_idx}: Acc={accuracy:.4f}, F1={f1:.4f}, Precision={precision:.4f}, Recall={recall:.4f}, Loss={test_loss:.4f}{COLORS.ENDC}"
             )
             
             del model, train_dataset, history
@@ -376,7 +376,7 @@ class FederatedLearningPipeline:
         log_timestamp(self.logger, "Independent learning completed")
         print(f"{COLORS.OKGREEN}Independent learning completed!{COLORS.ENDC}")
 
-    _WRAPPER_STRATEGIES = frozenset({'fedora'})
+    _WRAPPER_STRATEGIES = frozenset({'fedmlb', 'fedora'})
 
     def _checkpoint_dir(self) -> str:
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
@@ -711,7 +711,6 @@ class FederatedLearningPipeline:
         del train_dataset, trained_weights
         if reuse_model is None:
             del model
-            tf.keras.backend.clear_session()
         del history
         aggressive_memory_cleanup()
 
@@ -835,7 +834,7 @@ class FederatedLearningPipeline:
             test_loss,
         )
         print(
-            f"{COLORS.OKBLUE}Client {client_id} personalized eval -> Acc={accuracy:.4f}, F1={f1_value:.4f}, Loss={test_loss:.4f}{COLORS.ENDC}"
+            f"{COLORS.OKBLUE}Client {client_id} personalized eval -> Acc={accuracy:.4f}, F1={f1_value:.4f}, Precision={precision:.4f}, Recall={recall:.4f}, Loss={test_loss:.4f}{COLORS.ENDC}"
         )
 
     def _evaluate_global_model(
@@ -883,7 +882,7 @@ class FederatedLearningPipeline:
         class_report = result[7] if len(result) > 7 else ""
 
         print(
-            f"{COLORS.OKGREEN}[GLOBAL] Acc={accuracy:.4f}, Loss={test_loss:.4f}, F1={f1_score_value:.4f}{COLORS.ENDC}"
+            f"{COLORS.OKGREEN}[GLOBAL] Acc={accuracy:.4f}, F1={f1_score_value:.4f}, Precision={precision:.4f}, Recall={recall:.4f}, Loss={test_loss:.4f}{COLORS.ENDC}"
         )
 
         self.logger.info(
@@ -1287,7 +1286,7 @@ class FederatedLearningPipeline:
                 f"Round {round_num} summary - ClientLossAvg: {round_avg_loss:.4f}, GlobalLoss: {test_loss:.4f}"
             )
             print(
-                f"{COLORS.OKGREEN}Round {round_num} completed - Loss: {test_loss:.4f}, Acc: {accuracy:.4f}, F1: {f1_value:.4f}{COLORS.ENDC}"
+                f"{COLORS.OKGREEN}Round {round_num} completed - Loss: {test_loss:.4f}, Acc: {accuracy:.4f}, F1: {f1_value:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}{COLORS.ENDC}"
             )
 
             round_time = time.time() - round_start_time
