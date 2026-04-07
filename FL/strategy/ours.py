@@ -416,9 +416,15 @@ class Ours(DistillationStrategy):
                 logit_shape = (row_bytes_test // (n_classes * 4), n_classes)
 
         if not skip_kd:
-            print(f"\n{COLORS.OKCYAN}Computing consensus logits{COLORS.ENDC}")
-            consensus_logits = compute_consensus_from_files(logit_files, logit_shape)
-            print(f"  Consensus shape: {consensus_logits.shape}")
+            consensus_path = os.path.join(LOGITS_CACHE_DIR, f"r{round_number}_consensus.npy")
+            if os.path.exists(consensus_path):
+                print(f"\n{COLORS.OKCYAN}Loading cached consensus logits{COLORS.ENDC}")
+                consensus_logits = np.load(consensus_path)
+            else:
+                print(f"\n{COLORS.OKCYAN}Computing consensus logits{COLORS.ENDC}")
+                consensus_logits = compute_consensus_from_files(logit_files, logit_shape)
+                print(f"  Consensus shape: {consensus_logits.shape}")
+                np.save(consensus_path, consensus_logits)
 
             for fpath in logit_files:
                 if os.path.exists(fpath):
@@ -427,6 +433,8 @@ class Ours(DistillationStrategy):
             self._run_kd_stage(context, consensus_logits, public_features, first_client=first_kd)
 
             del consensus_logits
+            if os.path.exists(consensus_path):
+                os.remove(consensus_path)
         del public_features
         aggressive_memory_cleanup()
 

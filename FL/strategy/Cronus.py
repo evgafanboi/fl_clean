@@ -325,25 +325,29 @@ class Cronus(DistillationStrategy):
         # ---- robust filter ----
         print(f"\n{COLORS.HEADER}Robust filtering{COLORS.ENDC}")
         eps = getattr(cfg, "robust_epsilon", 0.2)
-        pseudo, max_eig, max_threshold, removed_idx = _robust_filter(
-            pred_files, n_pub, context.num_classes, eps)
-
-        removed_cids = sorted({pred_cids[i] for i in removed_idx})
-        eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
-        thr_s = f"{max_threshold:.6f}" if max_threshold is not None else "N/A"
-        valid_n = int(np.sum(pseudo >= 0))
-        print(f"  epsilon={eps}  max_eig={eig_s}  max_threshold={thr_s}  removed={removed_cids or 'none'}")
-        print(f"  {valid_n}/{n_pub} pseudo-labeled")
-        context.logger.info(
-            "Round %s | RobustFilter | eps=%.4f | max_eig=%s | max_threshold=%s | removed=%s | valid=%d/%d",
-            round_number, eps, eig_s, thr_s, removed_cids or "none", valid_n, n_pub)
-
         pseudo_file = _pseudo_path(round_number)
-        np.save(pseudo_file, pseudo)
-        del pseudo
+        if not os.path.exists(pseudo_file):
+            pseudo, max_eig, max_threshold, removed_idx = _robust_filter(
+                pred_files, n_pub, context.num_classes, eps)
 
-        for f in pred_files:
-            os.remove(f)
+            removed_cids = sorted({pred_cids[i] for i in removed_idx})
+            eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
+            thr_s = f"{max_threshold:.6f}" if max_threshold is not None else "N/A"
+            valid_n = int(np.sum(pseudo >= 0))
+            print(f"  epsilon={eps}  max_eig={eig_s}  max_threshold={thr_s}  removed={removed_cids or 'none'}")
+            print(f"  {valid_n}/{n_pub} pseudo-labeled")
+            context.logger.info(
+                "Round %s | RobustFilter | eps=%.4f | max_eig=%s | max_threshold=%s | removed=%s | valid=%d/%d",
+                round_number, eps, eig_s, thr_s, removed_cids or "none", valid_n, n_pub)
+
+            np.save(pseudo_file, pseudo)
+            del pseudo
+
+            for f in pred_files:
+                if os.path.exists(f):
+                    os.remove(f)
+        else:
+            print(f"  Pseudo labels already exist, skipping robust filter")
         if round_number > 1:
             self._cleanup(round_number - 1)
 
