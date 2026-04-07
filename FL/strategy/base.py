@@ -8,6 +8,7 @@ class DistillationStrategy(ABC):
     """Base class for distillation-based federated learning strategies."""
     name: str = "Base"
     is_distillation_strategy: bool = True
+    has_global_model: bool = False
 
     def __init__(self, config: FDConfig) -> None:
         self.config = config

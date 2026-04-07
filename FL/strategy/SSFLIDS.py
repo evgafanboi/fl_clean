@@ -10,7 +10,7 @@ import tensorflow as tf
 from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
-from ..context import PipelineContext, ModelPool, evaluate_model
+from ..context import PipelineContext, ModelPool
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
@@ -365,51 +365,6 @@ class SSFLIDS(DistillationStrategy):
                 os.remove(os.path.join(SSFLIDS_CACHE_DIR, name))
         aggressive_memory_cleanup()
 
-        round_metrics: Dict[int, Dict[str, float]] = {}
-        is_last_round = round_number == config.rounds
-        do_eval = not getattr(config, "skip_eval", False) or is_last_round
-
-        if do_eval:
-            del model
-            tf.keras.backend.clear_session()
-            aggressive_memory_cleanup()
-            model = create_model(context.input_dim, context.num_classes,
-                                 config.batch_size, model_type=config.model_type)
-            self._model = model
-
-            print(f"\n{COLORS.HEADER}Per-client evaluation{COLORS.ENDC}")
-            all_client_metrics = []
-            for state in context.client_states:
-                model.set_weights(state.data["w"] or context.shared_state["init_w"])
-                metrics = evaluate_model(model, context.test_dataset, context.test_labels)
-                all_client_metrics.append(metrics)
-                round_metrics[state.client_id] = metrics
-                context.logger.info(
-                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                    round_number, state.client_id,
-                    metrics["Acc"], metrics["F1"], metrics["Precision"], metrics["Recall"], metrics["Loss"],
-                )
-                print(
-                    f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
-                )
-
-            avg_metrics = {
-                k: np.mean([m[k] for m in all_client_metrics])
-                for k in ("Acc", "F1", "Precision", "Recall", "Loss")
-            }
-            round_metrics[-1] = avg_metrics
-            print(
-                f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
-                f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
-                f"Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
-            )
-            context.logger.info(
-                "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                round_number, avg_metrics["Acc"], avg_metrics["F1"],
-                avg_metrics["Precision"], avg_metrics["Recall"], avg_metrics["Loss"],
-            )
-
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
         context.logger.info("Round %s completed in %.2fs", round_number, round_time)
@@ -418,9 +373,7 @@ class SSFLIDS(DistillationStrategy):
         if _ckpt:
             clear_mid_round(context, "ssflids")
 
-        return round_metrics
-
-    def finalize(self, context: PipelineContext) -> None:
+        return {}
         tf.keras.backend.clear_session()
         if os.path.isdir(SSFLIDS_CACHE_DIR):
             for name in os.listdir(SSFLIDS_CACHE_DIR):

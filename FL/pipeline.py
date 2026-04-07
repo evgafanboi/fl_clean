@@ -34,11 +34,54 @@ from .decentralized import (
 from .poison_utils import parse_poison_config, get_or_create_poisoned_clients, PoisonedDataLoader
 
 
+def _record_round_weights(log_filename, round_num, global_weights=None, context=None):
+    stem = os.path.splitext(os.path.basename(log_filename))[0]
+    record_dir = os.path.join("temp_weights", f"{stem}_weight_record", f"round_{round_num}")
+    os.makedirs(record_dir, exist_ok=True)
+
+    if global_weights is not None:
+        path = os.path.join(record_dir, "global_weight.bin")
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(global_weights, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+        return
+
+    if context is None:
+        return
+
+    saved_any = False
+    for state in getattr(context, "client_states", []):
+        w = state.data.get("w")
+        if w is not None:
+            path = os.path.join(record_dir, f"client_{state.client_id}_weight.bin")
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump(w, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, path)
+            saved_any = True
+
+    if saved_any or context.model_pool is None:
+        return
+
+    pool = context.model_pool
+    for state in getattr(context, "client_states", []):
+        model = pool.checkout(state.client_id)
+        w = pool._get_weights(model)
+        pool.release(model)
+        path = os.path.join(record_dir, f"client_{state.client_id}_weight.bin")
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(w, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+
+
 def _config_fingerprint(config) -> str:
     import hashlib
     d = dataclasses.asdict(config)
     d.pop('checkpoint', None)
     d.pop('rounds', None)
+    d.pop('skip_mid_eval', None)
     raw = str(sorted(d.items()))
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -76,6 +119,7 @@ class FLConfig:
     threshold: float = 0.3
     decentralized: Optional[str] = None
     checkpoint: int = 0
+    skip_mid_eval: bool = False
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -933,8 +977,6 @@ class FederatedLearningPipeline:
 
         class_names, num_classes = self._load_class_metadata(partition_label, client_count)
         self.class_names = class_names
-        self.eval_batch_size = min(self.config.batch_size, 2048)
-        self.test_dataset = load_test_dataset(self.eval_batch_size, num_classes)
         input_dim = self._determine_input_dim()
 
         paths_list = self._prepare_paths(n_clients, partition_label, client_count)
@@ -988,6 +1030,18 @@ class FederatedLearningPipeline:
                     log_timestamp(self.logger, f"Resuming round {start_round} from client {_resume_client}")
                 else:
                     log_timestamp(self.logger, f"Resumed from checkpoint, starting at round {start_round}")
+
+        # Check if final weight records already exist — skip training entirely
+        stem = os.path.splitext(os.path.basename(self.log_filename))[0]
+        record_base = os.path.join("temp_weights", f"{stem}_weight_record")
+        final_weight = os.path.join(record_base, f"round_{self.config.rounds}", "global_weight.bin")
+        if os.path.exists(final_weight):
+            log_timestamp(self.logger, f"Weight records found (round {self.config.rounds}), skipping training")
+            print(f"{COLORS.OKGREEN}Weight records found up to round {self.config.rounds} — skipping to evaluation{COLORS.ENDC}")
+            self._run_eval_from_records(
+                input_dim, num_classes, class_names, partition_label, excel_filename, record_base,
+            )
+            return
 
         # Special handling for None strategy (independent learning)
         if self.config.strategy == "None":
@@ -1245,49 +1299,12 @@ class FederatedLearningPipeline:
 
             aggressive_memory_cleanup()
 
-            eval_start_time = time.time()
-            metrics = self._evaluate_global_model(
-                latest_weights,
-                input_dim,
-                num_classes,
-                class_names,
-                round_num,
-                partition_label,
-                eval_model=reusable_model,
-            )
-            test_loss, accuracy, f1_value, precision, recall, per_class_metrics, confusion_mat = metrics
-
-            eval_time = time.time() - eval_start_time
-            log_timestamp(self.logger, f"Global eval completed in {eval_time:.2f}s")
-
-            new_row = pd.DataFrame({
-                'Round': [round_num],
-                'Loss': [test_loss],
-                'Accuracy': [accuracy],
-                'F1_Score': [f1_value],
-                'Precision': [precision],
-                'Recall': [recall],
-            })
-            self.results_df = pd.concat([self.results_df, new_row], ignore_index=True)
-
-            if round_num == self.config.rounds and per_class_metrics is not None:
-                create_enhanced_excel_report(
-                    excel_filename,
-                    self.results_df,
-                    per_class_metrics,
-                    class_names,
-                    round_num,
-                    confusion_mat,
-                )
-            else:
-                self.results_df.to_excel(excel_filename, index=False)
-
             round_avg_loss = sum(client_losses) / len(client_losses) if client_losses else 0.0
             self.logger.info(
-                f"Round {round_num} summary - ClientLossAvg: {round_avg_loss:.4f}, GlobalLoss: {test_loss:.4f}"
+                f"Round {round_num} summary - ClientLossAvg: {round_avg_loss:.4f}"
             )
             print(
-                f"{COLORS.OKGREEN}Round {round_num} completed - Loss: {test_loss:.4f}, Acc: {accuracy:.4f}, F1: {f1_value:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}{COLORS.ENDC}"
+                f"{COLORS.OKGREEN}Round {round_num} completed - ClientLossAvg: {round_avg_loss:.4f}{COLORS.ENDC}"
             )
 
             round_time = time.time() - round_start_time
@@ -1303,25 +1320,112 @@ class FederatedLearningPipeline:
                 self._save_checkpoint(round_num, latest_weights, n_clients, round_times,
                                       selected_server=selected_server, ms_prev_scores=ms_prev_scores)
 
+            _record_round_weights(self.log_filename, round_num, global_weights=latest_weights)
+
             aggressive_memory_cleanup()
 
         pipeline_end_time = time.time()
         total_time = pipeline_end_time - pipeline_start_time
         avg_round_time = sum(round_times) / len(round_times) if round_times else 0
 
-        log_timestamp(self.logger, "All rounds completed")
-        self.logger.info(f"Total time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+        log_timestamp(self.logger, "=== TRAINING PHASE COMPLETED ===")
+        self.logger.info(f"Training time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
         self.logger.info(f"Average time per round: {avg_round_time:.2f} seconds")
         self.logger.info(f"Total rounds completed: {len(round_times)}")
 
-        print(f"{COLORS.OKGREEN}Pipeline completed!{COLORS.ENDC}")
-        print(f"{COLORS.OKGREEN}Total time: {total_time:.2f} seconds ({total_time/60:.2f} minutes){COLORS.ENDC}")
+        print(f"{COLORS.OKGREEN}Training phase completed!{COLORS.ENDC}")
+        print(f"{COLORS.OKGREEN}Training time: {total_time:.2f} seconds ({total_time/60:.2f} minutes){COLORS.ENDC}")
         print(f"{COLORS.OKGREEN}Average time per round: {avg_round_time:.2f} seconds{COLORS.ENDC}")
-        print(f"{COLORS.OKCYAN}Results saved to {excel_filename}{COLORS.ENDC}")
 
         if self.config.checkpoint and os.path.isdir(self._checkpoint_dir()):
             shutil.rmtree(self._checkpoint_dir(), ignore_errors=True)
             print(f"{COLORS.OKCYAN}Checkpoint cleaned up{COLORS.ENDC}")
+
+        if reusable_model is not None:
+            del reusable_model
+        tf.keras.backend.clear_session()
+        aggressive_memory_cleanup()
+
+        stem = os.path.splitext(os.path.basename(self.log_filename))[0]
+        record_base = os.path.join("temp_weights", f"{stem}_weight_record")
+        self._run_eval_from_records(
+            input_dim, num_classes, class_names, partition_label, excel_filename, record_base,
+        )
+
+    def _run_eval_from_records(self, input_dim, num_classes, class_names, partition_label, excel_filename, record_base):
+        log_timestamp(self.logger, "=== EVALUATION ===")
+        print(f"\n{COLORS.HEADER}[EVALUATION]{COLORS.ENDC}")
+
+        self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
+        eval_batch_size = min(self.config.batch_size, 2048)
+        test_dataset = load_test_dataset(eval_batch_size, num_classes)
+
+        eval_model = create_model(
+            architecture=self.config.model,
+            input_dim=input_dim,
+            num_classes=num_classes,
+            batch_size=self.config.batch_size,
+            strategy_runtime=self.strategy_runtime,
+            client_id=None,
+        )
+
+        for round_num in range(1, self.config.rounds + 1):
+            weight_path = os.path.join(record_base, f"round_{round_num}", "global_weight.bin")
+            if not os.path.exists(weight_path):
+                self.logger.info(f"Round {round_num} | SKIPPED (no weight record)")
+                print(f"{COLORS.WARNING}Round {round_num}: skipped (no weight record){COLORS.ENDC}")
+                continue
+
+            if self.config.skip_mid_eval and round_num != self.config.rounds:
+                continue
+
+            with open(weight_path, "rb") as f:
+                weights = pickle.load(f)
+            eval_model.set_weights(weights)
+            del weights
+
+            collect_details = (round_num == self.config.rounds)
+            result = evaluate_model_with_metrics(
+                eval_model, test_dataset, num_classes,
+                class_names, round_num, self.config.strategy,
+                partition_label, collect_details=collect_details,
+            )
+            test_loss, accuracy, f1_value, precision, recall = result[:5]
+            per_class_metrics = result[5]
+            confusion_mat = result[6]
+            class_report = result[7] if len(result) > 7 else ""
+
+            self.logger.info(
+                f"Round {round_num} | GLOBAL | Acc: {accuracy:.4f} | F1: {f1_value:.4f} | "
+                f"Precision: {precision:.4f} | Recall: {recall:.4f} | Loss: {test_loss:.4f}"
+            )
+            print(
+                f"{COLORS.OKGREEN}Round {round_num} | Acc={accuracy:.4f}, F1={f1_value:.4f}, "
+                f"Precision={precision:.4f}, Recall={recall:.4f}, Loss={test_loss:.4f}{COLORS.ENDC}"
+            )
+            if class_report and self.detailed_logger is not None:
+                self.detailed_logger.info(f"Round {round_num}\n{class_report}")
+
+            new_row = pd.DataFrame({
+                'Round': [round_num], 'Loss': [test_loss], 'Accuracy': [accuracy],
+                'F1_Score': [f1_value], 'Precision': [precision], 'Recall': [recall],
+            })
+            self.results_df = pd.concat([self.results_df, new_row], ignore_index=True)
+
+            if round_num == self.config.rounds and per_class_metrics is not None:
+                create_enhanced_excel_report(
+                    excel_filename, self.results_df, per_class_metrics,
+                    class_names, round_num, confusion_mat,
+                )
+
+        if not self.results_df.empty:
+            self.results_df.to_excel(excel_filename, index=False)
+
+        del eval_model, test_dataset
+        aggressive_memory_cleanup()
+        log_timestamp(self.logger, "=== SIMULATION COMPLETED ===")
+        print(f"{COLORS.OKCYAN}Results saved to {excel_filename}{COLORS.ENDC}")
+        print(f"{COLORS.OKGREEN}Simulation completed!{COLORS.ENDC}")
 
 
 def run_pipeline(config: FLConfig) -> None:
@@ -1371,9 +1475,7 @@ def run_distillation_pipeline(config, strategy) -> None:
         if restored_count > 0:
             print(f"{COLORS.OKGREEN}Restored {restored_count} partitions for {strategy.name} (no public dataset){COLORS.ENDC}")
     
-    test_dataset = load_test_dataset(config.batch_size, num_classes)
-    test_labels = _extract_labels(test_dataset, num_classes)
-
+    # Defer test data loading to evaluation phase — pass None during training
     model_type = getattr(config, "model_type", "dense")
     model_pool = None
     if getattr(strategy, "use_model_pool", True):
@@ -1407,8 +1509,8 @@ def run_distillation_pipeline(config, strategy) -> None:
         detailed_logger=detailed_logger,
         log_filename=log_filename,
         excel_filename=excel_filename,
-        test_dataset=test_dataset,
-        test_labels=test_labels,
+        test_dataset=None,
+        test_labels=None,
         shared_state={"extra_log_tokens": extra_log_tokens},
         poisoned_clients=poisoned_clients,
         poison_loader=poison_loader,
@@ -1450,6 +1552,25 @@ def run_distillation_pipeline(config, strategy) -> None:
                     context.results = pd.read_pickle(results_path)
                 print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {ckpt_info['round']}) -> starting round {start_round}{COLORS.ENDC}")
     
+    # Check if final weight records already exist — skip training entirely
+    stem = os.path.splitext(os.path.basename(log_filename))[0]
+    record_base = os.path.join("temp_weights", f"{stem}_weight_record")
+    final_round_dir = os.path.join(record_base, f"round_{config.rounds}")
+    _global_model_strategy = getattr(strategy, "has_global_model", False)
+
+    if _global_model_strategy:
+        _final_exists = os.path.exists(os.path.join(final_round_dir, "global_weight.bin"))
+    else:
+        _final_exists = all(
+            os.path.exists(os.path.join(final_round_dir, f"client_{i}_weight.bin"))
+            for i in range(n_clients)
+        )
+    if _final_exists:
+        log_timestamp(logger, f"Weight records found (round {config.rounds}), skipping training")
+        print(f"{COLORS.OKGREEN}Weight records found up to round {config.rounds} — skipping to evaluation{COLORS.ENDC}")
+        _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, _global_model_strategy)
+        return
+
     for round_number in range(start_round, config.rounds + 1):
         logger.info(f"Round {round_number}/{config.rounds}")
         print(f"\n{COLORS.HEADER}Round {round_number}/{config.rounds}{COLORS.ENDC}")
@@ -1489,18 +1610,124 @@ def run_distillation_pipeline(config, strategy) -> None:
             if context.results:
                 pd.to_pickle(context.results, os.path.join(ckpt_dir, "results.pkl"))
             print(f"{COLORS.OKCYAN}Checkpoint saved (round {round_number}) -> {ckpt_dir}{COLORS.ENDC}")
+
+        if _global_model_strategy:
+            global_model = context.shared_state.get("global_model")
+            if global_model is not None:
+                _record_round_weights(log_filename, round_number, global_weights=global_model.get_weights())
+        else:
+            context.record_client_weights(round_number)
     
     strategy.finalize(context)
     
     total_time = context.shared_state.get("pipeline_elapsed_s")
     if total_time is not None:
-        log_timestamp(logger, f"Pipeline completed in {total_time:.2f}s ({total_time/60:.2f}m)")
+        log_timestamp(logger, f"Training phase completed in {total_time:.2f}s ({total_time/60:.2f}m)")
     else:
-        log_timestamp(logger, "Pipeline completed")
+        log_timestamp(logger, "Training phase completed")
 
     if config.checkpoint and os.path.isdir(ckpt_dir):
         shutil.rmtree(ckpt_dir, ignore_errors=True)
         print(f"{COLORS.OKCYAN}Checkpoint cleaned up{COLORS.ENDC}")
+
+    tf.keras.backend.clear_session()
+    aggressive_memory_cleanup()
+
+    stem = os.path.splitext(os.path.basename(log_filename))[0]
+    record_base = os.path.join("temp_weights", f"{stem}_weight_record")
+    _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, _global_model_strategy)
+
+
+def _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, global_model_eval=False):
+    from .context import evaluate_model
+    from .strategy.common import create_model as create_strategy_model
+
+    log_timestamp(logger, "=== EVALUATION ===")
+    print(f"\n{COLORS.HEADER}[EVALUATION]{COLORS.ENDC}")
+
+    context.results = {}
+    test_dataset = load_test_dataset(config.batch_size, num_classes)
+    test_labels = _extract_labels(test_dataset, num_classes)
+
+    eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
+
+    for round_number in range(1, config.rounds + 1):
+        round_dir = os.path.join(record_base, f"round_{round_number}")
+
+        if config.skip_mid_eval and round_number != config.rounds:
+            continue
+
+        if global_model_eval:
+            weight_path = os.path.join(round_dir, "global_weight.bin")
+            if not os.path.exists(weight_path):
+                logger.info(f"Round {round_number} | SKIPPED (no weight record)")
+                print(f"{COLORS.WARNING}Round {round_number}: skipped (no weight record){COLORS.ENDC}")
+                continue
+
+            with open(weight_path, "rb") as _f:
+                weights = pickle.load(_f)
+            eval_model.set_weights(weights)
+            del weights
+
+            metrics = evaluate_model(eval_model, test_dataset, test_labels)
+            round_metrics = {-1: metrics}
+            _record_metrics(context, round_number, round_metrics, excel_filename)
+
+            logger.info(
+                "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                round_number, metrics["Acc"], metrics["F1"],
+                metrics["Precision"], metrics["Recall"], metrics["Loss"],
+            )
+            print(
+                f"{COLORS.OKGREEN}Round {round_number} | Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
+                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+            )
+        else:
+            expected = [os.path.join(round_dir, f"client_{i}_weight.bin") for i in range(n_clients)]
+            if not all(os.path.exists(p) for p in expected):
+                logger.info(f"Round {round_number} | SKIPPED (incomplete weight records)")
+                print(f"{COLORS.WARNING}Round {round_number}: skipped (incomplete weight records){COLORS.ENDC}")
+                continue
+
+            all_client_metrics = []
+            for client_id in range(n_clients):
+                with open(expected[client_id], "rb") as _f:
+                    weights = pickle.load(_f)
+                eval_model.set_weights(weights)
+                del weights
+
+                metrics = evaluate_model(eval_model, test_dataset, test_labels)
+                all_client_metrics.append(metrics)
+                logger.info(
+                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                    round_number, client_id,
+                    metrics["Acc"], metrics["F1"], metrics["Precision"], metrics["Recall"], metrics["Loss"],
+                )
+                print(
+                    f"{COLORS.OKGREEN}Client {client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
+                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+                )
+
+            avg_metrics = {k: np.mean([m[k] for m in all_client_metrics]) for k in ("Acc", "F1", "Precision", "Recall", "Loss")}
+            round_metrics = {i: all_client_metrics[i] for i in range(n_clients)}
+            round_metrics[-1] = avg_metrics
+            _record_metrics(context, round_number, round_metrics, excel_filename)
+
+            logger.info(
+                "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                round_number, avg_metrics["Acc"], avg_metrics["F1"],
+                avg_metrics["Precision"], avg_metrics["Recall"], avg_metrics["Loss"],
+            )
+            print(
+                f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg_metrics['Acc']:.4f}, F1={avg_metrics['F1']:.4f}, "
+                f"Precision={avg_metrics['Precision']:.4f}, Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
+            )
+
+    del eval_model, test_dataset, test_labels
+    aggressive_memory_cleanup()
+    log_timestamp(logger, "=== SIMULATION COMPLETED ===")
+    print(f"{COLORS.OKCYAN}Results saved to {excel_filename}{COLORS.ENDC}")
+    print(f"{COLORS.OKGREEN}Simulation completed!{COLORS.ENDC}")
 
 
 def _extract_labels(dataset: tf.data.Dataset, num_classes: int) -> np.ndarray:

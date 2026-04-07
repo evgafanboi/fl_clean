@@ -10,7 +10,7 @@ import tensorflow as tf
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
-from ..context import PipelineContext, evaluate_model
+from ..context import PipelineContext
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import (
@@ -367,50 +367,6 @@ class Ours(DistillationStrategy):
                     "last_client_idx": client_idx,
                 })
 
-    def _evaluate(self, context, round_number):
-        pool = context.model_pool
-        all_client_metrics = []
-        round_metrics: Dict[int, Dict[str, float]] = {}
-
-        for state in context.client_states:
-            model = pool.checkout(state.client_id)
-            metrics = evaluate_model(model, context.test_dataset, context.test_labels)
-            pool.release(model)
-            all_client_metrics.append(metrics)
-            round_metrics[state.client_id] = metrics
-            context.logger.info(
-                "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                round_number, state.client_id,
-                metrics["Acc"], metrics["F1"], metrics["Precision"], metrics["Recall"], metrics["Loss"],
-            )
-            print(
-                f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
-            )
-            del metrics
-            gc.collect()
-
-        avg_metrics = {
-            "Acc": np.mean([m["Acc"] for m in all_client_metrics]),
-            "F1": np.mean([m["F1"] for m in all_client_metrics]),
-            "Precision": np.mean([m["Precision"] for m in all_client_metrics]),
-            "Recall": np.mean([m["Recall"] for m in all_client_metrics]),
-            "Loss": np.mean([m["Loss"] for m in all_client_metrics]),
-        }
-        round_metrics[-1] = avg_metrics
-
-        print(
-            f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
-            f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
-            f"Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
-        )
-        context.logger.info(
-            "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-            round_number, avg_metrics["Acc"], avg_metrics["F1"],
-            avg_metrics["Precision"], avg_metrics["Recall"], avg_metrics["Loss"],
-        )
-        return round_metrics
-
     def run_round(self, context: PipelineContext, round_number: int) -> Dict[int, Dict[str, float]]:
         round_start = time.time()
         config = context.config
@@ -474,10 +430,6 @@ class Ours(DistillationStrategy):
         del public_features
         aggressive_memory_cleanup()
 
-        is_last_round = round_number == config.rounds
-        do_eval = not getattr(config, "skip_eval", False) or is_last_round
-        round_metrics = self._evaluate(context, round_number) if do_eval else {}
-
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
         context.logger.info("Round %s completed in %.2fs", round_number, round_time)
@@ -486,4 +438,4 @@ class Ours(DistillationStrategy):
         if self._ckpt:
             clear_mid_round(context, "ours")
 
-        return round_metrics
+        return {}

@@ -11,7 +11,7 @@ import tensorflow as tf
 from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
-from ..context import PipelineContext, evaluate_model
+from ..context import PipelineContext
 from ..poison_utils import parse_poison_config, apply_gaussian_noise_scale
 from .base import DistillationStrategy
 from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
@@ -143,6 +143,11 @@ def _save_mid_round(context: PipelineContext, round_number: int,
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, dst)
     print(f"{COLORS.OKCYAN}  Mid-round checkpoint saved (client {last_client_idx}){COLORS.ENDC}")
+
+    for st in context.client_states[:last_client_idx + 1]:
+        w = st.data.get("w")
+        if w is not None:
+            context.record_client_weight(round_number, st.client_id, w)
 
 
 def _load_mid_round(context: PipelineContext, round_number: int):
@@ -345,30 +350,6 @@ class Cronus(DistillationStrategy):
         context.shared_state["pseudo_path"] = pseudo_file
         context.shared_state["pub_X_path"] = pub_X_file
 
-        # ---- evaluation ----
-        metrics: Dict[int, Dict[str, float]] = {}
-        is_last_round = round_number == cfg.rounds
-        do_eval = not getattr(cfg, "skip_eval", False) or is_last_round
-
-        if do_eval:
-            # Fresh model to avoid CuDNN fragmentation from training loop
-            del model
-            tf.keras.backend.clear_session()
-            aggressive_memory_cleanup()
-            model = create_model(context.input_dim, context.num_classes,
-                                 cfg.batch_size, model_type=cfg.model_type)
-            self._model = model
-
-            print(f"\n{COLORS.HEADER}Per-client evaluation{COLORS.ENDC}")
-            for st in context.client_states:
-                model.set_weights(st.data["w"] or context.shared_state["init_w"])
-                ev = evaluate_model(model, context.test_dataset, context.test_labels)
-                metrics[st.client_id] = ev
-                context.logger.info(
-                    "Round %s | Client %s | Acc: %.4f | F1: %.4f",
-                    round_number, st.client_id, ev["Acc"], ev["F1"])
-                print(f"  Client {st.client_id}: Acc={ev['Acc']:.4f} F1={ev['F1']:.4f}")
-
         # Clear mid-round checkpoint now that the round completed successfully
         if getattr(cfg, "checkpoint", 0):
             _clear_mid_round(context)
@@ -378,9 +359,7 @@ class Cronus(DistillationStrategy):
             context.shared_state.get("pipeline_elapsed_s", 0.0) + dt)
         context.logger.info("Round %s completed in %.2fs", round_number, dt)
         print(f"{COLORS.OKCYAN}Round {round_number} done in {dt:.1f}s{COLORS.ENDC}")
-        return metrics
-
-    # ── helpers ────────────────────────────────────────────────────────
+        return {}
 
     @staticmethod
     def _cleanup(rnd: int):

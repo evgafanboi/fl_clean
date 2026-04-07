@@ -8,7 +8,7 @@ import numpy as np
 import tensorflow as tf
 
 from ..colors import COLORS
-from ..context import PipelineContext, evaluate_model
+from ..context import PipelineContext
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
@@ -227,20 +227,7 @@ class Exp1(DistillationStrategy):
             all_stats[state.client_id] = stats
             print(" done")
 
-            metrics = evaluate_model(model, context.test_dataset, context.test_labels)
             pool.checkin(state.client_id, model)
-            all_client_metrics.append(metrics)
-            round_metrics[state.client_id] = metrics
-            context.logger.info(
-                "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                round_number, state.client_id,
-                metrics["Acc"], metrics["F1"], metrics["Precision"], metrics["Recall"], metrics["Loss"],
-            )
-            print(
-                f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, "
-                f"F1={metrics['F1']:.4f}, Precision={metrics['Precision']:.4f}, "
-                f"Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
-            )
 
             gc.collect()
 
@@ -265,23 +252,6 @@ class Exp1(DistillationStrategy):
         print(f"  Global: {len(global_logits)} class logits")
         del all_stats
 
-        print(f"\n{COLORS.OKCYAN}[STEP 3/3] Evaluation{COLORS.ENDC}")
-
-        avg = {
-            k: np.mean([m[k] for m in all_client_metrics])
-            for k in ("Acc", "F1", "Precision", "Recall", "Loss")
-        }
-        round_metrics[-1] = avg
-        print(
-            f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg['Acc']:.4f}, "
-            f"F1={avg['F1']:.4f}, Precision={avg['Precision']:.4f}, "
-            f"Recall={avg['Recall']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
-        )
-        context.logger.info(
-            "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-            round_number, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["Loss"],
-        )
-
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = (
             context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
@@ -292,4 +262,4 @@ class Exp1(DistillationStrategy):
         if _ckpt:
             clear_mid_round(context, "exp1")
 
-        return round_metrics
+        return {}

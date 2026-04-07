@@ -47,7 +47,10 @@ def _ckpt_dir(context: Any) -> str:
 
 
 def save_mid_round(context: Any, tag: str, payload: Dict[str, Any]) -> None:
-    """Atomically write *payload* to ``<ckpt_dir>/<tag>_mid.bin``."""
+    """Atomically write *payload* to ``<ckpt_dir>/<tag>_mid.bin``.
+    
+    Also records client weights for eval replay up to last_client_idx.
+    """
     d = _ckpt_dir(context)
     os.makedirs(d, exist_ok=True)
     tmp = os.path.join(d, f"{tag}_mid.bin.tmp")
@@ -57,6 +60,26 @@ def save_mid_round(context: Any, tag: str, payload: Dict[str, Any]) -> None:
     os.replace(tmp, dst)
     last = payload.get("last_client_idx", "?")
     print(f"{COLORS.OKCYAN}  Mid-round checkpoint saved ({tag}, client {last}){COLORS.ENDC}")
+
+    round_num = payload.get("round")
+    last_idx = payload.get("last_client_idx")
+    if round_num is not None and last_idx is not None:
+        _record_checkpoint_weights(context, round_num, last_idx)
+
+
+def _record_checkpoint_weights(context: Any, round_num: int, last_client_idx: int) -> None:
+    """Record client weights for all completed clients up to last_client_idx."""
+    for st in context.client_states[:last_client_idx + 1]:
+        w = st.data.get("w")
+        if w is not None:
+            context.record_client_weight(round_num, st.client_id, w)
+            continue
+        if context.model_pool is None:
+            continue
+        model = context.model_pool.checkout(st.client_id)
+        w = context.model_pool._get_weights(model)
+        context.model_pool.release(model)
+        context.record_client_weight(round_num, st.client_id, w)
 
 
 def load_mid_round(context: Any, tag: str, round_number: int) -> Optional[Dict[str, Any]]:

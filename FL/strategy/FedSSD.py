@@ -8,7 +8,7 @@ import tensorflow as tf
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
-from ..context import PipelineContext, evaluate_model
+from ..context import PipelineContext
 from ..logging_utils import log_timestamp
 from .base import DistillationStrategy
 from .common import create_model, create_private_dataset, load_public_dataset_from_clients
@@ -154,6 +154,7 @@ def train_with_ssd_loss(
 
 class FedSSD(DistillationStrategy):
     name = "FedSSD"
+    has_global_model = True
 
     def extra_log_tokens(self) -> Dict[str, float]:
         return {"m_max": self.config.m_max}
@@ -256,52 +257,13 @@ class FedSSD(DistillationStrategy):
 
         context.shared_state["global_model"] = global_model
         
-        global_metrics = evaluate_model(global_model, context.test_dataset, context.test_labels)
-        print(
-            f"{COLORS.OKGREEN}Round {round_number} - Global Acc={global_metrics['Acc']:.4f}, "
-            f"F1={global_metrics['F1']:.4f}, Precision={global_metrics['Precision']:.4f}, "
-            f"Recall={global_metrics['Recall']:.4f}, Loss={global_metrics['Loss']:.4f}{COLORS.ENDC}"
-        )
-        context.logger.info(
-            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-            round_number,
-            global_metrics["Acc"],
-            global_metrics["F1"],
-            global_metrics["Precision"],
-            global_metrics["Recall"],
-            global_metrics["Loss"],
-        )
-
-        round_metrics: Dict[int, Dict[str, float]] = {-1: global_metrics}
-        
-        if config.personalized_eval:
-            for idx, state in enumerate(context.client_states):
-                wrapper.set_weights(client_weights[idx])
-                metrics = evaluate_model(wrapper, context.test_dataset, context.test_labels)
-                round_metrics[state.client_id] = metrics
-                round_metrics[state.client_id] = metrics
-                context.logger.info(
-                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                    round_number,
-                    state.client_id,
-                    metrics["Acc"],
-                    metrics["F1"],
-                    metrics["Precision"],
-                    metrics["Recall"],
-                    metrics["Loss"],
-                )
-                print(
-                    f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
-                )
-
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
         
         context.logger.info(
-            f"Round {round_number} summary - GlobalLoss: {global_metrics['Loss']:.4f}"
+            f"Round {round_number} completed"
         )
         log_timestamp(context.logger, f"--- Round {round_number} completed in {round_time:.2f}s ---")
         print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
 
-        return round_metrics
+        return {}

@@ -8,7 +8,7 @@ import tensorflow as tf
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
-from ..context import PipelineContext, evaluate_model
+from ..context import PipelineContext
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
@@ -326,25 +326,7 @@ class FederatedDistillation(DistillationStrategy):
             all_client_logits[state.client_id] = logits
             all_client_counts_for_round[state.client_id] = counts
 
-            metrics = evaluate_model(model, context.test_dataset, context.test_labels)
             pool.checkin(state.client_id, model)
-            all_client_metrics.append(metrics)
-            round_metrics[state.client_id] = metrics
-            context.logger.info(
-                "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                round_number,
-                state.client_id,
-                metrics["Acc"],
-                metrics["F1"],
-                metrics["Precision"],
-                metrics["Recall"],
-                metrics["Loss"],
-            )
-            print(
-                f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, "
-                f"F1={metrics['F1']:.4f}, Precision={metrics['Precision']:.4f}, "
-                f"Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
-            )
 
             del private_dataset
             aggressive_memory_cleanup()
@@ -391,30 +373,6 @@ class FederatedDistillation(DistillationStrategy):
 
         context.shared_state["global_logits"] = new_global_logits
 
-        avg_metrics = {
-            "Acc": np.mean([m["Acc"] for m in all_client_metrics]),
-            "F1": np.mean([m["F1"] for m in all_client_metrics]),
-            "Precision": np.mean([m["Precision"] for m in all_client_metrics]),
-            "Recall": np.mean([m["Recall"] for m in all_client_metrics]),
-            "Loss": np.mean([m["Loss"] for m in all_client_metrics]),
-        }
-        round_metrics[-1] = avg_metrics
-        
-        print(
-            f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
-            f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
-            f"Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
-        )
-        context.logger.info(
-            "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-            round_number,
-            avg_metrics["Acc"],
-            avg_metrics["F1"],
-            avg_metrics["Precision"],
-            avg_metrics["Recall"],
-            avg_metrics["Loss"],
-        )
-
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = (
             context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
@@ -425,4 +383,4 @@ class FederatedDistillation(DistillationStrategy):
         if _ckpt:
             clear_mid_round(context, "fd")
 
-        return round_metrics
+        return {}

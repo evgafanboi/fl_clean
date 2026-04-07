@@ -7,37 +7,12 @@ from typing import Dict, Tuple
 import numpy as np
 import tensorflow as tf
 
-from sklearn.metrics import f1_score, precision_score, recall_score
-
 from ..colors import COLORS
 from ..context import PipelineContext
 from ..memory import aggressive_memory_cleanup
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
-
-
-def _evaluate_model(model_wrapper, test_dataset: tf.data.Dataset, reference_labels: np.ndarray) -> Dict[str, float]:
-    keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
-    all_preds = []
-    for batch_x, _ in test_dataset:
-        preds = keras_model(batch_x, training=False)
-        if isinstance(preds, (list, tuple)):
-            preds = preds[0]
-        all_preds.append(preds.numpy())
-    predictions = np.concatenate(all_preds, axis=0)
-    pred_labels = np.argmax(predictions, axis=1)
-    true_labels = reference_labels[:len(pred_labels)]
-
-    y_true_onehot = tf.keras.utils.to_categorical(true_labels, predictions.shape[1])
-    loss = float(-np.mean(np.sum(y_true_onehot * np.log(np.clip(predictions, 1e-7, 1.0)), axis=1)))
-    return {
-        "Acc": float(np.mean(pred_labels == true_labels)),
-        "F1": float(f1_score(true_labels, pred_labels, average="macro", zero_division=0)),
-        "Precision": float(precision_score(true_labels, pred_labels, average="macro", zero_division=0)),
-        "Recall": float(recall_score(true_labels, pred_labels, average="macro", zero_division=0)),
-        "Loss": loss,
-    }
 
 
 def extract_class_prototypes(
@@ -208,8 +183,6 @@ class FedProto(DistillationStrategy):
         all_client_prototypes: Dict[int, Dict[int, Dict[str, np.ndarray | int]]] = {}
         all_client_metrics = []
         round_metrics: Dict[int, Dict[str, float]] = {}
-        is_last_round = round_number == config.rounds
-        do_eval = not config.skip_eval or is_last_round
         cleanup_interval = getattr(config, 'cleanup_interval', 25)
 
         _ckpt = getattr(config, "checkpoint", 0)
@@ -254,20 +227,6 @@ class FedProto(DistillationStrategy):
             all_client_prototypes[state.client_id] = proto_dict
             del prototypes, supports
 
-            if do_eval:
-                metrics = _evaluate_model(model, context.test_dataset, context.test_labels)
-                all_client_metrics.append(metrics)
-                round_metrics[state.client_id] = metrics
-                context.logger.info(
-                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                    round_number, state.client_id,
-                    metrics["Acc"], metrics["F1"], metrics["Precision"], metrics["Recall"], metrics["Loss"],
-                )
-                print(
-                    f"{COLORS.OKGREEN}Client {state.client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
-                )
-
             pool.checkin(state.client_id, model)
             gc.collect()
 
@@ -289,25 +248,6 @@ class FedProto(DistillationStrategy):
         global_prototypes = aggregate_prototypes(all_client_prototypes, context.num_classes)
         context.shared_state["global_prototypes"] = global_prototypes
         del all_client_prototypes
-
-        if all_client_metrics:
-            avg_metrics = {
-                k: np.mean([m[k] for m in all_client_metrics])
-                for k in ("Acc", "F1", "Precision", "Recall", "Loss")
-            }
-            round_metrics[-1] = avg_metrics
-
-            print(
-                f"{COLORS.OKGREEN}Round {round_number} - Avg Acc={avg_metrics['Acc']:.4f}, "
-                f"F1={avg_metrics['F1']:.4f}, Precision={avg_metrics['Precision']:.4f}, "
-                f"Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
-            )
-            context.logger.info(
-                "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                round_number,
-                avg_metrics["Acc"], avg_metrics["F1"], avg_metrics["Precision"],
-                avg_metrics["Recall"], avg_metrics["Loss"],
-            )
 
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time

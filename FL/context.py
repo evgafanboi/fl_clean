@@ -1,4 +1,5 @@
 import os
+import pickle
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -122,6 +123,32 @@ class PipelineContext:
         self.client_states.append(state)
         self.results.setdefault(client_id, {})
         return state
+
+    def _weight_record_dir(self, round_num: int) -> str:
+        stem = os.path.splitext(os.path.basename(self.log_filename))[0]
+        return os.path.join("temp_weights", f"{stem}_weight_record", f"round_{round_num}")
+
+    def record_client_weight(self, round_num: int, client_id: int, weights) -> None:
+        record_dir = self._weight_record_dir(round_num)
+        os.makedirs(record_dir, exist_ok=True)
+        path = os.path.join(record_dir, f"client_{client_id}_weight.bin")
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(weights, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+
+    def record_client_weights(self, round_num: int) -> None:
+        for st in self.client_states:
+            w = st.data.get("w")
+            if w is not None:
+                self.record_client_weight(round_num, st.client_id, w)
+                continue
+            if self.model_pool is None:
+                continue
+            model = self.model_pool.checkout(st.client_id)
+            w = self.model_pool._get_weights(model)
+            self.model_pool.release(model)
+            self.record_client_weight(round_num, st.client_id, w)
 
 
 def evaluate_model(model: Any, test_dataset: tf.data.Dataset, reference_labels: np.ndarray) -> Dict[str, float]:

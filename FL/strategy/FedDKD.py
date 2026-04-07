@@ -8,7 +8,7 @@ import tensorflow as tf
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
-from ..context import PipelineContext, evaluate_model
+from ..context import PipelineContext
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
@@ -89,6 +89,7 @@ def apply_gradient_update(model, gradients, learning_rate):
 
 class FedDKD(DistillationStrategy):
     name = "FedDKD"
+    has_global_model = True
 
     def __init__(self, config) -> None:
         super().__init__(config)
@@ -266,28 +267,6 @@ class FedDKD(DistillationStrategy):
         
         context.logger.info(f"Completed {self.dkd_steps} DKD steps")
         
-        print(f"\n{COLORS.PURPLE}[GLOBAL EVALUATION]{COLORS.ENDC}")
-        
-        global_metrics = evaluate_model(global_model, context.test_dataset, context.test_labels)
-        
-        print(
-            f"{COLORS.OKGREEN}[GLOBAL MODEL] Acc={global_metrics['Acc']:.4f}, "
-            f"F1={global_metrics['F1']:.4f}, Precision={global_metrics['Precision']:.4f}, "
-            f"Recall={global_metrics['Recall']:.4f}, Loss={global_metrics['Loss']:.4f}{COLORS.ENDC}"
-        )
-        
-        context.logger.info(
-            "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-            round_number,
-            global_metrics["Acc"],
-            global_metrics["F1"],
-            global_metrics["Precision"],
-            global_metrics["Recall"],
-            global_metrics["Loss"],
-        )
-        
-        round_metrics: Dict[int, Dict[str, float]] = {-1: global_metrics}
-        
         round_time = time.time() - round_start
         context.shared_state["pipeline_elapsed_s"] = context.shared_state.get("pipeline_elapsed_s", 0.0) + round_time
         context.logger.info("Round %s completed in %.2fs", round_number, round_time)
@@ -295,4 +274,4 @@ class FedDKD(DistillationStrategy):
         if _ckpt:
             clear_mid_round(context, "feddkd")
         
-        return round_metrics
+        return {}
