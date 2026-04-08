@@ -151,31 +151,22 @@ class PipelineContext:
             self.record_client_weight(round_num, st.client_id, w)
 
 
-def evaluate_model(model: Any, test_dataset: tf.data.Dataset, reference_labels: np.ndarray) -> Dict[str, float]:
+def evaluate_model(model: Any, X_test: np.ndarray, y_labels: np.ndarray,
+                   batch_size: int, num_classes: int) -> Dict[str, float]:
     base = model.base_model if hasattr(model, "base_model") else model
     if hasattr(base, "model"):
         base = base.model
 
-    ce = tf.keras.losses.CategoricalCrossentropy(reduction="none")
-    total_loss = 0.0
-    n_samples = 0
-    pred_parts = []
+    preds = base.predict(X_test, batch_size=batch_size, verbose=0)
+    pred_labels = np.argmax(preds, axis=1).astype(np.int32)
+    y_oh = tf.keras.utils.to_categorical(y_labels, num_classes).astype(np.float32)
+    loss = float(-np.sum(y_oh * np.log(np.clip(preds, 1e-7, 1.0)))) / len(y_labels)
+    del preds, y_oh
 
-    for batch_x, batch_y in test_dataset:
-        preds = base(batch_x, training=False)
-        total_loss += float(tf.reduce_sum(ce(batch_y, preds)))
-        pred_parts.append(tf.argmax(preds, axis=1).numpy())
-        n_samples += int(batch_x.shape[0])
-
-    pred_labels = np.concatenate(pred_parts)
-    del pred_parts
-    true_labels = reference_labels[:len(pred_labels)]
-
-    loss = total_loss / n_samples
-    accuracy = float(np.mean(pred_labels == true_labels))
-    f1 = float(f1_score(true_labels, pred_labels, average="macro", zero_division=0))
-    precision = float(precision_score(true_labels, pred_labels, average="macro", zero_division=0))
-    recall = float(recall_score(true_labels, pred_labels, average="macro", zero_division=0))
+    accuracy = float(np.mean(pred_labels == y_labels))
+    f1 = float(f1_score(y_labels, pred_labels, average="macro", zero_division=0))
+    precision = float(precision_score(y_labels, pred_labels, average="macro", zero_division=0))
+    recall = float(recall_score(y_labels, pred_labels, average="macro", zero_division=0))
 
     return {
         "Acc": accuracy,

@@ -223,7 +223,7 @@ class Ours(DistillationStrategy):
 
     def __init__(self, config) -> None:
         super().__init__(config)
-        self.kd_epochs = 1
+        self.kd_epochs = getattr(config, "kd_epochs", 1)
         self.ce_epochs = config.epochs
 
     def extra_log_tokens(self) -> Dict[str, float]:

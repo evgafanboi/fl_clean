@@ -56,9 +56,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # ours
     parser.add_argument("--ours_ekd_lambda", type=float, default=1.0, help="Lambda weighting L_2nd in EKD (Ours)")
     parser.add_argument("--kd", type=str, default="ekd", choices=["ekd", "abkd"], help="KD method for Ours (ekd or abkd)")
-    parser.add_argument("--ab_alpha", type=float, default=1.0, help="Alpha for ABKD divergence")
+    parser.add_argument("--ab_alpha", type=float, default=0.7, help="Alpha for ABKD divergence")
     parser.add_argument("--ab_beta", type=float, default=0.0, help="Beta for ABKD divergence")
     parser.add_argument("--ours_temperature", type=float, default=4.0, help="Temperature for ABKD softmax scaling")
+    parser.add_argument("--kd_epochs", type=int, default=2, help="KD epochs for stage 1 in Ours strategy")
 
     # distillation hyperparameters
     parser.add_argument("--gamma", type=float, default=1.0, help="Distillation temperature / weighting factor (for FD, FedMD, FedProto)")
@@ -72,6 +73,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_rounds", type=int, default=3, help="Training rounds for discriminator-based methods")
     parser.add_argument("--batch_size", type=int, default=8192, help="Minibatch size for local training")
     parser.add_argument("--epochs", type=int, default=5, help="Local epochs per round")
+
     parser.add_argument("--weights_cache_dir", type=str, default="temp_weights", help="Directory to cache client weights")
 
     # experimental info computation

@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
@@ -50,7 +51,8 @@ def setup_logger(
     resume: bool = False,
 ) -> Tuple[logging.Logger, str, logging.Logger]:
     """Configure loggers for the federated learning pipeline. Supports both FL and FD style arguments."""
-    Path(results_dir).mkdir(parents=True, exist_ok=True)
+    if not os.path.islink(results_dir):
+        Path(results_dir).mkdir(parents=True, exist_ok=True)
     
     # Handle both FL and FD argument styles
     name = algorithm_name or strategy_name

@@ -1646,8 +1646,9 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     print(f"\n{COLORS.HEADER}[EVALUATION]{COLORS.ENDC}")
 
     context.results = {}
-    test_dataset = load_test_dataset(config.batch_size, num_classes)
-    test_labels = _extract_labels(test_dataset, num_classes)
+    X_test = np.load("data/X_test.npy").astype(np.float32)
+    y_test = np.load("data/y_test.npy")
+    test_labels = y_test.astype(np.int32).ravel() if y_test.ndim == 1 or y_test.shape[1] == 1 else np.argmax(y_test, axis=1).astype(np.int32)
 
     eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
 
@@ -1669,7 +1670,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
             eval_model.set_weights(weights)
             del weights
 
-            metrics = evaluate_model(eval_model, test_dataset, test_labels)
+            metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
             round_metrics = {-1: metrics}
             _record_metrics(context, round_number, round_metrics, excel_filename)
 
@@ -1696,7 +1697,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                 eval_model.set_weights(weights)
                 del weights
 
-                metrics = evaluate_model(eval_model, test_dataset, test_labels)
+                metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
                 all_client_metrics.append(metrics)
                 logger.info(
                     "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
@@ -1723,7 +1724,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                 f"Precision={avg_metrics['Precision']:.4f}, Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
             )
 
-    del eval_model, test_dataset, test_labels
+    del eval_model, X_test, y_test, test_labels
     aggressive_memory_cleanup()
     log_timestamp(logger, "=== SIMULATION COMPLETED ===")
     print(f"{COLORS.OKCYAN}Results saved to {excel_filename}{COLORS.ENDC}")

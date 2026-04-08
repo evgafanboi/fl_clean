@@ -22,7 +22,7 @@ def evaluate_model_streaming(
     num_classes: int,
     batch_size: int,
     is_gru: bool = False,
-    chunk_size: int = 50000
+    chunk_size: int = 2_000_000
 ):
     X_test = np.load(X_path, mmap_mode='r')
     y_test = np.load(y_path, mmap_mode='r')

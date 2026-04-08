@@ -62,6 +62,7 @@ python -m FL --n_clients <> --partition_type <> --strategy <> --rounds <>
 - `DeepFed`[10]: FedAvg using Paillier Homomorphic Encryption (expect extremely long runtime)
 
 **Federated distillation**:
+- `Ours`: `--kd ekd|abkd`: chooses either `EKD` (**Evidential Knowledge Distillation**[24]) or `ABKD` (**$\alpha-\beta$ Knowledge Distillation**[23]). `--ekd_lambda`: controls `EKD`'s $\lambda$, as in $\mathcal{L}_{EKD} = \mathcal{L}_{1st} + \lambda \mathcal{L}_{2nd}$ (not the weight $\lambda$ used to compute $\alpha$ from $exp(z)$, that value is hard-coded). `--ab_alpha` and `--ab_beta` controls `ABKD`'s $\alpha$ and $\beta$, as in the $\alpha$-$\beta$ divergence. `--kd_epochs` controls the first stage's knowledge distillation epochs, default `2`. Stage 2 infers from the global argument `--epochs` (default `5`). `--ours_temperature` controls `ABKD` distillation temperature, default `4`.
 - `Cronus`[8]: Byzantine-robust semi supervised federated distillation, `--robust_epsilon` with value equal or higher than byzantine ratio.
 - `FedDKD`[11]: Federated Decentralized Knowledge Distillation (deprecated)
 - `FedProto`[12]: FedProto `--gamma`, default `1.0`, controls the $\lambda$ in its loss function $\mathcal{L}=\mathcal{L}_S + \lambda\mathcal{L}_R$, where $\mathcal{L}_S$ is defined as the standard supervised loss (cross-entropy in our context) and $\mathcal{L}_R$ is the prototype-distance loss, the distance function is not specific and our code implement L1 distance.
@@ -160,6 +161,9 @@ python -m FCIL --n_clients <> --partition_type <> --strategy <> --rounds <> --ci
 - [20] Wu, Yue, et al. "Large scale incremental learning." Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. 2019.
 - [21] Aljundi, Rahaf, et al. "Memory aware synapses: Learning what (not) to forget." Proceedings of the European conference on computer vision (ECCV). 2018.
 - [22] Zhu, Fei, et al. "Prototype augmentation and self-supervision for incremental learning." Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. 2021.
+- [23] Wang, Guanghui, et al. "ABKD: Pursuing a proper allocation of the probability mass in knowledge distillation via $\alpha $-$\beta $-divergence." arXiv preprint arXiv:2505.04560 (2025).
+- [24] Xiang, Liangyu, Junyu Gao, and Changsheng Xu. "Evidential Knowledge Distillation." Proceedings of the IEEE/CVF International Conference on Computer Vision. 2025.
+Xiang, L., Gao, J., & Xu, C. (2025). Evidential Knowledg
 #### Classifer based on:
 - [18] Kasongo, Sydney Mambwe. "A deep learning technique for intrusion detection system using a Recurrent Neural Networks based framework." Computer Communications 199 (2023): 113-125.
 
