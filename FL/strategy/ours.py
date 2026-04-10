@@ -7,12 +7,14 @@ from typing import Dict, List
 
 import numpy as np
 import tensorflow as tf
+from tqdm import tqdm
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
+from .robust_filter import RobustFilter
 from .common import (
     create_model,
     create_private_dataset,
@@ -64,7 +66,46 @@ def compute_consensus_from_files(logit_files: List[str], shape: tuple) -> np.nda
     return consensus
 
 
-# ── Stage 1: KD (pure distillation, no CE) ──────────────────────────────────
+def compute_robust_consensus_from_files(
+    logit_files: List[str], shape: tuple, robust_filter: RobustFilter,
+) -> tuple:
+    n_clients = len(logit_files)
+    n_samples, n_classes = shape
+    consensus = np.zeros(shape, dtype=np.float32)
+    # edit chunk_rows to increase filtering speed at the cost of mem
+    chunk_rows = 50_000
+    row_bytes = n_classes * 4
+    max_eig = None
+    max_threshold = None
+    removal_counts = {c: 0 for c in range(n_clients)}
+
+    handles = [open(fpath, "rb") for fpath in logit_files]
+    pbar = tqdm(total=n_samples, desc="Robust consensus", unit="sample")
+    for offset in range(0, n_samples, chunk_rows):
+        rows = min(chunk_rows, n_samples - offset)
+        client_chunks = [
+            np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes)
+            for h in handles
+        ]
+        S_batch = np.stack(client_chunks, axis=1)  # (rows, n_clients, n_classes)
+        means, batch_max_eig, removal_delta, batch_max_thr = robust_filter.compute_robust_mean_batch(S_batch)
+        consensus[offset : offset + rows] = means
+        if batch_max_eig is not None and (max_eig is None or batch_max_eig > max_eig):
+            max_eig = batch_max_eig
+        if batch_max_thr is not None and (max_threshold is None or batch_max_thr > max_threshold):
+            max_threshold = batch_max_thr
+        for c in range(n_clients):
+            removal_counts[c] += int(removal_delta[c])
+        pbar.update(rows)
+        del client_chunks, S_batch, means
+    pbar.close()
+    for h in handles:
+        h.close()
+
+    return consensus, max_eig, max_threshold, removal_counts
+
+
+# ── Stage 2: KD (pure distillation, no CE) ──────────────────────────────────
 
 def ekd_stage(
     model_wrapper, consensus_logits: np.ndarray, public_features: np.ndarray,
@@ -207,7 +248,7 @@ def abkd_stage(
             print(f"    ABKD epoch {epoch + 1}/{epochs} — loss {epoch_loss / batches:.4f}")
 
 
-# ── Stage 2: CE training on private data ─────────────────────────────────────
+# ── Stage 1: CE training on private data ─────────────────────────────────────
 
 def ce_stage(model_wrapper, private_dataset: tf.data.Dataset, epochs: int) -> None:
     print(f"    CE training for {epochs} epochs")
@@ -225,9 +266,13 @@ class Ours(DistillationStrategy):
         super().__init__(config)
         self.kd_epochs = getattr(config, "kd_epochs", 1)
         self.ce_epochs = config.epochs
+        self.robust_filter = RobustFilter(
+            epsilon=config.robust_epsilon, preset="logits",
+        )
 
     def extra_log_tokens(self) -> Dict[str, float]:
-        tokens = {"kd": self.config.ours_kd, "ekd_lambda": self.config.ours_ekd_lambda}
+        tokens = {"kd": self.config.ours_kd, "ekd_lambda": self.config.ours_ekd_lambda,
+                  "eps": self.config.robust_epsilon}
         if self.config.ours_kd == "abkd":
             tokens.update({"ab_alpha": self.config.ab_alpha, "ab_beta": self.config.ab_beta, "temperature": self.config.ours_temperature})
         return tokens
@@ -310,7 +355,7 @@ class Ours(DistillationStrategy):
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_client:
                 continue
-            print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 1 ({kd_method.upper()}){COLORS.ENDC}")
+            print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 2 ({kd_method.upper()}){COLORS.ENDC}")
             model = pool.checkout(state.client_id)
             if kd_method == "abkd":
                 abkd_stage(
@@ -345,7 +390,7 @@ class Ours(DistillationStrategy):
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_client:
                 continue
-            print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 2 (CE){COLORS.ENDC}")
+            print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 1 (CE){COLORS.ENDC}")
             model = pool.checkout(state.client_id)
             private_dataset = create_private_dataset(
                 state.paths["train_X"], state.paths["train_y"],
@@ -421,9 +466,19 @@ class Ours(DistillationStrategy):
                 print(f"\n{COLORS.OKCYAN}Loading cached consensus logits{COLORS.ENDC}")
                 consensus_logits = np.load(consensus_path)
             else:
-                print(f"\n{COLORS.OKCYAN}Computing consensus logits{COLORS.ENDC}")
-                consensus_logits = compute_consensus_from_files(logit_files, logit_shape)
+                print(f"\n{COLORS.OKCYAN}Computing robust consensus logits (eps={config.robust_epsilon}){COLORS.ENDC}")
+                consensus_logits, max_eig, max_threshold, removal_counts = compute_robust_consensus_from_files(
+                    logit_files, logit_shape, self.robust_filter,
+                )
                 print(f"  Consensus shape: {consensus_logits.shape}")
+                eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
+                thr_s = f"{max_threshold:.6f}" if max_threshold is not None else "N/A"
+                top_removed = sorted(removal_counts.items(), key=lambda x: -x[1])
+                print(f"  max_eig={eig_s}  max_threshold={thr_s}  top removals (client_idx: count): {top_removed[:5]}")
+                context.logger.info(
+                    "Round %s | RobustConsensus | max_eig=%s | max_threshold=%s | removals=%s",
+                    round_number, eig_s, thr_s, top_removed,
+                )
                 np.save(consensus_path, consensus_logits)
 
             for fpath in logit_files:
