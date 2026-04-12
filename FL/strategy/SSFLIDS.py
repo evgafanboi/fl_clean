@@ -125,9 +125,7 @@ def hard_label_vote(pred_files: List[str], num_classes: int) -> np.ndarray:
             valid = labels_chunk < num_classes
             rows = np.arange(e - s)
             label_votes[rows[valid], labels_chunk[valid]] += 1
-        no_votes = label_votes.sum(axis=1) == 0
         voted[s:e] = np.argmax(label_votes, axis=1)
-        voted[s:e][no_votes] = -1
         del label_votes
 
     del mmaps
