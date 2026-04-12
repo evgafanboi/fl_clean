@@ -82,6 +82,7 @@ def _config_fingerprint(config) -> str:
     d.pop('checkpoint', None)
     d.pop('rounds', None)
     d.pop('skip_eval', None)
+    d.pop('fresh_run', None)
     raw = str(sorted(d.items()))
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -120,6 +121,7 @@ class FLConfig:
     decentralized: Optional[str] = None
     checkpoint: int = 0
     skip_eval: bool = False
+    fresh_run: bool = False
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -1034,10 +1036,16 @@ class FederatedLearningPipeline:
         # Check if final weight records already exist — skip training entirely
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
         record_base = os.path.join("temp_weights", f"{stem}_weight_record")
-        final_weight = os.path.join(record_base, f"round_{self.config.rounds}", "global_weight.bin")
-        if os.path.exists(final_weight):
-            log_timestamp(self.logger, f"Weight records found (round {self.config.rounds}), skipping training")
-            print(f"{COLORS.OKGREEN}Weight records found up to round {self.config.rounds} — skipping to evaluation{COLORS.ENDC}")
+        if self.config.fresh_run and os.path.isdir(record_base):
+            shutil.rmtree(record_base)
+        _highest_record = next(
+            (r for r in range(self.config.rounds, 0, -1)
+             if os.path.exists(os.path.join(record_base, f"round_{r}", "global_weight.bin"))),
+            None,
+        )
+        if _highest_record is not None:
+            log_timestamp(self.logger, f"Weight records found (highest round {_highest_record}), skipping to evaluation")
+            print(f"{COLORS.OKGREEN}Weight records found up to round {_highest_record} — skipping to evaluation{COLORS.ENDC}")
             self._run_eval_from_records(
                 input_dim, num_classes, class_names, partition_label, excel_filename, record_base,
             )
@@ -1356,9 +1364,25 @@ class FederatedLearningPipeline:
         log_timestamp(self.logger, "=== EVALUATION ===")
         print(f"\n{COLORS.HEADER}[EVALUATION]{COLORS.ENDC}")
 
-        self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
+        # Resume: load any previously completed rounds
+        evaluated_rounds: set = set()
+        if os.path.exists(excel_filename):
+            try:
+                try:
+                    existing_df = pd.read_excel(excel_filename, sheet_name='Overall_Metrics')
+                except Exception:
+                    existing_df = pd.read_excel(excel_filename, sheet_name=0)
+                evaluated_rounds = set(existing_df['Round'].astype(int).tolist())
+                self.results_df = existing_df
+                print(f"{COLORS.OKCYAN}Resuming eval — {len(evaluated_rounds)} rounds already done{COLORS.ENDC}")
+            except Exception:
+                self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
+        else:
+            self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
+
         eval_batch_size = min(self.config.batch_size, 2048)
         test_dataset = load_test_dataset(eval_batch_size, num_classes)
+        y_true_cache = np.load("data/y_test.npy").astype(np.int32).ravel()
 
         eval_model = create_model(
             architecture=self.config.model,
@@ -1369,14 +1393,22 @@ class FederatedLearningPipeline:
             client_id=None,
         )
 
-        for round_num in range(1, self.config.rounds + 1):
+        final_per_class_metrics = None
+        final_confusion_mat = None
+
+        # evaluate in reverse order (last round -> first round)
+        for round_num in range(self.config.rounds, 0, -1):
+            if round_num in evaluated_rounds:
+                print(f"{COLORS.OKCYAN}Round {round_num}: already evaluated, skipping{COLORS.ENDC}")
+                continue
+
+            if self.config.skip_eval and round_num != self.config.rounds:
+                continue
+
             weight_path = os.path.join(record_base, f"round_{round_num}", "global_weight.bin")
             if not os.path.exists(weight_path):
                 self.logger.info(f"Round {round_num} | SKIPPED (no weight record)")
                 print(f"{COLORS.WARNING}Round {round_num}: skipped (no weight record){COLORS.ENDC}")
-                continue
-
-            if self.config.skip_eval and round_num != self.config.rounds:
                 continue
 
             with open(weight_path, "rb") as f:
@@ -1389,6 +1421,7 @@ class FederatedLearningPipeline:
                 eval_model, test_dataset, num_classes,
                 class_names, round_num, self.config.strategy,
                 partition_label, collect_details=collect_details,
+                y_true_cache=y_true_cache,
             )
             test_loss, accuracy, f1_value, precision, recall = result[:5]
             per_class_metrics = result[5]
@@ -1413,15 +1446,22 @@ class FederatedLearningPipeline:
             self.results_df = pd.concat([self.results_df, new_row], ignore_index=True)
 
             if round_num == self.config.rounds and per_class_metrics is not None:
-                create_enhanced_excel_report(
-                    excel_filename, self.results_df, per_class_metrics,
-                    class_names, round_num, confusion_mat,
-                )
+                final_per_class_metrics = per_class_metrics
+                final_confusion_mat = confusion_mat
 
-        if not self.results_df.empty:
+            # Incremental save for resume capability
             self.results_df.to_excel(excel_filename, index=False)
 
-        del eval_model, test_dataset
+        if not self.results_df.empty:
+            if final_per_class_metrics is not None:
+                create_enhanced_excel_report(
+                    excel_filename, self.results_df, final_per_class_metrics,
+                    class_names, self.config.rounds, final_confusion_mat,
+                )
+            else:
+                self.results_df.to_excel(excel_filename, index=False)
+
+        del eval_model, test_dataset, y_true_cache
         aggressive_memory_cleanup()
         log_timestamp(self.logger, "=== SIMULATION COMPLETED ===")
         print(f"{COLORS.OKCYAN}Results saved to {excel_filename}{COLORS.ENDC}")
@@ -1555,6 +1595,8 @@ def run_distillation_pipeline(config, strategy) -> None:
     # Check if final weight records already exist — skip training entirely
     stem = os.path.splitext(os.path.basename(log_filename))[0]
     record_base = os.path.join("temp_weights", f"{stem}_weight_record")
+    if config.fresh_run and os.path.isdir(record_base):
+        shutil.rmtree(record_base)
     final_round_dir = os.path.join(record_base, f"round_{config.rounds}")
     _global_model_strategy = getattr(strategy, "has_global_model", False)
 

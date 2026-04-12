@@ -50,12 +50,13 @@ def _predict_to_file(model, X: np.ndarray, num_classes: int,
 def _robust_filter(pred_files: List[str], n_samples: int,
                    num_classes: int, epsilon: float,
                    ) -> Tuple[np.ndarray, Optional[float], Optional[float], Set[int]]:
-    rf = RobustFilter(epsilon=epsilon, tau=0.1, preset="logits")
+    rf = RobustFilter(epsilon=epsilon)
     row_bytes = num_classes * 4
-    CHUNK = 200_000
+    CHUNK = 50_000
     pseudo = np.empty(n_samples, dtype=np.int32)
     max_eig: Optional[float] = None
-    max_threshold: Optional[float] = None
+    max_ratio: Optional[float] = None
+    removal_counts = np.zeros(len(pred_files), dtype=np.int64)
     removed: Set[int] = set()
     handles = [open(f, "rb") for f in pred_files]
     boundary = 1.0 / num_classes
@@ -63,27 +64,31 @@ def _robust_filter(pred_files: List[str], n_samples: int,
     pbar = tqdm(total=n_samples, desc="Robust filter", unit="sample")
     while off < n_samples:
         rows = min(CHUNK, n_samples - off)
-        chunks = np.stack([
+        S_batch = np.stack([
             np.frombuffer(h.read(rows * row_bytes), dtype=np.float32)
               .reshape(rows, num_classes)
             for h in handles
-        ])
-        for i in range(rows):
-            mean, eig, rm, thr = rf.compute_robust_mean_debug(chunks[:, i, :])
-            if eig is not None and (max_eig is None or eig > max_eig):
-                max_eig = eig
-            if thr is not None and (max_threshold is None or thr > max_threshold):
-                max_threshold = thr
-            removed.update(rm)
-            pseudo[off + i] = int(np.argmax(mean)) if float(np.max(mean)) > boundary else -1
+        ], axis=1)
+        means, batch_eig, batch_removals, batch_ratio = rf.compute_robust_mean_batch(S_batch)
+        if batch_eig is not None and (max_eig is None or batch_eig > max_eig):
+            max_eig = batch_eig
+        if batch_ratio is not None and (max_ratio is None or batch_ratio > max_ratio):
+            max_ratio = batch_ratio
+        removal_counts += batch_removals
+        for c in range(len(pred_files)):
+            if batch_removals[c] > 0:
+                removed.add(c)
+        max_vals = means.max(axis=1)
+        labels = means.argmax(axis=1).astype(np.int32)
+        labels[max_vals <= boundary] = -1
+        pseudo[off : off + rows] = labels
         pbar.update(rows)
         off += rows
+        del S_batch, means
     pbar.close()
     for h in handles:
         h.close()
-    if max_threshold is None:
-        max_threshold = rf.threshold(epsilon, num_classes)
-    return pseudo, max_eig, max_threshold, removed
+    return pseudo, max_eig, max_ratio, removed
 
 
 # ── merged dataset (round 2+) ─────────────────────────────────────────
@@ -327,18 +332,18 @@ class Cronus(DistillationStrategy):
         eps = getattr(cfg, "robust_epsilon", 0.2)
         pseudo_file = _pseudo_path(round_number)
         if not os.path.exists(pseudo_file):
-            pseudo, max_eig, max_threshold, removed_idx = _robust_filter(
+            pseudo, max_eig, max_ratio, removed_idx = _robust_filter(
                 pred_files, n_pub, context.num_classes, eps)
 
             removed_cids = sorted({pred_cids[i] for i in removed_idx})
             eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
-            thr_s = f"{max_threshold:.6f}" if max_threshold is not None else "N/A"
+            ratio_s = f"{max_ratio:.4f}" if max_ratio is not None else "N/A"
             valid_n = int(np.sum(pseudo >= 0))
-            print(f"  epsilon={eps}  max_eig={eig_s}  max_threshold={thr_s}  removed={removed_cids or 'none'}")
+            print(f"  epsilon={eps}  max_eig={eig_s}  max_ratio={ratio_s}  removed={removed_cids or 'none'}")
             print(f"  {valid_n}/{n_pub} pseudo-labeled")
             context.logger.info(
-                "Round %s | RobustFilter | eps=%.4f | max_eig=%s | max_threshold=%s | removed=%s | valid=%d/%d",
-                round_number, eps, eig_s, thr_s, removed_cids or "none", valid_n, n_pub)
+                "Round %s | RobustFilter | eps=%.4f | max_eig=%s | max_ratio=%s | removed=%s | valid=%d/%d",
+                round_number, eps, eig_s, ratio_s, removed_cids or "none", valid_n, n_pub)
 
             np.save(pseudo_file, pseudo)
             del pseudo

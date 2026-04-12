@@ -125,7 +125,9 @@ def hard_label_vote(pred_files: List[str], num_classes: int) -> np.ndarray:
             valid = labels_chunk < num_classes
             rows = np.arange(e - s)
             label_votes[rows[valid], labels_chunk[valid]] += 1
+        no_votes = label_votes.sum(axis=1) == 0
         voted[s:e] = np.argmax(label_votes, axis=1)
+        voted[s:e][no_votes] = -1
         del label_votes
 
     del mmaps
@@ -315,11 +317,15 @@ class SSFLIDS(DistillationStrategy):
 
         pub_X = np.array(np.load(pub_X_path, mmap_mode="r"), dtype=np.float32)
         pseudo_y = np.array(np.load(pseudo_y_path, mmap_mode="r"), dtype=np.int32)
+        valid_mask = pseudo_y >= 0
+        pub_X = pub_X[valid_mask]
+        pseudo_y = pseudo_y[valid_mask]
+        print(f"  Pseudo-labeled samples: {len(pseudo_y)} / {int(valid_mask.size)} ({100*len(pseudo_y)/max(valid_mask.size,1):.1f}%)")
         y_cat = tf.keras.utils.to_categorical(pseudo_y, context.num_classes).astype(np.float32)
         perm = np.random.permutation(len(pub_X))
         public_ds = (tf.data.Dataset.from_tensor_slices((pub_X[perm], y_cat[perm]))
                      .batch(config.batch_size).prefetch(tf.data.AUTOTUNE))
-        del pub_X, pseudo_y, y_cat, perm
+        del pub_X, pseudo_y, y_cat, perm, valid_mask
 
         for s2_idx, state in enumerate(context.client_states):
             if s2_idx < first_s2:
@@ -333,11 +339,14 @@ class SSFLIDS(DistillationStrategy):
                 self._model = model
                 pub_X = np.array(np.load(pub_X_path, mmap_mode="r"), dtype=np.float32)
                 pseudo_y_arr = np.array(np.load(pseudo_y_path, mmap_mode="r"), dtype=np.int32)
+                valid_mask = pseudo_y_arr >= 0
+                pub_X = pub_X[valid_mask]
+                pseudo_y_arr = pseudo_y_arr[valid_mask]
                 y_cat = tf.keras.utils.to_categorical(pseudo_y_arr, context.num_classes).astype(np.float32)
                 p = np.random.permutation(len(pub_X))
                 public_ds = (tf.data.Dataset.from_tensor_slices((pub_X[p], y_cat[p]))
                              .batch(config.batch_size).prefetch(tf.data.AUTOTUNE))
-                del pub_X, pseudo_y_arr, y_cat, p
+                del pub_X, pseudo_y_arr, y_cat, p, valid_mask
 
             model.set_weights(state.data["w"])
             print(f"Client {state.client_id}: training on pseudo-labeled public data")

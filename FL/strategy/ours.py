@@ -76,7 +76,7 @@ def compute_robust_consensus_from_files(
     chunk_rows = 50_000
     row_bytes = n_classes * 4
     max_eig = None
-    max_threshold = None
+    max_ratio = None
     removal_counts = {c: 0 for c in range(n_clients)}
 
     handles = [open(fpath, "rb") for fpath in logit_files]
@@ -88,12 +88,12 @@ def compute_robust_consensus_from_files(
             for h in handles
         ]
         S_batch = np.stack(client_chunks, axis=1)  # (rows, n_clients, n_classes)
-        means, batch_max_eig, removal_delta, batch_max_thr = robust_filter.compute_robust_mean_batch(S_batch)
+        means, batch_max_eig, removal_delta, batch_max_ratio = robust_filter.compute_robust_mean_batch(S_batch)
         consensus[offset : offset + rows] = means
         if batch_max_eig is not None and (max_eig is None or batch_max_eig > max_eig):
             max_eig = batch_max_eig
-        if batch_max_thr is not None and (max_threshold is None or batch_max_thr > max_threshold):
-            max_threshold = batch_max_thr
+        if batch_max_ratio is not None and (max_ratio is None or batch_max_ratio > max_ratio):
+            max_ratio = batch_max_ratio
         for c in range(n_clients):
             removal_counts[c] += int(removal_delta[c])
         pbar.update(rows)
@@ -102,7 +102,7 @@ def compute_robust_consensus_from_files(
     for h in handles:
         h.close()
 
-    return consensus, max_eig, max_threshold, removal_counts
+    return consensus, max_eig, max_ratio, removal_counts
 
 
 # ── Stage 2: KD (pure distillation, no CE) ──────────────────────────────────
@@ -267,7 +267,7 @@ class Ours(DistillationStrategy):
         self.kd_epochs = getattr(config, "kd_epochs", 1)
         self.ce_epochs = config.epochs
         self.robust_filter = RobustFilter(
-            epsilon=config.robust_epsilon, preset="logits",
+            epsilon=config.robust_epsilon,
         )
 
     def extra_log_tokens(self) -> Dict[str, float]:
@@ -343,6 +343,13 @@ class Ours(DistillationStrategy):
                     "last_client_idx": client_idx,
                     "logit_files": logit_files,
                 })
+
+        # If all clients were already done (checkpoint resume), derive shape
+        # from the first recovered file so callers never receive None.
+        if logit_shape is None and logit_files:
+            n_classes = context.num_classes
+            row_bytes = os.path.getsize(logit_files[0])
+            logit_shape = (row_bytes // (n_classes * 4), n_classes)
 
         return logit_files, logit_shape
 
@@ -455,10 +462,17 @@ class Ours(DistillationStrategy):
             logit_files, logit_shape = self._generate_logits(context, public_features, first_client=first_logit)
         else:
             logit_files = saved_logit_files or []
+            logit_shape = None
             if logit_files:
                 row_bytes_test = os.path.getsize(logit_files[0])
                 n_classes = context.num_classes
                 logit_shape = (row_bytes_test // (n_classes * 4), n_classes)
+
+        if logit_shape is None:
+            raise RuntimeError(
+                "logit_shape is None — no logit files were produced or recovered. "
+                "Check that client logit .bin files exist in the cache directory."
+            )
 
         if not skip_kd:
             consensus_path = os.path.join(LOGITS_CACHE_DIR, f"r{round_number}_consensus.npy")
@@ -467,17 +481,17 @@ class Ours(DistillationStrategy):
                 consensus_logits = np.load(consensus_path)
             else:
                 print(f"\n{COLORS.OKCYAN}Computing robust consensus logits (eps={config.robust_epsilon}){COLORS.ENDC}")
-                consensus_logits, max_eig, max_threshold, removal_counts = compute_robust_consensus_from_files(
+                consensus_logits, max_eig, max_ratio, removal_counts = compute_robust_consensus_from_files(
                     logit_files, logit_shape, self.robust_filter,
                 )
                 print(f"  Consensus shape: {consensus_logits.shape}")
                 eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
-                thr_s = f"{max_threshold:.6f}" if max_threshold is not None else "N/A"
+                ratio_s = f"{max_ratio:.4f}" if max_ratio is not None else "N/A"
                 top_removed = sorted(removal_counts.items(), key=lambda x: -x[1])
-                print(f"  max_eig={eig_s}  max_threshold={thr_s}  top removals (client_idx: count): {top_removed[:5]}")
+                print(f"  max_eig={eig_s}  max_ratio={ratio_s}  top removals (client_idx: count): {top_removed[:5]}")
                 context.logger.info(
-                    "Round %s | RobustConsensus | max_eig=%s | max_threshold=%s | removals=%s",
-                    round_number, eig_s, thr_s, top_removed,
+                    "Round %s | RobustConsensus | max_eig=%s | max_ratio=%s | removals=%s",
+                    round_number, eig_s, ratio_s, top_removed,
                 )
                 np.save(consensus_path, consensus_logits)
 

@@ -94,35 +94,33 @@ def evaluate_model_with_metrics(
     strategy_name: Optional[str] = None,
     partition_type: Optional[str] = None,
     collect_details: bool = True,
+    y_true_cache: Optional[np.ndarray] = None,
 ):
     base_model = model.base_model if hasattr(model, 'base_model') else model
     if hasattr(base_model, 'model'):
         base_model = base_model.model
 
-    ce = tf.keras.losses.CategoricalCrossentropy(reduction="none")
-    total_loss = 0.0
-    n_samples = 0
-    y_pred_parts = []
-    y_true_parts = []
+    y_pred_proba = base_model.predict(test_dataset, verbose=0)
+    y_pred = np.argmax(y_pred_proba, axis=1)
 
-    for batch_x, batch_y in test_dataset:
-        preds = base_model(batch_x, training=False)
-        batch_loss = ce(batch_y, preds).numpy()
-        total_loss += float(np.sum(batch_loss))
-        y_pred_parts.append(np.argmax(preds.numpy(), axis=1))
-        b = batch_y.numpy()
-        if len(b.shape) > 1 and b.shape[1] > 1:
-            y_true_parts.append(np.argmax(b, axis=1))
-        else:
-            y_true_parts.append(b.astype(int))
-        n_samples += int(batch_x.shape[0])
+    if y_true_cache is not None:
+        y_true = y_true_cache
+    else:
+        y_true_parts = []
+        for _, batch_y in test_dataset:
+            b = batch_y.numpy()
+            if len(b.shape) > 1 and b.shape[1] > 1:
+                y_true_parts.append(np.argmax(b, axis=1))
+            else:
+                y_true_parts.append(b.astype(int))
+        y_true = np.concatenate(y_true_parts)
+        del y_true_parts
 
-    y_pred = np.concatenate(y_pred_parts)
-    y_true = np.concatenate(y_true_parts)
-    del y_pred_parts, y_true_parts
+    y_true_oh = np.eye(num_classes, dtype=np.float32)[y_true]
+    test_loss = float(-np.mean(np.sum(y_true_oh * np.log(np.clip(y_pred_proba, 1e-7, 1.0)), axis=1)))
+    del y_true_oh
 
-    test_loss = total_loss / n_samples
-    accuracy = np.mean(y_true == y_pred)
+    accuracy = float(np.mean(y_true == y_pred))
 
     f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
     precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
@@ -148,7 +146,9 @@ def evaluate_model_with_metrics(
             zero_division=0
         )
 
-    del y_pred, y_true
+    del y_pred, y_pred_proba
+    if y_true_cache is None:
+        del y_true
     gc.collect()
 
     return (

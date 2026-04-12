@@ -33,6 +33,7 @@ class FDConfig:
     checkpoint: int = 0
     cleanup_interval: int = 10
     skip_eval: bool = False
+    fresh_run: bool = False
 
     def to_algorithm_params(self) -> dict:
         return {
