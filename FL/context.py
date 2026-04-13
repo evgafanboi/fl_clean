@@ -1,5 +1,6 @@
 import os
 import pickle
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -7,7 +8,7 @@ import numpy as np
 import tensorflow as tf
 from sklearn.metrics import f1_score, precision_score, recall_score
 
-MODEL_WEIGHTS_DIR = os.path.join("temp_weights", "model_weights")
+MODEL_WEIGHTS_DIR = os.path.join(tempfile.gettempdir(), "fl_model_weights")
 
 
 class ModelPool:
@@ -138,7 +139,11 @@ class PipelineContext:
         os.replace(tmp, path)
 
     def record_client_weights(self, round_num: int) -> None:
+        record_dir = self._weight_record_dir(round_num)
         for st in self.client_states:
+            path = os.path.join(record_dir, f"client_{st.client_id}_weight.bin")
+            if os.path.exists(path):
+                continue
             w = st.data.get("w")
             if w is not None:
                 self.record_client_weight(round_num, st.client_id, w)

@@ -468,14 +468,13 @@ class Ours(DistillationStrategy):
                 n_classes = context.num_classes
                 logit_shape = (row_bytes_test // (n_classes * 4), n_classes)
 
-        if logit_shape is None:
-            raise RuntimeError(
-                "logit_shape is None — no logit files were produced or recovered. "
-                "Check that client logit .bin files exist in the cache directory."
-            )
-
         if not skip_kd:
             consensus_path = os.path.join(LOGITS_CACHE_DIR, f"r{round_number}_consensus.npy")
+            if logit_shape is None and not os.path.exists(consensus_path):
+                raise RuntimeError(
+                    "logit_shape is None — no logit files were produced or recovered. "
+                    "Check that client logit .bin files exist in the cache directory."
+                )
             if os.path.exists(consensus_path):
                 print(f"\n{COLORS.OKCYAN}Loading cached consensus logits{COLORS.ENDC}")
                 consensus_logits = np.load(consensus_path)
