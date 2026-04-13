@@ -5,14 +5,18 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 import numpy as np
-import tensorflow as tf
 from sklearn.metrics import f1_score, precision_score, recall_score
+from .backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 
 MODEL_WEIGHTS_DIR = os.path.join(tempfile.gettempdir(), "fl_model_weights")
 
 
 class ModelPool:
     def __init__(self, pool_size, factory_fn, weights_dir=MODEL_WEIGHTS_DIR, in_memory=False):
+        from .backend import use_tf
+        self._use_tf = use_tf()
         self.weights_dir = weights_dir
         self.in_memory = in_memory
         self._factory_fn = factory_fn
@@ -27,8 +31,13 @@ class ModelPool:
             for f in os.listdir(weights_dir):
                 os.remove(os.path.join(weights_dir, f))
         os.makedirs(weights_dir, exist_ok=True)
-        self._init_path = os.path.join(weights_dir, "_init.weights.h5")
-        self._keras_model(self._available[0]).save_weights(self._init_path)
+        if self._use_tf:
+            self._init_path = os.path.join(weights_dir, "_init.weights.h5")
+            self._keras_model(self._available[0]).save_weights(self._init_path)
+        else:
+            self._init_path = os.path.join(weights_dir, "_init.pkl")
+            with open(self._init_path, 'wb') as _f:
+                pickle.dump(self._available[0].get_weights(), _f, protocol=pickle.HIGHEST_PROTOCOL)
 
     @staticmethod
     def _keras_model(model):
@@ -52,7 +61,8 @@ class ModelPool:
 
     def _path(self, client_id, tag=""):
         suffix = f"_{tag}" if tag else ""
-        return os.path.join(self.weights_dir, f"c{client_id}{suffix}.weights.h5")
+        ext = ".weights.h5" if self._use_tf else ".pkl"
+        return os.path.join(self.weights_dir, f"c{client_id}{suffix}{ext}")
 
     def checkout(self, client_id, tag=""):
         model = self._available.pop()
@@ -63,7 +73,11 @@ class ModelPool:
 
         path = self._path(client_id, tag)
         weights_path = path if os.path.exists(path) else self._init_path
-        self._keras_model(model).load_weights(weights_path)
+        if self._use_tf:
+            self._keras_model(model).load_weights(weights_path)
+        else:
+            with open(weights_path, 'rb') as _f:
+                model.set_weights(pickle.load(_f))
         return model
 
     def checkin(self, client_id, model, tag=""):
@@ -72,7 +86,11 @@ class ModelPool:
             self._available.append(model)
             return
 
-        self._keras_model(model).save_weights(self._path(client_id, tag))
+        if self._use_tf:
+            self._keras_model(model).save_weights(self._path(client_id, tag))
+        else:
+            with open(self._path(client_id, tag), 'wb') as _f:
+                pickle.dump(model.get_weights(), _f, protocol=pickle.HIGHEST_PROTOCOL)
         self._available.append(model)
 
     def release(self, model):
@@ -82,7 +100,11 @@ class ModelPool:
         if self.in_memory:
             self._weights_cache[(client_id, tag)] = self._clone_weights(self._get_weights(model))
             return
-        self._keras_model(model).save_weights(self._path(client_id, tag))
+        if self._use_tf:
+            self._keras_model(model).save_weights(self._path(client_id, tag))
+        else:
+            with open(self._path(client_id, tag), 'wb') as _f:
+                pickle.dump(model.get_weights(), _f, protocol=pickle.HIGHEST_PROTOCOL)
 
     def refresh(self):
         """Recreate pool models after tf.keras.backend.clear_session()."""
@@ -110,7 +132,7 @@ class PipelineContext:
     detailed_logger: Any
     log_filename: str
     excel_filename: str
-    test_dataset: tf.data.Dataset
+    test_dataset: Any
     test_labels: np.ndarray
     results: Dict[int, Dict[str, float]] = field(default_factory=dict)
     client_states: List[ClientState] = field(default_factory=list)
@@ -164,7 +186,8 @@ def evaluate_model(model: Any, X_test: np.ndarray, y_labels: np.ndarray,
 
     preds = base.predict(X_test, batch_size=batch_size, verbose=0)
     pred_labels = np.argmax(preds, axis=1).astype(np.int32)
-    y_oh = tf.keras.utils.to_categorical(y_labels, num_classes).astype(np.float32)
+    y_oh = np.zeros((len(y_labels), num_classes), dtype=np.float32)
+    y_oh[np.arange(len(y_labels)), y_labels] = 1.0
     loss = float(-np.sum(y_oh * np.log(np.clip(preds, 1e-7, 1.0)))) / len(y_labels)
     del preds, y_oh
 

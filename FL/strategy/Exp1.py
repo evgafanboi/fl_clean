@@ -5,13 +5,39 @@ import time
 from typing import Dict, Tuple
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 
 from ..colors import COLORS
 from ..context import PipelineContext
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
+
+
+def _train_step_pt(net, opt, X_b, y_b, gl_t, hl_t, lam, T, dev):
+    import torch
+    import torch.nn.functional as F
+    y_labels = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
+    logits = net(X_b, return_logits=True)
+    ce = F.cross_entropy(logits, y_labels)
+    mask = hl_t[y_labels]
+    kl = torch.tensor(0.0, device=dev)
+    if mask.any():
+        v_logits = logits[mask]
+        v_targets = gl_t[y_labels][mask]
+        kl = F.kl_div(
+            F.log_softmax(v_logits / T, dim=-1),
+            F.softmax(v_targets / T, dim=-1),
+            reduction='batchmean',
+        ) * (T * T)
+    loss = ce + lam * kl
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+    opt.step()
+    return loss.item(), ce.item(), kl.item()
 
 
 def compute_client_logits(
@@ -76,6 +102,12 @@ class Exp1(DistillationStrategy):
         }
 
     def _build_training_infra(self, context: PipelineContext):
+        if not _use_tf():
+            self._shared_wrapper = create_model(
+                context.input_dim, context.num_classes, context.config.batch_size,
+                model_type=context.config.model_type,
+            )
+            return
         self._shared_wrapper = create_model(context.input_dim, context.num_classes, context.config.batch_size)
         keras_model = self._shared_wrapper.model if hasattr(self._shared_wrapper, 'model') else self._shared_wrapper
         self._shared_keras = keras_model
@@ -153,8 +185,15 @@ class Exp1(DistillationStrategy):
             for c, l in global_logits.items():
                 gl_arr[c] = l
                 hl_arr[c] = True
-            self._gl_var.assign(gl_arr)
-            self._hl_var.assign(hl_arr)
+            if _use_tf():
+                self._gl_var.assign(gl_arr)
+                self._hl_var.assign(hl_arr)
+            else:
+                import torch
+                from ..backend import get_torch_device
+                dev = get_torch_device()
+                self._gl_t = torch.from_numpy(gl_arr).to(dev)
+                self._hl_t = torch.from_numpy(hl_arr).to(dev)
 
         print(f"\n{COLORS.OKCYAN}[STEP 1/3] Local training{COLORS.ENDC}")
         pool = context.model_pool
@@ -191,33 +230,61 @@ class Exp1(DistillationStrategy):
                 model.fit(dataset, epochs=config.epochs)
                 del dataset
             else:
-                client_keras = model.model if hasattr(model, 'model') else model
-                self._shared_keras.set_weights(client_keras.get_weights())
+                if not _use_tf():
+                    self._shared_wrapper.set_weights(model.get_weights())
+                    dataset = create_private_dataset(
+                        state.paths["train_X"], state.paths["train_y"],
+                        context.input_dim, context.num_classes, config.batch_size,
+                        poison_loader=poison_loader,
+                    )
+                    net = self._shared_wrapper.nn
+                    opt = self._shared_wrapper.optimizer
+                    dev = self._gl_t.device
+                    net.to(dev); net.train()
+                    T = config.exp1_temperature
+                    lam = config.exp1_lambda
+                    print(f"    [KLD] Training ({config.epochs} epochs)")
+                    for epoch in range(config.epochs):
+                        e_loss = e_ce = e_kl = 0.0
+                        n_batches = 0
+                        for X_batch, y_batch in dataset:
+                            X_batch = X_batch.to(dev, non_blocking=True)
+                            y_batch = y_batch.to(dev, non_blocking=True)
+                            loss, ce, kl = _train_step_pt(net, opt, X_batch, y_batch, self._gl_t, self._hl_t, lam, T, dev)
+                            e_loss += loss; e_ce += ce; e_kl += kl
+                            n_batches += 1
+                        if n_batches > 0:
+                            print(f"      Epoch {epoch+1}/{config.epochs} - Loss: {e_loss/n_batches:.4f} (CE: {e_ce/n_batches:.4f}, KL: {e_kl/n_batches:.4f})")
+                    del dataset
+                    model.set_weights(self._shared_wrapper.get_weights())
+                else:
+                    client_keras = model.model if hasattr(model, 'model') else model
+                    self._shared_keras.set_weights(client_keras.get_weights())
 
-                dataset = create_private_dataset(
-                    state.paths["train_X"], state.paths["train_y"],
-                    context.input_dim, context.num_classes, config.batch_size,
-                    poison_loader=poison_loader,
-                )
+                    dataset = create_private_dataset(
+                        state.paths["train_X"], state.paths["train_y"],
+                        context.input_dim, context.num_classes, config.batch_size,
+                        poison_loader=poison_loader,
+                    )
 
-                print(f"    [KLD] Training ({config.epochs} epochs)")
-                for epoch in range(config.epochs):
-                    e_loss = e_ce = e_kl = 0.0
-                    n_batches = 0
-                    for X_batch, y_batch in dataset:
-                        loss, ce, kl = self._train_step(X_batch, y_batch)
-                        e_loss += float(loss)
-                        e_ce += float(ce)
-                        e_kl += float(kl)
-                        n_batches += 1
-                    if n_batches > 0:
-                        print(
-                            f"      Epoch {epoch+1}/{config.epochs} - Loss: {e_loss/n_batches:.4f} "
-                            f"(CE: {e_ce/n_batches:.4f}, KL: {e_kl/n_batches:.4f})"
-                        )
-                del dataset
+                    print(f"    [KLD] Training ({config.epochs} epochs)")
+                    for epoch in range(config.epochs):
+                        e_loss = e_ce = e_kl = 0.0
+                        n_batches = 0
+                        for X_batch, y_batch in dataset:
+                            loss, ce, kl = self._train_step(X_batch, y_batch)
+                            e_loss += float(loss)
+                            e_ce += float(ce)
+                            e_kl += float(kl)
+                            n_batches += 1
+                        if n_batches > 0:
+                            print(
+                                f"      Epoch {epoch+1}/{config.epochs} - Loss: {e_loss/n_batches:.4f} "
+                                f"(CE: {e_ce/n_batches:.4f}, KL: {e_kl/n_batches:.4f})"
+                            )
+                    del dataset
 
-                client_keras.set_weights(self._shared_keras.get_weights())
+                    client_keras.set_weights(self._shared_keras.get_weights())
 
             print(f"  Client {state.client_id}...", end="", flush=True)
             stats = compute_client_logits(

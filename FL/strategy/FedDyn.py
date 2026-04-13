@@ -1,6 +1,49 @@
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 from .FedAvg import FedAvg
+
+
+def _train_client_pt(model, dataset, epochs, alpha, grad_L, global_weights):
+    import torch
+    import torch.nn.functional as F
+    from ..backend import get_torch_device
+    dev = get_torch_device()
+    net = model.nn
+    net.to(dev)
+    net.train()
+    dyn_opt = torch.optim.SGD(net.parameters(), lr=0.01)
+    sd_keys = list(net.state_dict().keys())
+    gw_map = {k: torch.from_numpy(np.array(global_weights[i], dtype=np.float32)).to(dev)
+              for i, k in enumerate(sd_keys) if i < len(global_weights)}
+    gl_map = {k: torch.from_numpy(np.array(grad_L[i], dtype=np.float32)).to(dev)
+              for i, k in enumerate(sd_keys) if i < len(grad_L)}
+    total_loss, n_batches = 0.0, 0
+    for _ in range(epochs):
+        for X, y in dataset:
+            X = X.to(dev, non_blocking=True)
+            y = y.to(dev, non_blocking=True)
+            if y.ndim > 1:
+                y = y.argmax(dim=1)
+            dyn_opt.zero_grad(set_to_none=True)
+            logits = net(X, return_logits=True)
+            ce = F.cross_entropy(logits, y)
+            lin = torch.tensor(0.0, device=dev)
+            quad = torch.tensor(0.0, device=dev)
+            for name, param in net.named_parameters():
+                if param.requires_grad:
+                    if name in gl_map:
+                        lin = lin + (param * gl_map[name]).sum()
+                    if name in gw_map:
+                        quad = quad + (param - gw_map[name]).pow(2).sum()
+            loss = ce - lin + (alpha / 2.0) * quad
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+            dyn_opt.step()
+            total_loss += loss.item()
+            n_batches += 1
+    return total_loss / max(n_batches, 1)
 
 
 class FedDyn(FedAvg):
@@ -115,6 +158,10 @@ class FedDyn(FedAvg):
         return self.alpha
 
     def train_client(self, model, dataset, epochs, client_id=None, global_weights=None):
+        if not _use_tf():
+            template = model.get_weights()
+            grad_L = self.get_grad_L_for_client(client_id, template)
+            return _train_client_pt(model, dataset, epochs, self.alpha, grad_L, global_weights)
         keras_model = model.model if hasattr(model, 'model') else model
         all_weights = keras_model.weights
         trainable = keras_model.trainable_variables

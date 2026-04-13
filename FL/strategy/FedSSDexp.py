@@ -6,7 +6,9 @@ Aggregates M_class values directly instead of confusion matrices
 """
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 from typing import List, Dict
 from sklearn.metrics import confusion_matrix
 from .FedSSD import train_with_ssd_loss

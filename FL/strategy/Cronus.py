@@ -6,7 +6,9 @@ import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 
 from ..colors import COLORS
 from ..data_utils import create_client_dataset
@@ -95,25 +97,34 @@ def _robust_filter(pred_files: List[str], n_samples: int,
 
 def _make_merged_dataset(priv_X_path, priv_y_path, pub_X_path, pseudo_y_path,
                          input_dim, num_classes, batch_size, poison_loader=None):
+    from ..backend import use_tf
     priv_X = np.array(np.load(priv_X_path, mmap_mode="r"), dtype=np.float32)
     priv_y = np.array(np.load(priv_y_path, mmap_mode="r"), dtype=np.int32)
     if poison_loader:
         priv_y = poison_loader.poison_labels(priv_y)
-    priv_y = tf.keras.utils.to_categorical(priv_y, num_classes).astype(np.float32)
+    priv_y_oh = np.zeros((len(priv_y), num_classes), dtype=np.float32)
+    priv_y_oh[np.arange(len(priv_y)), priv_y] = 1.0
 
     pseudo = np.array(np.load(pseudo_y_path, mmap_mode="r"), dtype=np.int32)
     valid = pseudo >= 0
     pub_X = np.array(np.load(pub_X_path, mmap_mode="r")[valid], dtype=np.float32)
-    pub_y = tf.keras.utils.to_categorical(pseudo[valid], num_classes).astype(np.float32)
+    pub_y_oh = np.zeros((int(valid.sum()), num_classes), dtype=np.float32)
+    pub_y_oh[np.arange(int(valid.sum())), pseudo[valid]] = 1.0
     del pseudo
 
     X = np.concatenate([priv_X, pub_X])
-    y = np.concatenate([priv_y, pub_y])
-    del priv_X, priv_y, pub_X, pub_y
+    y = np.concatenate([priv_y_oh, pub_y_oh])
+    del priv_X, priv_y_oh, pub_X, pub_y_oh
     perm = np.random.permutation(len(X))
     X, y = X[perm], y[perm]
     del perm
 
+    if not use_tf():
+        import torch
+        from torch.utils.data import DataLoader, TensorDataset
+        ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
+        return DataLoader(ds, batch_size=batch_size, shuffle=False,
+                          pin_memory=torch.cuda.is_available(), num_workers=0)
     return (tf.data.Dataset.from_tensor_slices((X, y))
               .batch(batch_size).prefetch(tf.data.AUTOTUNE))
 
@@ -201,7 +212,8 @@ class Cronus(DistillationStrategy):
         context.shared_state["n_public"] = pub_X.shape[0]
         del pub_X
 
-        tf.keras.backend.clear_session()
+        from ..memory import clear_session
+        clear_session()
         reusable = create_model(context.input_dim, context.num_classes,
                                 cfg.batch_size, model_type=cfg.model_type)
         init_w = reusable.get_weights()
@@ -228,7 +240,8 @@ class Cronus(DistillationStrategy):
         # Round-boundary refresh
         if round_number > 1:
             del model
-            tf.keras.backend.clear_session()
+            from ..memory import clear_session
+            clear_session()
             aggressive_memory_cleanup()
             model = create_model(context.input_dim, context.num_classes,
                                  cfg.batch_size, model_type=cfg.model_type)
@@ -276,7 +289,8 @@ class Cronus(DistillationStrategy):
             # Periodic refresh to defrag GPU memory (same as FedAvg)
             if idx > 0 and idx % _REFRESH_EVERY == 0:
                 del model
-                tf.keras.backend.clear_session()
+                from ..memory import clear_session
+                clear_session()
                 aggressive_memory_cleanup()
                 model = create_model(context.input_dim, context.num_classes,
                                      cfg.batch_size, model_type=cfg.model_type)
@@ -378,6 +392,7 @@ class Cronus(DistillationStrategy):
 
     def finalize(self, context: PipelineContext) -> None:
         del self._model
-        tf.keras.backend.clear_session()
+        from ..memory import clear_session
+        clear_session()
         for name in os.listdir(CACHE_DIR):
             os.remove(os.path.join(CACHE_DIR, name))

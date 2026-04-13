@@ -91,6 +91,7 @@ python3 -m FL --n_clients 10 --partition_type iid-500 --strategy FedSSD
 - `--rounds`: Communication rounds (default: 10)
 - `--epochs`: Local epochs per round (default: 5)
 - `--model`: default `dense` (MLP), `{gru, dcblstm}` (RNN-GRU[18], DCNNBiLSTM[19]).
+- **$\triangle$ IMPORTANT**: `--use_tf`: uses **Tensorflow** (for older architecture). Tensorflow was the original backend and will have better stability. If not added, the current default backend **PyTorch** takes place.
 
 
 **Outputs**:

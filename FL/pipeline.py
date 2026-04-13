@@ -9,8 +9,11 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 from sklearn.metrics import f1_score, precision_score, recall_score
+
+from .backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 
 from .aggregators import StrategyRuntime, build_strategy
 from .colors import COLORS
@@ -23,9 +26,9 @@ from .data_utils import (
     setup_paths,
 )
 from .evaluation import create_enhanced_excel_report, evaluate_model_with_metrics
-from .gpu import configure_gpu_memory
+from .gpu import configure_gpu_memory, configure_gpu
 from .logging_utils import log_timestamp, setup_logger
-from .memory import aggressive_memory_cleanup
+from .memory import aggressive_memory_cleanup, clear_session
 from .model_factory import create_model
 from .decentralized import (
     braintorrent_select_server, log_braintorrent_selection,
@@ -208,7 +211,8 @@ class FederatedLearningPipeline:
 
     def _extract_weight_matrices(self, model):
         """Extract weight matrices from Dense layers for frequency aggregation"""
-        # Handle wrapper classes (e.g., DenseModel)
+        if not _use_tf():
+            return {}
         keras_model = model.model if hasattr(model, 'model') else model
         
         weight_matrices = {}
@@ -358,7 +362,7 @@ class FederatedLearningPipeline:
         log_timestamp(self.logger, f"Independent learning: {total_epochs} total epochs per client")
         
         for client_idx in range(n_clients):
-            tf.keras.backend.clear_session()
+            clear_session()
             print(f"\n{COLORS.BOLD}Client {client_idx}{COLORS.ENDC}")
             log_timestamp(self.logger, f"Client {client_idx} training started")
             
@@ -633,7 +637,7 @@ class FederatedLearningPipeline:
         if reuse_model is not None:
             model = reuse_model
         else:
-            tf.keras.backend.clear_session()
+            clear_session()
             model = create_model(
                 architecture=self.config.model,
                 input_dim=input_dim,
@@ -710,17 +714,20 @@ class FederatedLearningPipeline:
             )
             history = None
         else:
-            history = model.fit(
-                train_dataset,
-                epochs=self.config.epochs,
-                callbacks=[
+            callbacks = []
+            if _use_tf():
+                callbacks.append(
                     tf.keras.callbacks.EarlyStopping(
                         monitor='loss',
                         patience=3,
                         restore_best_weights=True,
                         verbose=1
                     )
-                ],
+                )
+            history = model.fit(
+                train_dataset,
+                epochs=self.config.epochs,
+                callbacks=callbacks if callbacks else None,
                 verbose=2,
             )
             loss = float(history.history.get("loss", [0.0])[-1])
@@ -808,12 +815,13 @@ class FederatedLearningPipeline:
             all_public_y.append(np.load(os.path.join(partition_path, f"client_{client_idx}_y_public.npy")))
         combined_X = np.concatenate(all_public_X, axis=0).astype(np.float32)
         combined_y = np.concatenate(all_public_y, axis=0)
-        combined_y = tf.keras.utils.to_categorical(combined_y.astype(np.int32), num_classes).astype(np.float32)
-        self._root_dataset_cache = (combined_X, combined_y)
+        y_oh = np.zeros((len(combined_y), num_classes), dtype=np.float32)
+        y_oh[np.arange(len(combined_y)), combined_y.astype(np.int32)] = 1.0
+        self._root_dataset_cache = (combined_X, y_oh)
         return self._root_dataset_cache
 
     def _train_server_on_root_dataset(self, current_weights, input_dim, num_classes):
-        tf.keras.backend.clear_session()
+        clear_session()
         
         model = create_model(
             architecture=self.config.model,
@@ -829,8 +837,16 @@ class FederatedLearningPipeline:
         
         combined_X, combined_y = self._get_root_dataset(num_classes)
         
-        root_dataset = tf.data.Dataset.from_tensor_slices((combined_X, combined_y))
-        root_dataset = root_dataset.batch(self.config.batch_size).prefetch(tf.data.AUTOTUNE)
+        root_dataset = None
+        if _use_tf():
+            root_dataset = (tf.data.Dataset.from_tensor_slices((combined_X, combined_y))
+                            .batch(self.config.batch_size).prefetch(tf.data.AUTOTUNE))
+        else:
+            import torch
+            from torch.utils.data import DataLoader, TensorDataset
+            ds = TensorDataset(torch.from_numpy(combined_X), torch.from_numpy(combined_y))
+            root_dataset = DataLoader(ds, batch_size=self.config.batch_size, shuffle=False,
+                                      pin_memory=torch.cuda.is_available(), num_workers=0)
         
         print(f"  [SERVER] Training on root dataset ({len(combined_X)} samples) for {self.config.root_iterations} iterations")
         
@@ -895,7 +911,7 @@ class FederatedLearningPipeline:
     ):
         created_model = eval_model is None
         if created_model:
-            tf.keras.backend.clear_session()
+            clear_session()
             eval_model = create_model(
                 architecture=self.config.model,
                 input_dim=input_dim,
@@ -944,7 +960,7 @@ class FederatedLearningPipeline:
         return test_loss, accuracy, f1_score_value, precision, recall, per_class_metrics, confusion_mat
 
     def run(self):
-        configure_gpu_memory()
+        configure_gpu()
         if not os.path.islink(self.config.weights_cache_dir):
             os.makedirs(self.config.weights_cache_dir, exist_ok=True)
 
@@ -1131,8 +1147,8 @@ class FederatedLearningPipeline:
                         batch_X = np.array(X_train[start_idx:end_idx], dtype=np.float32)
                         batch_y = np.array(y_train[start_idx:end_idx], dtype=np.int32)
                         
-                        predictions = keras_model(batch_X, training=False)
-                        pred_labels = tf.argmax(predictions, axis=1).numpy()
+                        predictions = global_model_for_mclass.predict(batch_X, batch_size=self.config.batch_size)
+                        pred_labels = np.argmax(predictions, axis=1)
                         true_labels = batch_y if len(batch_y.shape) == 1 else np.argmax(batch_y, axis=1)
                         
                         np.add.at(cm, (true_labels, pred_labels), 1)
@@ -1166,7 +1182,7 @@ class FederatedLearningPipeline:
             if (can_reuse and reusable_model is not None
                     and round_num > start_round):
                 del reusable_model
-                tf.keras.backend.clear_session()
+                clear_session()
                 aggressive_memory_cleanup()
                 reusable_model = create_model(
                     architecture=self.config.model,
@@ -1205,7 +1221,7 @@ class FederatedLearningPipeline:
                 if (can_reuse and reusable_model is not None
                         and client_idx > 0 and client_idx % _REFRESH_EVERY == 0):
                     del reusable_model
-                    tf.keras.backend.clear_session()
+                    clear_session()
                     aggressive_memory_cleanup()
                     reusable_model = create_model(
                         architecture=self.config.model,
@@ -1351,7 +1367,7 @@ class FederatedLearningPipeline:
 
         if reusable_model is not None:
             del reusable_model
-        tf.keras.backend.clear_session()
+        clear_session()
         aggressive_memory_cleanup()
 
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
@@ -1474,6 +1490,7 @@ def run_pipeline(config: FLConfig) -> None:
 
 
 def run_distillation_pipeline(config, strategy) -> None:
+    configure_gpu()
     from .config import FDConfig
     from .context import evaluate_model, ModelPool
     from .strategy.common import create_model as create_strategy_model
@@ -1641,9 +1658,18 @@ def run_distillation_pipeline(config, strategy) -> None:
             for k, v in context.shared_state.items():
                 if k in _SKIP_KEYS:
                     continue
-                if isinstance(v, (tf.data.Dataset, tf.Tensor)):
-                    continue
-                saveable_shared[k] = v
+                skip = False
+                if _use_tf() and isinstance(v, (tf.data.Dataset, tf.Tensor)):
+                    skip = True
+                if not skip:
+                    try:
+                        import torch
+                        if isinstance(v, torch.Tensor):
+                            skip = True
+                    except Exception:
+                        pass
+                if not skip:
+                    saveable_shared[k] = v
             _shared_tmp = os.path.join(ckpt_dir, "shared_state.bin.tmp")
             _shared_dst = os.path.join(ckpt_dir, "shared_state.bin")
             with open(_shared_tmp, "wb") as _f:
@@ -1672,7 +1698,8 @@ def run_distillation_pipeline(config, strategy) -> None:
         shutil.rmtree(ckpt_dir, ignore_errors=True)
         print(f"{COLORS.OKCYAN}Checkpoint cleaned up{COLORS.ENDC}")
 
-    tf.keras.backend.clear_session()
+    if _use_tf():
+        tf.keras.backend.clear_session()  # noqa – TF-only teardown
     aggressive_memory_cleanup()
 
     stem = os.path.splitext(os.path.basename(log_filename))[0]
@@ -1773,15 +1800,15 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     print(f"{COLORS.OKGREEN}Simulation completed!{COLORS.ENDC}")
 
 
-def _extract_labels(dataset: tf.data.Dataset, num_classes: int) -> np.ndarray:
-    labels: List[int] = []
-    for _, batch_y in dataset:
-        batch = batch_y.numpy()
-        if batch.ndim == 1 or batch.shape[1] == 1:
-            labels.extend(batch.astype(int).tolist())
-        else:
-            labels.extend(np.argmax(batch, axis=1).tolist())
-    return np.asarray(labels, dtype=int)
+# def _extract_labels(dataset: tf.data.Dataset, num_classes: int) -> np.ndarray:
+#     labels: List[int] = []
+#     for _, batch_y in dataset:
+#         batch = batch_y.numpy()
+#         if batch.ndim == 1 or batch.shape[1] == 1:
+#             labels.extend(batch.astype(int).tolist())
+#         else:
+#             labels.extend(np.argmax(batch, axis=1).tolist())
+#     return np.asarray(labels, dtype=int)
 
 
 def _record_metrics(context: PipelineContext, round_number: int, round_metrics: Dict[int, Dict[str, float]], excel_filename: str) -> None:

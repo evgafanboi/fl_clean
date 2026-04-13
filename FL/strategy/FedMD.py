@@ -5,7 +5,9 @@ import time
 from typing import Dict, List
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
@@ -66,6 +68,34 @@ def compute_consensus_from_files(logit_files: List[str], shape: tuple) -> np.nda
     return consensus
 
 
+def _digest_phase_pt(model_wrapper, consensus_logits, public_features, batch_size, epochs):
+    import torch
+    from ..backend import get_torch_device
+    dev = get_torch_device()
+    net = model_wrapper.nn
+    opt = model_wrapper.optimizer
+    net.to(dev)
+    net.train()
+    n_samples = len(public_features)
+    X_t = torch.from_numpy(public_features.astype(np.float32))
+    C_t = torch.from_numpy(consensus_logits.astype(np.float32))
+    for epoch in range(epochs):
+        perm = torch.randperm(n_samples)
+        epoch_loss, batches = 0.0, 0
+        for start in range(0, n_samples, batch_size):
+            idx = perm[start:min(start + batch_size, n_samples)]
+            X_b = X_t[idx].to(dev)
+            C_b = C_t[idx].to(dev)
+            student_logits = net(X_b, return_logits=True)
+            loss = torch.mean((C_b - student_logits) ** 2)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            epoch_loss += loss.item()
+            batches += 1
+        print(f"    DIGEST epoch {epoch + 1}/{epochs} - MSE {epoch_loss / max(batches, 1):.4f}")
+
+
 def digest_phase(
     model_wrapper,
     consensus_logits: np.ndarray,
@@ -73,6 +103,8 @@ def digest_phase(
     batch_size: int,
     epochs: int,
 ) -> None:
+    if not _use_tf():
+        return _digest_phase_pt(model_wrapper, consensus_logits, public_features, batch_size, epochs)
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
     logits_model = model_wrapper.get_logits_model() if hasattr(model_wrapper, "get_logits_model") else keras_model
 

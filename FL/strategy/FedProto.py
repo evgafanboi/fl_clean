@@ -5,7 +5,9 @@ import time
 from typing import Dict, Tuple
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 
 from ..colors import COLORS
 from ..context import PipelineContext
@@ -13,6 +15,72 @@ from ..memory import aggressive_memory_cleanup
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
+
+
+def _local_training_with_prototypes_pt(
+    model_wrapper, dataloader, global_prototypes, num_classes, epochs, gamma,
+):
+    import torch
+    import torch.nn.functional as F
+    from ..backend import get_torch_device
+    dev = get_torch_device()
+    net = model_wrapper.nn
+    opt = model_wrapper.optimizer
+    net.to(dev)
+    net.train()
+    feature_model = model_wrapper.get_feature_model()
+    feat_dim = feature_model.output_shape[-1]
+
+    global_proto_t = torch.zeros(num_classes, feat_dim, device=dev)
+    has_proto = torch.zeros(num_classes, dtype=torch.bool, device=dev)
+    for cid, proto in global_prototypes.items():
+        global_proto_t[cid] = torch.from_numpy(proto).to(dev)
+        has_proto[cid] = True
+
+    features_buf = [None]
+    for name, module in net.named_modules():
+        if name == 'logits':
+            module.register_forward_pre_hook(lambda m, inp: features_buf.__setitem__(0, inp[0]))
+            break
+
+    class_features_sum = {c: np.zeros(feat_dim, dtype=np.float32) for c in range(num_classes)}
+    class_counts = {c: 0 for c in range(num_classes)}
+
+    for epoch in range(epochs):
+        collect = (epoch == epochs - 1)
+        for X_b, y_b in dataloader:
+            X_b = X_b.to(dev, non_blocking=True)
+            y_b = y_b.to(dev, non_blocking=True)
+            y_labels = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
+            logits = net(X_b, return_logits=True)
+            features = features_buf[0]
+            ce = F.cross_entropy(logits, y_labels)
+            proto_targets = global_proto_t[y_labels]
+            mask = has_proto[y_labels].unsqueeze(-1).float()
+            proto_new = mask * proto_targets + (1.0 - mask) * features
+            proto_loss = gamma * F.mse_loss(features, proto_new)
+            loss = ce + proto_loss
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+            opt.step()
+            if collect:
+                with torch.no_grad():
+                    feat_np = features.detach().cpu().numpy()
+                    y_np = y_labels.cpu().numpy()
+                    for c in range(num_classes):
+                        mask_c = y_np == c
+                        if np.any(mask_c):
+                            class_features_sum[c] += feat_np[mask_c].sum(axis=0)
+                            class_counts[c] += int(mask_c.sum())
+
+    prototypes, supports = {}, {}
+    for c in range(num_classes):
+        if class_counts[c] > 0:
+            prototypes[c] = class_features_sum[c] / class_counts[c]
+            supports[c] = class_counts[c]
+    model_wrapper._feature_model = None
+    return prototypes, supports
 
 
 def extract_class_prototypes(
@@ -83,6 +151,10 @@ def local_training_with_prototypes(
     epochs: int,
     gamma: float,
 ) -> Tuple[Dict[int, np.ndarray], Dict[int, int]]:
+    if not _use_tf():
+        return _local_training_with_prototypes_pt(
+            model_wrapper, private_dataset, global_prototypes, num_classes, epochs, gamma,
+        )
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
 
     feature_model = model_wrapper.get_feature_model()
@@ -200,7 +272,8 @@ class FedProto(DistillationStrategy):
             if client_idx < first_client:
                 continue
             if client_idx > 0 and client_idx % cleanup_interval == 0:
-                tf.keras.backend.clear_session()
+                from ..memory import clear_session
+                clear_session()
                 pool.refresh()
                 aggressive_memory_cleanup()
 

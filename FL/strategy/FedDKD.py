@@ -4,7 +4,11 @@ import time
 from typing import Dict, List
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
+if _use_tf():
+    from ..backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
@@ -14,7 +18,60 @@ from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
 
 
+def _compute_dkd_gradient_pt(expert_model, global_model, train_dataset, temperature=3.0):
+    import torch
+    import torch.nn.functional as F
+    from ..backend import get_torch_device
+    dev = get_torch_device()
+    expert_net = expert_model.nn
+    global_net = global_model.nn
+    expert_net.to(dev); expert_net.eval()
+    global_net.to(dev); global_net.train()
+    T = temperature
+    trainable_params = [p for p in global_net.parameters() if p.requires_grad]
+    accumulated_grads = [torch.zeros_like(p) for p in trainable_params]
+    total_loss, num_batches = 0.0, 0
+    for X_b, y_b in train_dataset:
+        X_b = X_b.to(dev, non_blocking=True)
+        with torch.no_grad():
+            expert_logits = expert_net(X_b, return_logits=True)
+        global_net.zero_grad()
+        global_logits = global_net(X_b, return_logits=True)
+        soft_teacher = F.softmax(expert_logits / T, dim=-1)
+        kl_loss = F.kl_div(F.log_softmax(global_logits / T, dim=-1), soft_teacher, reduction='batchmean')
+        loss = (T ** 2) * kl_loss
+        loss.backward()
+        for i, p in enumerate(trainable_params):
+            accumulated_grads[i] += p.grad.detach()
+        total_loss += loss.item()
+        num_batches += 1
+    avg_grads = [g / num_batches for g in accumulated_grads]
+    return [g.cpu().numpy() for g in avg_grads], total_loss / max(num_batches, 1)
+
+
+def _aggregate_gradients_pt(client_gradients, client_weights):
+    total_samples = sum(client_weights)
+    weights = [w / total_samples for w in client_weights]
+    aggregated = []
+    for layer_idx in range(len(client_gradients[0])):
+        layer_grads = np.stack([client_gradients[c][layer_idx] for c in range(len(client_gradients))])
+        w = np.array(weights, dtype=np.float32).reshape(-1, *([1] * (layer_grads.ndim - 1)))
+        aggregated.append(np.sum(layer_grads * w, axis=0))
+    return aggregated
+
+
+def _apply_gradient_update_pt(model, gradients, learning_rate):
+    import torch
+    net = model.nn if hasattr(model, 'nn') else model
+    trainable_params = [p for p in net.parameters() if p.requires_grad]
+    with torch.no_grad():
+        for param, grad in zip(trainable_params, gradients):
+            param -= learning_rate * torch.from_numpy(np.array(grad, dtype=np.float32)).to(param.device)
+
+
 def compute_dkd_gradient(expert_model, global_model, train_dataset, temperature=3.0):
+    if not _use_tf():
+        return _compute_dkd_gradient_pt(expert_model, global_model, train_dataset, temperature)
     expert_keras = expert_model.model if hasattr(expert_model, 'model') else expert_model
     global_keras = global_model.model if hasattr(global_model, 'model') else global_model
 
@@ -61,6 +118,8 @@ def compute_dkd_gradient(expert_model, global_model, train_dataset, temperature=
 
 
 def aggregate_gradients(client_gradients, client_weights):
+    if not _use_tf():
+        return _aggregate_gradients_pt(client_gradients, client_weights)
     n_clients = len(client_gradients)
     total_samples = sum(client_weights)
     weights = [w / total_samples for w in client_weights]
@@ -77,6 +136,8 @@ def aggregate_gradients(client_gradients, client_weights):
 
 
 def apply_gradient_update(model, gradients, learning_rate):
+    if not _use_tf():
+        return _apply_gradient_update_pt(model, gradients, learning_rate)
     optimizer = tf.keras.optimizers.SGD(learning_rate=learning_rate)
     
     if hasattr(model, 'model'):

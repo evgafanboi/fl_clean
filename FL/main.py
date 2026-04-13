@@ -7,8 +7,6 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 warnings.filterwarnings('ignore')
 
-from .pipeline import FLConfig, run_pipeline
-
 
 WEIGHT_AGGREGATION_STRATEGIES = {"FedAvg", "FedProx", "FedDyn", "FedCoMed", "RobustFilter", "DeepFed", "FLTrust", "SecureAggregation", "FedSSD1", "FedSSDexp", "FedSSD2", "None"}
 DISTILLATION_STRATEGIES = {"FD", "FedDKD", "FedProto", "FedMD", "FedSSD", "SSFL-IDS", "Exp1", "Ours", "Cronus"}
@@ -100,6 +98,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # checkpointing
     parser.add_argument("--checkpoint", type=int, nargs='?', const=1, default=0, help="Checkpoint every N clients (0=disabled, bare flag=every client)")
     parser.add_argument("--fresh_run", action="store_true", help="Delete existing weight records for this run and start fresh")
+    parser.add_argument("--use_tf", action="store_true", help="Use TensorFlow backend (default: PyTorch)")
 
     return parser
 
@@ -108,6 +107,8 @@ def main(argv=None):
     parser = build_argument_parser()
     args = parser.parse_args(argv)
 
+    from .backend import set_backend
+    set_backend(args.use_tf)
     if args.strategy in DISTILLATION_STRATEGIES:
         from .strategy import FD, FedDKD, FedProto, FedMD, FedSSD, SSFLIDS, Exp1, ours, Cronus
         from .config import FDConfig
@@ -162,6 +163,7 @@ def main(argv=None):
         strategy = strategy_registry[args.strategy](config)
         run_distillation_pipeline(config, strategy)
     else:
+        from .pipeline import FLConfig, run_pipeline
         config = FLConfig(
             n_clients=args.n_clients,
             partition_type=args.partition_type,

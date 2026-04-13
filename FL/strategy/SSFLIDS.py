@@ -5,7 +5,12 @@ import time
 from typing import Dict, List
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
+    from models.dense_discri import create_discriminator
+else:
+    from models.pt_dense_discri import create_discriminator
 
 from ..colors import COLORS
 from ..data_utils import create_client_dataset
@@ -14,10 +19,25 @@ from ..context import PipelineContext, ModelPool
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
-from models.dense_discri import create_discriminator
 
 SSFLIDS_DISC_DIR = os.path.join("temp_weights", "ssflids_disc_weights")
 SSFLIDS_CACHE_DIR = os.path.join("temp_weights", "ssflids_cache")
+
+
+def _softmax_np(x):
+    e = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def _make_public_ds(X, y, batch_size):
+    if _use_tf():
+        return (tf.data.Dataset.from_tensor_slices((X, y))
+                .batch(batch_size).prefetch(tf.data.AUTOTUNE))
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+    ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
+    return DataLoader(ds, batch_size=batch_size, shuffle=False,
+                      pin_memory=torch.cuda.is_available(), num_workers=0)
 
 
 def _base_public_path() -> str:
@@ -41,14 +61,14 @@ def train_discriminator(
     private_X_path: str,
 ) -> bool:
     logits_model = classify_model.get_logits_model() if hasattr(classify_model, "get_logits_model") else classify_model
-    discriminator_net = discri_model.model if hasattr(discri_model, "model") else discri_model
 
     chunk_size = 500_000
     max_probs_list = []
     for start in range(0, len(open_feature), chunk_size):
         logits = logits_model.predict(open_feature[start:start + chunk_size], batch_size=batch_size, verbose=0)
-        max_probs_list.append(np.max(tf.nn.softmax(logits).numpy(), axis=1))
-        del logits
+        probs = _softmax_np(logits)
+        max_probs_list.append(np.max(probs, axis=1))
+        del logits, probs
     max_probs = np.concatenate(max_probs_list)
     del max_probs_list
 
@@ -75,10 +95,21 @@ def train_discriminator(
     dis_X, dis_y = dis_X[indices], dis_y[indices]
     del indices
 
-    dataset = (tf.data.Dataset.from_tensor_slices((dis_X, dis_y))
-               .batch(batch_size).prefetch(tf.data.AUTOTUNE))
-    for _ in range(dis_rounds):
-        discriminator_net.fit(dataset, epochs=1, verbose=0)
+    if _use_tf():
+        dataset = (tf.data.Dataset.from_tensor_slices((dis_X, dis_y))
+                   .batch(batch_size).prefetch(tf.data.AUTOTUNE))
+        discriminator_net = discri_model.model if hasattr(discri_model, "model") else discri_model
+        for _ in range(dis_rounds):
+            discriminator_net.fit(dataset, epochs=1, verbose=0)
+    else:
+        import torch
+        from torch.utils.data import DataLoader, TensorDataset
+        ds = TensorDataset(torch.from_numpy(dis_X), torch.from_numpy(dis_y))
+        dataset = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                             pin_memory=torch.cuda.is_available(), num_workers=0)
+        for _ in range(dis_rounds):
+            discri_model.fit(dataset, epochs=1, verbose=0)
+
     del dataset, dis_X, dis_y
     return True
 
@@ -92,15 +123,15 @@ def predict_with_discriminator(
     output_path: str,
 ) -> None:
     logits_model = classify_model.get_logits_model() if hasattr(classify_model, "get_logits_model") else classify_model
-    discriminator_net = discri_model.model if hasattr(discri_model, "model") else discri_model
 
     boundary = 1.0 / num_classes
     hard_labels: List[int] = []
 
     for start in range(0, len(X_open), batch_size):
         X_batch = X_open[start:start + batch_size]
-        probs = tf.nn.softmax(logits_model.predict(X_batch, batch_size=batch_size, verbose=0)).numpy()
-        dis_pred = discriminator_net.predict(X_batch, batch_size=batch_size, verbose=0).reshape(-1)
+        logits = logits_model.predict(X_batch, batch_size=batch_size, verbose=0)
+        probs = _softmax_np(logits)
+        dis_pred = discri_model.predict(X_batch, batch_size=batch_size, verbose=0).reshape(-1)
         probs[dis_pred > 0.5] = 1.0 / num_classes
         for row in probs:
             max_p = float(np.max(row))
@@ -157,7 +188,8 @@ class SSFLIDS(DistillationStrategy):
         context.shared_state["public_sample_count"] = public_features.shape[0]
         del public_features
 
-        tf.keras.backend.clear_session()
+        from ..memory import clear_session
+        clear_session()
         reusable = create_model(context.input_dim, context.num_classes,
                                 config.batch_size, model_type=config.model_type)
         context.shared_state["init_w"] = reusable.get_weights()
@@ -189,7 +221,8 @@ class SSFLIDS(DistillationStrategy):
 
         if round_number > 1:
             del model
-            tf.keras.backend.clear_session()
+            from ..memory import clear_session
+            clear_session()
             aggressive_memory_cleanup()
             model = create_model(context.input_dim, context.num_classes,
                                  config.batch_size, model_type=config.model_type)
@@ -234,9 +267,11 @@ class SSFLIDS(DistillationStrategy):
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_s1:
                 continue
+
             if client_idx > 0 and client_idx % _REFRESH_EVERY == 0:
                 del model
-                tf.keras.backend.clear_session()
+                from ..memory import clear_session
+                clear_session()
                 aggressive_memory_cleanup()
                 model = create_model(context.input_dim, context.num_classes,
                                      config.batch_size, model_type=config.model_type)
@@ -308,10 +343,7 @@ class SSFLIDS(DistillationStrategy):
             global_labels_np = hard_label_vote(pred_files, context.num_classes)
             np.save(pseudo_y_path, global_labels_np)
             del global_labels_np
-            for f in pred_files:
-                if os.path.exists(f):
-                    os.remove(f)
-            aggressive_memory_cleanup()
+        aggressive_memory_cleanup()
 
         pub_X = np.array(np.load(pub_X_path, mmap_mode="r"), dtype=np.float32)
         pseudo_y = np.array(np.load(pseudo_y_path, mmap_mode="r"), dtype=np.int32)
@@ -319,18 +351,20 @@ class SSFLIDS(DistillationStrategy):
         pub_X = pub_X[valid_mask]
         pseudo_y = pseudo_y[valid_mask]
         print(f"  Pseudo-labeled samples: {len(pseudo_y)} / {int(valid_mask.size)} ({100*len(pseudo_y)/max(valid_mask.size,1):.1f}%)")
-        y_cat = tf.keras.utils.to_categorical(pseudo_y, context.num_classes).astype(np.float32)
+        y_cat = np.zeros((len(pseudo_y), context.num_classes), dtype=np.float32)
+        y_cat[np.arange(len(pseudo_y)), pseudo_y] = 1.0
         perm = np.random.permutation(len(pub_X))
-        public_ds = (tf.data.Dataset.from_tensor_slices((pub_X[perm], y_cat[perm]))
-                     .batch(config.batch_size).prefetch(tf.data.AUTOTUNE))
+        public_ds = _make_public_ds(pub_X[perm], y_cat[perm], config.batch_size)
         del pub_X, pseudo_y, y_cat, perm, valid_mask
 
         for s2_idx, state in enumerate(context.client_states):
             if s2_idx < first_s2:
                 continue
+
             if s2_idx > 0 and s2_idx % _REFRESH_EVERY == 0:
                 del model
-                tf.keras.backend.clear_session()
+                from ..memory import clear_session
+                clear_session()
                 aggressive_memory_cleanup()
                 model = create_model(context.input_dim, context.num_classes,
                                      config.batch_size, model_type=config.model_type)
@@ -340,10 +374,10 @@ class SSFLIDS(DistillationStrategy):
                 valid_mask = pseudo_y_arr >= 0
                 pub_X = pub_X[valid_mask]
                 pseudo_y_arr = pseudo_y_arr[valid_mask]
-                y_cat = tf.keras.utils.to_categorical(pseudo_y_arr, context.num_classes).astype(np.float32)
+                y_cat = np.zeros((len(pseudo_y_arr), context.num_classes), dtype=np.float32)
+                y_cat[np.arange(len(pseudo_y_arr)), pseudo_y_arr] = 1.0
                 p = np.random.permutation(len(pub_X))
-                public_ds = (tf.data.Dataset.from_tensor_slices((pub_X[p], y_cat[p]))
-                             .batch(config.batch_size).prefetch(tf.data.AUTOTUNE))
+                public_ds = _make_public_ds(pub_X[p], y_cat[p], config.batch_size)
                 del pub_X, pseudo_y_arr, y_cat, p, valid_mask
 
             model.set_weights(state.data["w"])
@@ -382,7 +416,10 @@ class SSFLIDS(DistillationStrategy):
             clear_mid_round(context, "ssflids")
 
         return {}
-        tf.keras.backend.clear_session()
+
+    def finalize(self, context: PipelineContext) -> None:
+        from ..memory import clear_session
+        clear_session()
         if os.path.isdir(SSFLIDS_CACHE_DIR):
             for name in os.listdir(SSFLIDS_CACHE_DIR):
                 os.remove(os.path.join(SSFLIDS_CACHE_DIR, name))

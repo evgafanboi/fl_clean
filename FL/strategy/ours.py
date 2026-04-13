@@ -6,7 +6,9 @@ import time
 from typing import Dict, List
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 from tqdm import tqdm
 
 from ..colors import COLORS
@@ -111,6 +113,9 @@ def ekd_stage(
     model_wrapper, consensus_logits: np.ndarray, public_features: np.ndarray,
     batch_size: int, epochs: int, ekd_lambda: float,
 ) -> None:
+    from ..backend import use_tf
+    if not use_tf():
+        return _ekd_stage_pt(model_wrapper, consensus_logits, public_features, batch_size, epochs, ekd_lambda)
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
     logits_model = model_wrapper.get_logits_model() if hasattr(model_wrapper, "get_logits_model") else keras_model
 
@@ -168,10 +173,57 @@ def ekd_stage(
             print(f"    EKD epoch {epoch + 1}/{epochs} — loss {epoch_loss / batches:.4f}")
 
 
+def _ekd_stage_pt(
+    model_wrapper, consensus_logits: np.ndarray, public_features: np.ndarray,
+    batch_size: int, epochs: int, ekd_lambda: float,
+) -> None:
+    import torch
+    from ..backend import get_torch_device
+    dev = get_torch_device()
+    logits_model = model_wrapper.get_logits_model()
+    net = logits_model._w.nn
+    net.to(dev)
+    net.train()
+    opt = model_wrapper.optimizer
+    lam = ekd_lambda
+    n_samples = len(public_features)
+    feat_t = torch.from_numpy(public_features).to(dev)
+    logits_t = torch.from_numpy(consensus_logits).to(dev)
+    for epoch in range(epochs):
+        perm = np.random.permutation(n_samples)
+        epoch_loss = 0.0
+        batches = 0
+        for start in range(0, n_samples, batch_size):
+            idx = perm[start : start + batch_size]
+            bX = feat_t[idx]
+            bT = logits_t[idx]
+            s_logits = net(bX)
+            alpha_T = torch.exp(bT) + 1.0
+            alpha_S = torch.exp(s_logits) + 1.0
+            a0_T = alpha_T.sum(-1, keepdim=True)
+            a0_S = alpha_S.sum(-1, keepdim=True)
+            L1 = ((alpha_T / a0_T) * (torch.log(alpha_T / a0_T + 1e-8) - torch.log(alpha_S / a0_S + 1e-8))).sum(-1)
+            L2 = (torch.lgamma(a0_T[:, 0]) - torch.lgamma(a0_S[:, 0])
+                  - (torch.lgamma(alpha_T) - torch.lgamma(alpha_S)).sum(-1)
+                  + ((alpha_T - alpha_S) * (torch.digamma(alpha_T) - torch.digamma(a0_T))).sum(-1))
+            loss = (L1 + lam * L2).mean()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            epoch_loss += loss.item()
+            batches += 1
+        if batches > 0:
+            print(f"    EKD epoch {epoch + 1}/{epochs} — loss {epoch_loss / batches:.4f}")
+
+
 def abkd_stage(
     model_wrapper, consensus_logits: np.ndarray, public_features: np.ndarray,
     batch_size: int, epochs: int, alpha: float, beta: float, temperature: float,
 ) -> None:
+    from ..backend import use_tf
+    if not use_tf():
+        return _abkd_stage_pt(model_wrapper, consensus_logits, public_features,
+                               batch_size, epochs, alpha, beta, temperature)
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
     logits_model = model_wrapper.get_logits_model() if hasattr(model_wrapper, "get_logits_model") else keras_model
 
@@ -248,9 +300,70 @@ def abkd_stage(
             print(f"    ABKD epoch {epoch + 1}/{epochs} — loss {epoch_loss / batches:.4f}")
 
 
+def _abkd_stage_pt(
+    model_wrapper, consensus_logits: np.ndarray, public_features: np.ndarray,
+    batch_size: int, epochs: int, alpha: float, beta: float, temperature: float,
+) -> None:
+    import torch
+    from ..backend import get_torch_device
+    dev = get_torch_device()
+    logits_model = model_wrapper.get_logits_model()
+    net = logits_model._w.nn
+    net.to(dev)
+    net.train()
+    opt = model_wrapper.optimizer
+    T = temperature
+    a = alpha
+    b = beta
+    ab_sum = a + b
+    n_samples = len(public_features)
+    feat_t = torch.from_numpy(public_features).to(dev)
+    teacher_t = torch.from_numpy(consensus_logits).to(dev)
+    for epoch in range(epochs):
+        perm = np.random.permutation(n_samples)
+        epoch_loss = 0.0
+        batches = 0
+        for start in range(0, n_samples, batch_size):
+            idx = perm[start : start + batch_size]
+            bX = feat_t[idx]
+            bT_logits = teacher_t[idx]
+            s_logits = net(bX)
+            p = torch.softmax(bT_logits / T, dim=-1)
+            q = torch.softmax(s_logits / T, dim=-1)
+            if a == 0.0 and b == 0.0:
+                log_diff = torch.log(q + 1e-10) - torch.log(p + 1e-10)
+                divergence = 0.5 * (log_diff ** 2).sum(1)
+            elif a == 0.0:
+                q_b = q.pow(b)
+                p_b = p.pow(b)
+                divergence = (1.0 / b) * (q_b * torch.log(q_b / (p_b + 1e-10) + 1e-10) - q_b + p_b).sum(1)
+            elif b == 0.0:
+                p_a = p.pow(a)
+                q_a = q.pow(a)
+                divergence = (1.0 / a) * (p_a * torch.log(p_a / (q_a + 1e-10) + 1e-10) - p_a + q_a).sum(1)
+            elif ab_sum == 0.0:
+                p_a = p.pow(a)
+                q_a = q.pow(a)
+                divergence = ((1.0 / a) * (torch.log(q_a / (p_a + 1e-10) + 1e-10) + p_a / (q_a + 1e-10) - 1.0)).sum(1)
+            else:
+                p_a = p.pow(a)
+                q_b = q.pow(b)
+                p_ab = p.pow(ab_sum)
+                q_ab = q.pow(ab_sum)
+                divergence = (-(p_a * q_b - (a / ab_sum) * p_ab - (b / ab_sum) * q_ab) / (a * b)).sum(1)
+            loss = divergence.mean()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            epoch_loss += loss.item()
+            batches += 1
+        if batches > 0:
+            print(f"    ABKD epoch {epoch + 1}/{epochs} — loss {epoch_loss / batches:.4f}")
+
+
 # ── Stage 1: CE training on private data ─────────────────────────────────────
 
-def ce_stage(model_wrapper, private_dataset: tf.data.Dataset, epochs: int) -> None:
+def ce_stage(model_wrapper, private_dataset, epochs: int) -> None:
     print(f"    CE training for {epochs} epochs")
     history = model_wrapper.fit(private_dataset, epochs=epochs, verbose=1)
     if hasattr(history, "history") and "loss" in history.history:

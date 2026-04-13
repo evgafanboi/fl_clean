@@ -4,7 +4,9 @@ import time
 from typing import Dict
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
@@ -33,10 +35,7 @@ def generate_per_class_logits(model_wrapper, X_path: str, y_path: str, num_class
         return per_class_logits, class_counts_dict
 
     print("  WARNING: No accumulated logits found, using final model state")
-    if hasattr(model_wrapper, 'get_logits_model'):
-        logits_model = model_wrapper.get_logits_model()
-    else:
-        logits_model = model_wrapper.model if hasattr(model_wrapper, 'model') else model_wrapper
+    logits_model = model_wrapper.get_logits_model() if hasattr(model_wrapper, 'get_logits_model') else model_wrapper
 
     X_mmap = np.load(X_path, mmap_mode='r')
     y_mmap = np.load(y_path, mmap_mode='r')
@@ -51,7 +50,7 @@ def generate_per_class_logits(model_wrapper, X_path: str, y_path: str, num_class
         X_chunk = np.array(X_mmap[start_idx:end_idx], dtype=np.float32)
         y_chunk = np.array(y_mmap[start_idx:end_idx], dtype=np.int32)
 
-        logits_chunk = logits_model(X_chunk, training=False).numpy()
+        logits_chunk = logits_model.predict(X_chunk, batch_size=8192, verbose=0)
 
         np.add.at(class_logits_sum, y_chunk, logits_chunk)
         np.add.at(class_counts, y_chunk, 1)
@@ -69,6 +68,69 @@ def generate_per_class_logits(model_wrapper, X_path: str, y_path: str, num_class
     return per_class_logits, class_counts_dict
 
 
+def _local_training_with_distillation_pt(
+    model_wrapper, dataloader, global_logits, num_classes, epochs, gamma, batch_size, client_class_counts=None,
+):
+    import torch
+    import torch.nn.functional as F
+    from ..backend import get_torch_device
+    dev = get_torch_device()
+    net = model_wrapper.nn
+    opt = model_wrapper.optimizer
+    net.to(dev)
+
+    class_logits_sum = np.zeros((num_classes, num_classes), dtype=np.float32)
+    class_counts = np.zeros(num_classes, dtype=np.int32)
+
+    if len(global_logits) == 0:
+        print("    No global logits available - using standard CE training")
+        model_wrapper.fit(dataloader, epochs=epochs, verbose=1)
+        logits_model = model_wrapper.get_logits_model()
+        for X_b, y_b in dataloader:
+            batch_logits = logits_model.predict(X_b.cpu().numpy(), batch_size=batch_size, verbose=0)
+            y_labels = y_b.argmax(dim=1).numpy() if y_b.ndim > 1 else y_b.numpy()
+            np.add.at(class_logits_sum, y_labels, batch_logits)
+            np.add.at(class_counts, y_labels, 1)
+        model_wrapper._accumulated_logits = class_logits_sum
+        model_wrapper._accumulated_counts = class_counts
+        return model_wrapper
+
+    gl_tensor = torch.zeros(num_classes, num_classes, device=dev)
+    has_gl = torch.zeros(num_classes, dtype=torch.bool, device=dev)
+    for cid, logits in global_logits.items():
+        gl_tensor[cid] = torch.from_numpy(np.array(logits, dtype=np.float32)).to(dev)
+        has_gl[cid] = True
+
+    net.train()
+    for epoch in range(epochs):
+        total_loss, batches = 0.0, 0
+        for X_b, y_b in dataloader:
+            X_b = X_b.to(dev, non_blocking=True)
+            y_b = y_b.to(dev, non_blocking=True)
+            y_labels = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
+            logits = net(X_b, return_logits=True)
+            ce = F.cross_entropy(logits, y_labels)
+            batch_has = has_gl[y_labels]
+            distill = torch.tensor(0.0, device=dev)
+            if batch_has.any():
+                distill = gamma * F.l1_loss(logits[batch_has], gl_tensor[y_labels][batch_has])
+            loss = ce + distill
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step()
+            with torch.no_grad():
+                np.add.at(class_logits_sum, y_labels.cpu().numpy(), logits.detach().cpu().numpy())
+                np.add.at(class_counts, y_labels.cpu().numpy(), 1)
+            total_loss += loss.item()
+            batches += 1
+        print(f"    epoch {epoch + 1}/{epochs}  loss={total_loss / max(batches, 1):.4f}")
+
+    model_wrapper._accumulated_logits = class_logits_sum
+    model_wrapper._accumulated_counts = class_counts
+    return model_wrapper
+
+
 def local_training_with_distillation(
     model_wrapper,
     private_dataset: tf.data.Dataset,
@@ -79,6 +141,10 @@ def local_training_with_distillation(
     batch_size: int,
     client_class_counts: Dict[int, int] | None = None,
 ):
+    if not _use_tf():
+        return _local_training_with_distillation_pt(
+            model_wrapper, private_dataset, global_logits, num_classes, epochs, gamma, batch_size, client_class_counts,
+        )
     setup_start = time.time()
     keras_model = model_wrapper.model if hasattr(model_wrapper, 'model') else model_wrapper
 

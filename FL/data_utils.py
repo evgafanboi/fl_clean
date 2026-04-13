@@ -2,13 +2,20 @@ import os
 from typing import Dict, Optional, Tuple
 
 import numpy as np
-import tensorflow as tf
+
+from .backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 
 from .colors import COLORS
 
 _test_tf_dataset_cache = None
 _test_tf_dataset_batch_size = None
 _test_tf_num_classes = None
+
+_test_pt_dataloader_cache = None
+_test_pt_dataloader_batch_size = None
+_test_pt_dataloader_num_classes = None
 
 _client_data_cache: dict = {}
 
@@ -78,7 +85,10 @@ def create_client_dataset(
     batch_size: int,
     poison_loader=None,
     cache: bool = True,
-) -> tf.data.Dataset:
+):
+    from .backend import use_tf
+    if not use_tf():
+        return _create_client_dataloader(X_path, y_path, num_classes, batch_size, poison_loader)
     cache_key = (X_path, y_path, num_classes, id(poison_loader))
     if cache_key in _client_data_cache:
         X, y = _client_data_cache[cache_key]
@@ -98,7 +108,30 @@ def create_client_dataset(
     return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
-def load_test_dataset(batch_size: int, num_classes: int) -> tf.data.Dataset:
+def _create_client_dataloader(X_path, y_path, num_classes, batch_size, poison_loader=None):
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+    cache_key = (X_path, y_path, num_classes, id(poison_loader))
+    if cache_key in _client_data_cache:
+        X, y = _client_data_cache[cache_key]
+    else:
+        X = np.load(X_path, mmap_mode='r').astype(np.float32, copy=False)
+        y = np.load(y_path, mmap_mode='r').astype(np.int32, copy=False)
+        if poison_loader is not None:
+            y = poison_loader.poison_labels(y)
+        y_oh = np.zeros((len(y), num_classes), dtype=np.float32)
+        y_oh[np.arange(len(y)), y] = 1.0
+        _client_data_cache[cache_key] = (X, y_oh)
+        X, y = X, y_oh
+    idx = np.random.permutation(len(X))
+    ds = TensorDataset(torch.from_numpy(X[idx].copy()), torch.from_numpy(y[idx]))
+    return DataLoader(ds, batch_size=batch_size, shuffle=False, pin_memory=torch.cuda.is_available(), num_workers=0)
+
+
+def load_test_dataset(batch_size: int, num_classes: int):
+    from .backend import use_tf
+    if not use_tf():
+        return _load_test_dataloader(batch_size, num_classes)
     global _test_tf_dataset_cache, _test_tf_dataset_batch_size, _test_tf_num_classes
 
     if (_test_tf_dataset_cache is None
@@ -117,3 +150,24 @@ def load_test_dataset(batch_size: int, num_classes: int) -> tf.data.Dataset:
         print(f"{COLORS.OKGREEN}Test dataset cached ({X_test.shape[0]} samples){COLORS.ENDC}")
 
     return _test_tf_dataset_cache
+
+
+def _load_test_dataloader(batch_size: int, num_classes: int):
+    global _test_pt_dataloader_cache, _test_pt_dataloader_batch_size, _test_pt_dataloader_num_classes
+    if (_test_pt_dataloader_cache is not None
+            and _test_pt_dataloader_batch_size == batch_size
+            and _test_pt_dataloader_num_classes == num_classes):
+        return _test_pt_dataloader_cache
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+    X_test = np.load("data/X_test.npy").astype(np.float32, copy=False)
+    y_test = np.load("data/y_test.npy").astype(np.int32)
+    y_oh = np.zeros((len(y_test), num_classes), dtype=np.float32)
+    y_oh[np.arange(len(y_test)), y_test] = 1.0
+    ds = TensorDataset(torch.from_numpy(np.array(X_test)), torch.from_numpy(y_oh))
+    _test_pt_dataloader_num_classes = num_classes
+    _test_pt_dataloader_batch_size = batch_size
+    _test_pt_dataloader_cache = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                                           pin_memory=torch.cuda.is_available(), num_workers=0)
+    print(f"{COLORS.OKGREEN}PT test dataloader cached ({X_test.shape[0]} samples){COLORS.ENDC}")
+    return _test_pt_dataloader_cache

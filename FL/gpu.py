@@ -1,5 +1,8 @@
 import os
-import tensorflow as tf
+
+from .backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 
 from .colors import COLORS
 
@@ -7,12 +10,12 @@ from .colors import COLORS
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-tf.get_logger().setLevel('ERROR')
-tf.autograph.set_verbosity(0)
+if _use_tf():
+    tf.get_logger().setLevel('ERROR')
+    tf.autograph.set_verbosity(0)
 
 
 def configure_gpu_memory() -> None:
-    """Configure TensorFlow GPU memory growth if GPUs are available."""
     import warnings
     warnings.filterwarnings('ignore')
     
@@ -28,3 +31,23 @@ def configure_gpu_memory() -> None:
         print(f"{COLORS.OKCYAN}GPU memory growth enabled + mixed precision enabled{COLORS.ENDC}")
     except Exception as exc:
         print(f"GPU configuration error: {exc}")
+
+
+def configure_pytorch_gpu() -> None:
+    import torch
+    if not torch.cuda.is_available():
+        print(f"{COLORS.WARNING}No CUDA GPU found for PyTorch — running on CPU{COLORS.ENDC}")
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    with torch.cuda.device(0):
+        _ = torch.zeros(1, device='cuda')
+    print(f"{COLORS.OKCYAN}PyTorch GPU ready: {torch.cuda.get_device_name(0)}{COLORS.ENDC}")
+
+
+def configure_gpu() -> None:
+    from .backend import use_tf
+    if use_tf():
+        configure_gpu_memory()
+    else:
+        configure_pytorch_gpu()

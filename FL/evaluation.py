@@ -3,7 +3,9 @@ from typing import Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-import tensorflow as tf
+from .backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -42,11 +44,19 @@ def evaluate_model_streaming(
             X_chunk = np.expand_dims(X_chunk, axis=1)
 
         if len(y_chunk.shape) == 1 or y_chunk.shape[1] == 1:
-            y_chunk_cat = tf.keras.utils.to_categorical(y_chunk, num_classes).astype(np.float32)
+            y_chunk_cat = np.zeros((len(y_chunk), num_classes), dtype=np.float32)
+            y_chunk_cat[np.arange(len(y_chunk)), y_chunk.astype(int).ravel()] = 1.0
         else:
             y_chunk_cat = y_chunk.astype(np.float32)
 
-        chunk_dataset = tf.data.Dataset.from_tensor_slices((X_chunk, y_chunk_cat)).batch(batch_size)
+        if _use_tf():
+            chunk_dataset = tf.data.Dataset.from_tensor_slices((X_chunk, y_chunk_cat)).batch(batch_size)
+        else:
+            import torch
+            from torch.utils.data import DataLoader, TensorDataset
+            chunk_dataset = DataLoader(
+                TensorDataset(torch.from_numpy(X_chunk), torch.from_numpy(y_chunk_cat)),
+                batch_size=batch_size, shuffle=False)
         chunk_loss = model.evaluate(chunk_dataset, verbose=0)[0]
         total_loss += chunk_loss * (chunk_end - chunk_start)
         total_observations += (chunk_end - chunk_start)
@@ -108,7 +118,7 @@ def evaluate_model_with_metrics(
     else:
         y_true_parts = []
         for _, batch_y in test_dataset:
-            b = batch_y.numpy()
+            b = batch_y.numpy() if hasattr(batch_y, 'numpy') else np.asarray(batch_y)
             if len(b.shape) > 1 and b.shape[1] > 1:
                 y_true_parts.append(np.argmax(b, axis=1))
             else:

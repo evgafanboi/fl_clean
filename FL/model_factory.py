@@ -1,6 +1,10 @@
 from typing import Callable, Dict, Optional
 
-from models import dense, gru, dcblstm, fedmlb_wrapper
+from .backend import use_tf as _use_tf
+if _use_tf():
+    from models import dense, gru, dcblstm, fedmlb_wrapper
+else:
+    dense = gru = dcblstm = fedmlb_wrapper = None  # type: ignore
 
 from .aggregators import StrategyRuntime
 
@@ -15,6 +19,19 @@ def _dense_builder(
     strategy_runtime: StrategyRuntime,
     client_id: Optional[int]
 ):
+    from .backend import use_tf
+    if not use_tf():
+        strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
+        if strategy_name == 'fedmlb':
+            from models import pt_fedmlb_wrapper
+            return pt_fedmlb_wrapper.create_fedmlb_model(
+                input_dim, num_classes, batch_size,
+                lambda1=strategy_runtime.client_strategy.lambda1,
+                lambda2=strategy_runtime.client_strategy.lambda2,
+                temperature=strategy_runtime.client_strategy.temperature,
+            )
+        from models import pt_dense
+        return pt_dense.create_dense_model(input_dim, num_classes, batch_size)
     strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
 
     if strategy_name == 'fedmlb':
@@ -36,6 +53,19 @@ def _gru_builder(
     strategy_runtime: StrategyRuntime,
     client_id: Optional[int]
 ):
+    from .backend import use_tf
+    if not use_tf():
+        strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
+        if strategy_name == 'fedmlb':
+            from models import pt_fedmlb_wrapper
+            return pt_fedmlb_wrapper.create_fedmlb_gru_model(
+                input_dim, num_classes, batch_size,
+                lambda1=strategy_runtime.client_strategy.lambda1,
+                lambda2=strategy_runtime.client_strategy.lambda2,
+                temperature=strategy_runtime.client_strategy.temperature,
+            )
+        from models import pt_gru
+        return pt_gru.create_gru_model(input_dim, num_classes, batch_size)
     strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
     if strategy_name == 'fedmlb':
         return fedmlb_wrapper.create_fedmlb_gru_model(
@@ -54,6 +84,19 @@ def _dcblstm_builder(
     strategy_runtime: StrategyRuntime,
     client_id: Optional[int],
 ):
+    from .backend import use_tf
+    if not use_tf():
+        strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
+        if strategy_name == 'fedmlb':
+            from models import pt_fedmlb_wrapper
+            return pt_fedmlb_wrapper.create_fedmlb_dcblstm_model(
+                input_dim, num_classes, batch_size,
+                lambda1=strategy_runtime.client_strategy.lambda1,
+                lambda2=strategy_runtime.client_strategy.lambda2,
+                temperature=strategy_runtime.client_strategy.temperature,
+            )
+        from models import pt_dcblstm
+        return pt_dcblstm.create_dcblstm_model(input_dim, num_classes, batch_size)
     strategy_name = getattr(strategy_runtime.client_strategy, 'name', '').lower()
     if strategy_name == 'fedmlb':
         return fedmlb_wrapper.create_fedmlb_dcblstm_model(

@@ -4,7 +4,9 @@ import time
 from typing import Dict, List, Sequence
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
+if _use_tf():
+    import tensorflow as tf
 
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
@@ -12,6 +14,80 @@ from ..context import PipelineContext
 from ..logging_utils import log_timestamp
 from .base import DistillationStrategy
 from .common import create_model, create_private_dataset, load_public_dataset_from_clients
+
+
+def _compute_class_metrics_pt(model_wrapper, aux_dataset, num_classes):
+    import torch
+    from ..backend import get_torch_device
+    dev = get_torch_device()
+    net = model_wrapper.nn
+    net.to(dev)
+    net.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for X_b, y_b in aux_dataset:
+            X_b = X_b.to(dev)
+            preds = net(X_b).argmax(dim=1).cpu().numpy()
+            labels = y_b.argmax(dim=1).numpy() if y_b.ndim > 1 else y_b.numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels)
+    confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for t, p in zip(all_labels, all_preds):
+        confusion[t, p] += 1
+    M_class = np.zeros(num_classes, dtype=np.float32)
+    for k in range(num_classes):
+        row_sum = confusion[k, :].sum()
+        if row_sum == 0:
+            continue
+        A_k_k = confusion[k, k] / row_sum
+        confusion_rates = []
+        for j in range(num_classes):
+            if j == k:
+                continue
+            js = confusion[j, :].sum()
+            if js > 0:
+                confusion_rates.append(confusion[j, k] / js)
+        max_confusion = max(confusion_rates) if confusion_rates else 0.0
+        M_class[k] = A_k_k * (1.0 - max_confusion)
+    return M_class
+
+
+def _train_with_ssd_loss_pt(model_wrapper, dataloader, global_model, m_class_np, m_max, num_classes, epochs):
+    import torch
+    import torch.nn.functional as F
+    from ..backend import get_torch_device
+    dev = get_torch_device()
+    net = model_wrapper.nn
+    global_net = global_model.nn
+    opt = model_wrapper.optimizer
+    net.to(dev); net.train()
+    global_net.to(dev); global_net.eval()
+    m_class_t = torch.from_numpy(m_class_np.reshape(1, -1)).to(dev)
+    print(f"  Training with CE+SSD loss (m_max={m_max:.2f}) for {epochs} epochs...")
+    for epoch in range(epochs):
+        ce_sum, ssd_sum, total_sum, num_b = 0.0, 0.0, 0.0, 0
+        for X_b, y_b in dataloader:
+            X_b = X_b.to(dev, non_blocking=True)
+            y_b = y_b.to(dev, non_blocking=True)
+            y_labels = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
+            local_logits = net(X_b, return_logits=True)
+            local_probs = F.softmax(local_logits, dim=-1)
+            with torch.no_grad():
+                global_logits = global_net(X_b, return_logits=True)
+                global_probs = F.softmax(global_logits, dim=-1)
+            p_g_k2 = global_probs[torch.arange(len(y_labels), device=dev), y_labels]
+            M_sample = (1.0 - torch.sqrt(torch.clamp(1.0 - p_g_k2, min=0.0))).unsqueeze(1)
+            M = m_max * F.relu(m_class_t * M_sample - 0.1)
+            ssd_loss = torch.mean(torch.sum((M * (global_logits - local_logits)) ** 2, dim=1))
+            ce_loss = F.cross_entropy(local_logits, y_labels)
+            loss = ce_loss + ssd_loss
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+            opt.step()
+            ce_sum += ce_loss.item(); ssd_sum += ssd_loss.item(); total_sum += loss.item(); num_b += 1
+        if num_b > 0:
+            print(f"    Epoch {epoch + 1}/{epochs} - CE: {ce_sum/num_b:.4f}, SSD: {ssd_sum/num_b:.4f}, Total: {total_sum/num_b:.4f}")
 
 
 def aggregate_weights(client_weights: Sequence[List[np.ndarray]], sample_sizes: Sequence[int]) -> List[np.ndarray]:
@@ -25,6 +101,8 @@ def aggregate_weights(client_weights: Sequence[List[np.ndarray]], sample_sizes: 
 
 
 def compute_class_metrics(model_wrapper, aux_dataset: tf.data.Dataset, num_classes: int) -> np.ndarray:
+    if not _use_tf():
+        return _compute_class_metrics_pt(model_wrapper, aux_dataset, num_classes)
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
 
     all_preds = []
@@ -87,6 +165,8 @@ def train_with_ssd_loss(
     num_classes: int,
     epochs: int,
 ) -> None:
+    if not _use_tf():
+        return _train_with_ssd_loss_pt(model_wrapper, private_dataset, global_model, m_class_expanded, m_max, num_classes, epochs)
     """Train with CE + selective self-distillation (L = L_CE + L_SSD)."""
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
 
@@ -218,7 +298,7 @@ class FedSSD(DistillationStrategy):
             f"  M_class statistics -> mean: {M_class.mean():.4f}, max: {M_class.max():.4f}"
         )
 
-        m_class_expanded = tf.constant(np.expand_dims(M_class, axis=0), dtype=tf.float32)
+        m_class_expanded = np.expand_dims(M_class, axis=0) if not _use_tf() else tf.constant(np.expand_dims(M_class, axis=0), dtype=tf.float32)
         global_weights = global_model.get_weights()
 
         print(f"\n{COLORS.OKCYAN}[STEP 2/2] Client selective soft distillation training{COLORS.ENDC}")
