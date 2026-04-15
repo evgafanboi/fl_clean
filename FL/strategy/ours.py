@@ -376,7 +376,6 @@ def ce_stage(model_wrapper, private_dataset, epochs: int) -> None:
 
 class Ours(DistillationStrategy):
     name = "Ours"
-    prefer_in_memory_pool = True
 
     def __init__(self, config) -> None:
         super().__init__(config)

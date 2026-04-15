@@ -100,7 +100,6 @@ class FLConfig:
     feddyn_alpha: float = 0.1
     batch_size: int = 8192
     epochs: int = 5
-    weights_cache_dir: str = "temp_weights"
     mu: float = 0.01
 
     model: str = "dense"
@@ -771,17 +770,6 @@ class FederatedLearningPipeline:
 
         return result_data, sample_size, loss
 
-    def _load_client_weights(self, weights_files: List[str]):
-        weights_list = []
-        for weights_file in weights_files:
-            with open(weights_file, 'rb') as file_handler:
-                saved_data = pickle.load(file_handler)
-                if isinstance(saved_data, dict) and 'weights' in saved_data:
-                    weights_list.append(saved_data['weights'])
-                else:
-                    weights_list.append(saved_data)
-        return weights_list
-
     _NEEDS_ALL_WEIGHTS = frozenset({'feddyn', 'fltrust', 'fedcomed', 'robustfilter'})
 
     def _can_stream_aggregate(self) -> bool:
@@ -963,8 +951,6 @@ class FederatedLearningPipeline:
 
     def run(self):
         configure_gpu()
-        if not os.path.islink(self.config.weights_cache_dir):
-            os.makedirs(self.config.weights_cache_dir, exist_ok=True)
 
         self.strategy_runtime = build_strategy(
             self.config.strategy,
@@ -1056,14 +1042,12 @@ class FederatedLearningPipeline:
         record_base = os.path.join("temp_weights", f"{stem}_weight_record")
         if self.config.fresh_run and os.path.isdir(record_base):
             shutil.rmtree(record_base)
-        _highest_record = next(
-            (r for r in range(self.config.rounds, 0, -1)
-             if os.path.exists(os.path.join(record_base, f"round_{r}", "global_weight.bin"))),
-            None,
+        _final_record_exists = os.path.exists(
+            os.path.join(record_base, f"round_{self.config.rounds}", "global_weight.bin")
         )
-        if _highest_record is not None:
-            log_timestamp(self.logger, f"Weight records found (highest round {_highest_record}), skipping to evaluation")
-            print(f"{COLORS.OKGREEN}Weight records found up to round {_highest_record} — skipping to evaluation{COLORS.ENDC}")
+        if _final_record_exists:
+            log_timestamp(self.logger, f"Weight records found (round {self.config.rounds}), skipping to evaluation")
+            print(f"{COLORS.OKGREEN}Weight records found for round {self.config.rounds} — skipping to evaluation{COLORS.ENDC}")
             self._run_eval_from_records(
                 input_dim, num_classes, class_names, partition_label, excel_filename, record_base,
             )
@@ -1541,7 +1525,7 @@ def run_distillation_pipeline(config, strategy) -> None:
         model_pool = ModelPool(
             pool_size=min(10, n_clients),
             factory_fn=lambda: create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type),
-            in_memory=bool(getattr(strategy, "prefer_in_memory_pool", False)),
+            in_memory=True,
         )
     
     poisoned_clients = []
@@ -1611,8 +1595,8 @@ def run_distillation_pipeline(config, strategy) -> None:
                     context.results = pd.read_pickle(results_path)
                 print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {ckpt_info['round']}) -> starting round {start_round}{COLORS.ENDC}")
     
-    # Seed in-memory pool from last completed round's weight records
-    if start_round > 1 and model_pool is not None and model_pool.in_memory:
+    # Seed pool from last completed round's weight records on resume
+    if start_round > 1 and model_pool is not None:
         prev_round = start_round - 1
         prev_dir = os.path.join("temp_weights", f"{os.path.splitext(os.path.basename(log_filename))[0]}_weight_record", f"round_{prev_round}")
         if os.path.isdir(prev_dir):

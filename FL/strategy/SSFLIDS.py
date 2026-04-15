@@ -20,7 +20,6 @@ from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
 
-SSFLIDS_DISC_DIR = os.path.join("temp_weights", "ssflids_disc_weights")
 SSFLIDS_CACHE_DIR = os.path.join("temp_weights", "ssflids_cache")
 
 
@@ -198,7 +197,6 @@ class SSFLIDS(DistillationStrategy):
         disc_pool = ModelPool(
             pool_size=min(5, len(context.paths)),
             factory_fn=lambda: create_discriminator(context.input_dim),
-            weights_dir=SSFLIDS_DISC_DIR,
         )
         context.shared_state["disc_pool"] = disc_pool
 
@@ -423,6 +421,3 @@ class SSFLIDS(DistillationStrategy):
         if os.path.isdir(SSFLIDS_CACHE_DIR):
             for name in os.listdir(SSFLIDS_CACHE_DIR):
                 os.remove(os.path.join(SSFLIDS_CACHE_DIR, name))
-        if os.path.isdir(SSFLIDS_DISC_DIR):
-            for name in os.listdir(SSFLIDS_DISC_DIR):
-                os.remove(os.path.join(SSFLIDS_DISC_DIR, name))

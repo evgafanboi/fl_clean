@@ -1,6 +1,5 @@
 import os
 import pickle
-import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -10,34 +9,24 @@ from .backend import use_tf as _use_tf
 if _use_tf():
     import tensorflow as tf
 
-MODEL_WEIGHTS_DIR = os.path.join(tempfile.gettempdir(), "fl_model_weights")
-
 
 class ModelPool:
-    def __init__(self, pool_size, factory_fn, weights_dir=MODEL_WEIGHTS_DIR, in_memory=False):
-        from .backend import use_tf
-        self._use_tf = use_tf()
-        self.weights_dir = weights_dir
-        self.in_memory = in_memory
+    """Pool of reusable Keras/PyTorch models with in-memory weight storage.
+
+    Client weights are kept in ``_weights_cache``; no files are written to
+    disk.  Persistence across rounds is handled by the weight-record layer
+    (``record_client_weight`` / ``record_client_weights``).
+    """
+
+    def __init__(self, pool_size, factory_fn, *, in_memory=True, **_kw):
         self._factory_fn = factory_fn
         self._pool_size = pool_size
         self._available = [factory_fn() for _ in range(pool_size)]
-        if self.in_memory:
-            self._weights_cache = {}
-            self._initial_weights = self._clone_weights(self._get_weights(self._available[0]))
-            return
-
-        if os.path.isdir(weights_dir):
-            for f in os.listdir(weights_dir):
-                os.remove(os.path.join(weights_dir, f))
-        os.makedirs(weights_dir, exist_ok=True)
-        if self._use_tf:
-            self._init_path = os.path.join(weights_dir, "_init.weights.h5")
-            self._keras_model(self._available[0]).save_weights(self._init_path)
-        else:
-            self._init_path = os.path.join(weights_dir, "_init.pkl")
-            with open(self._init_path, 'wb') as _f:
-                pickle.dump(self._available[0].get_weights(), _f, protocol=pickle.HIGHEST_PROTOCOL)
+        self.in_memory = True  # always in-memory; kept for back-compat checks
+        self._weights_cache: Dict = {}
+        self._initial_weights = self._clone_weights(
+            self._get_weights(self._available[0])
+        )
 
     @staticmethod
     def _keras_model(model):
@@ -59,52 +48,21 @@ class ModelPool:
             return
         self._keras_model(model).set_weights(copied_weights)
 
-    def _path(self, client_id, tag=""):
-        suffix = f"_{tag}" if tag else ""
-        ext = ".weights.h5" if self._use_tf else ".pkl"
-        return os.path.join(self.weights_dir, f"c{client_id}{suffix}{ext}")
-
     def checkout(self, client_id, tag=""):
         model = self._available.pop()
-        if self.in_memory:
-            weights = self._weights_cache.get((client_id, tag), self._initial_weights)
-            self._set_weights(model, weights)
-            return model
-
-        path = self._path(client_id, tag)
-        weights_path = path if os.path.exists(path) else self._init_path
-        if self._use_tf:
-            self._keras_model(model).load_weights(weights_path)
-        else:
-            with open(weights_path, 'rb') as _f:
-                model.set_weights(pickle.load(_f))
+        weights = self._weights_cache.get((client_id, tag), self._initial_weights)
+        self._set_weights(model, weights)
         return model
 
     def checkin(self, client_id, model, tag=""):
-        if self.in_memory:
-            self._weights_cache[(client_id, tag)] = self._clone_weights(self._get_weights(model))
-            self._available.append(model)
-            return
-
-        if self._use_tf:
-            self._keras_model(model).save_weights(self._path(client_id, tag))
-        else:
-            with open(self._path(client_id, tag), 'wb') as _f:
-                pickle.dump(model.get_weights(), _f, protocol=pickle.HIGHEST_PROTOCOL)
+        self._weights_cache[(client_id, tag)] = self._clone_weights(self._get_weights(model))
         self._available.append(model)
 
     def release(self, model):
         self._available.append(model)
 
     def save(self, client_id, model, tag=""):
-        if self.in_memory:
-            self._weights_cache[(client_id, tag)] = self._clone_weights(self._get_weights(model))
-            return
-        if self._use_tf:
-            self._keras_model(model).save_weights(self._path(client_id, tag))
-        else:
-            with open(self._path(client_id, tag), 'wb') as _f:
-                pickle.dump(model.get_weights(), _f, protocol=pickle.HIGHEST_PROTOCOL)
+        self._weights_cache[(client_id, tag)] = self._clone_weights(self._get_weights(model))
 
     def refresh(self):
         """Recreate pool models after tf.keras.backend.clear_session()."""

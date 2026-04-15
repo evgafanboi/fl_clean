@@ -72,8 +72,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=8192, help="Minibatch size for local training")
     parser.add_argument("--epochs", type=int, default=5, help="Local epochs per round")
 
-    parser.add_argument("--weights_cache_dir", type=str, default="temp_weights", help="Directory to cache client weights")
-
     # experimental info computation
     parser.add_argument("--trust_score", action="store_true", help="Enable trust score logging (FLTrust cosine similarity) after local training")
     parser.add_argument("--peer_trust", action="store_true", help="Enable peer trust score logging (cosine similarity with adjacent neighbors +-1)")
@@ -174,7 +172,6 @@ def main(argv=None):
             feddyn_alpha=args.feddyn_alpha,
             batch_size=args.batch_size,
             epochs=args.epochs,
-            weights_cache_dir=args.weights_cache_dir,
             mu=args.mu,
 
             model=args.model,
