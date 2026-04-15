@@ -99,7 +99,7 @@ def _create_private_dataloader(X_path, y_path, num_classes, batch_size, poison_l
     idx = np.random.permutation(len(X))
     ds = TensorDataset(torch.from_numpy(X[idx].copy()), torch.from_numpy(y_oh[idx]))
     return DataLoader(ds, batch_size=batch_size, shuffle=False,
-                      pin_memory=torch.cuda.is_available(), num_workers=0)
+                      pin_memory=False, num_workers=0)
 
 
 def load_public_dataset_from_clients(
@@ -254,5 +254,5 @@ def _load_public_dataloader_from_clients(
     else:
         ds = TensorDataset(torch.from_numpy(X_all))
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                        pin_memory=torch.cuda.is_available(), num_workers=0)
+                        pin_memory=False, num_workers=0)
     return loader, total_samples

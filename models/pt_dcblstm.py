@@ -35,8 +35,10 @@ class _DCBLSTMNet(nn.Module):
 class PTDCBLSTMModel(_PTModelWrapper):
     def __init__(self, input_dim, num_classes, batch_size=4096, learning_rate=None):
         lr = learning_rate or 0.001 * (batch_size / 1024) ** 0.5
-        print(f"PT DCBLSTM Model - lr={lr:.6f} bs={batch_size}")
-        super().__init__(_DCBLSTMNet(input_dim, num_classes), input_dim, num_classes, batch_size, lr)
+        print(f"PT DCBLSTM Model - Using learning rate: {lr:.6f} for batch size {batch_size}")
+        net = _DCBLSTMNet(input_dim, num_classes)
+        super().__init__(net, input_dim, num_classes, batch_size, lr,
+                         l2_modules=[], optimizer_eps=1e-7)
 
 
 def create_dcblstm_model(input_dim, num_classes, batch_size=4096, learning_rate=None):

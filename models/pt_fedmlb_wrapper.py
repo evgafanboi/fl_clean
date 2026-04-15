@@ -272,7 +272,8 @@ class _FedMLBDCBLSTMNet(nn.Module):
 
 class _FedMLBWrapper:
     def __init__(self, nn_module, input_dim, num_classes, batch_size, lr,
-                 lambda1, lambda2, temperature, n_hybrids, hybrid_fn):
+                 lambda1, lambda2, temperature, n_hybrids, hybrid_fn,
+                 l2_modules=None):
         self.nn = nn_module
         self.input_dim = input_dim
         self.num_classes = num_classes
@@ -283,10 +284,17 @@ class _FedMLBWrapper:
         self._n_hybrids = n_hybrids
         self._hybrid_fn = hybrid_fn
         self.base_model = nn_module
-        self.optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, nn_module.parameters()),
-            lr=lr, weight_decay=1e-4,
-        )
+        trainable = [p for p in nn_module.parameters() if p.requires_grad]
+        l2_ids = {id(m.weight) for m in (l2_modules or []) if hasattr(m, 'weight')}
+        decay, no_decay = [], []
+        for p in trainable:
+            (decay if id(p) in l2_ids else no_decay).append(p)
+        groups = []
+        if decay:
+            groups.append({'params': decay, 'weight_decay': 1e-4})
+        if no_decay:
+            groups.append({'params': no_decay, 'weight_decay': 0.0})
+        self.optimizer = torch.optim.Adam(groups, lr=lr, eps=1e-7)
         self._logits_model = None
 
     def fit(self, dataloader, epochs=5, **kwargs):
@@ -411,7 +419,8 @@ def create_fedmlb_model(input_dim, num_classes, batch_size, lambda1=1.0, lambda2
     net = _FedMLBDenseNet(input_dim, num_classes)
     net.sync_hybrid()
     print(f"PT FedMLB Dense - lr={lr:.6f} bs={batch_size}")
-    return _FedMLBWrapper(net, input_dim, num_classes, batch_size, lr, lambda1, lambda2, temperature, 2, _dense_hybrids)
+    return _FedMLBWrapper(net, input_dim, num_classes, batch_size, lr, lambda1, lambda2, temperature, 2, _dense_hybrids,
+                          l2_modules=[net.b1.dense, net.b2.dense, net.b3.dense])
 
 
 def create_fedmlb_gru_model(input_dim, num_classes, batch_size, lambda1=1.0, lambda2=1.0, temperature=1.0, gru_units=128):
@@ -419,7 +428,8 @@ def create_fedmlb_gru_model(input_dim, num_classes, batch_size, lambda1=1.0, lam
     net = _FedMLBGRUNet(input_dim, num_classes, gru_units)
     net.sync_hybrid()
     print(f"PT FedMLB GRU - lr={lr:.6f} bs={batch_size}")
-    return _FedMLBWrapper(net, input_dim, num_classes, batch_size, lr, lambda1, lambda2, temperature, 3, _gru_hybrids)
+    return _FedMLBWrapper(net, input_dim, num_classes, batch_size, lr, lambda1, lambda2, temperature, 3, _gru_hybrids,
+                          l2_modules=[net.head.dense])
 
 
 def create_fedmlb_dcblstm_model(input_dim, num_classes, batch_size, lambda1=1.0, lambda2=1.0, temperature=1.0):
@@ -427,4 +437,5 @@ def create_fedmlb_dcblstm_model(input_dim, num_classes, batch_size, lambda1=1.0,
     net = _FedMLBDCBLSTMNet(input_dim, num_classes)
     net.sync_hybrid()
     print(f"PT FedMLB DCBLSTM - lr={lr:.6f} bs={batch_size}")
-    return _FedMLBWrapper(net, input_dim, num_classes, batch_size, lr, lambda1, lambda2, temperature, 4, _dcblstm_hybrids)
+    return _FedMLBWrapper(net, input_dim, num_classes, batch_size, lr, lambda1, lambda2, temperature, 4, _dcblstm_hybrids,
+                          l2_modules=[])

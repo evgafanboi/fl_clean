@@ -98,6 +98,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # checkpointing
     parser.add_argument("--checkpoint", type=int, nargs='?', const=1, default=0, help="Checkpoint every N clients (0=disabled, bare flag=every client)")
     parser.add_argument("--fresh_run", action="store_true", help="Delete existing weight records for this run and start fresh")
+    parser.add_argument("--cache_test_set", action="store_true", help="Pin X_test to GPU VRAM before evaluation (avoids repeated host↔device transfers; ~1 GB VRAM)")
     parser.add_argument("--use_tf", action="store_true", help="Use TensorFlow backend (default: PyTorch)")
 
     return parser
@@ -158,6 +159,7 @@ def main(argv=None):
             cleanup_interval=args.cleanup_interval,
             skip_eval=args.skip_eval,
             fresh_run=args.fresh_run,
+            cache_test_set=args.cache_test_set,
         )
         
         strategy = strategy_registry[args.strategy](config)
@@ -193,6 +195,7 @@ def main(argv=None):
             cleanup_interval=args.cleanup_interval,
             skip_eval=args.skip_eval,
             fresh_run=args.fresh_run,
+            cache_test_set=args.cache_test_set,
         )
         run_pipeline(config)
 

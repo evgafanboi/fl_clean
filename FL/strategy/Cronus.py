@@ -124,7 +124,7 @@ def _make_merged_dataset(priv_X_path, priv_y_path, pub_X_path, pseudo_y_path,
         from torch.utils.data import DataLoader, TensorDataset
         ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
         return DataLoader(ds, batch_size=batch_size, shuffle=False,
-                          pin_memory=torch.cuda.is_available(), num_workers=0)
+                          pin_memory=False, num_workers=0)
     return (tf.data.Dataset.from_tensor_slices((X, y))
               .batch(batch_size).prefetch(tf.data.AUTOTUNE))
 

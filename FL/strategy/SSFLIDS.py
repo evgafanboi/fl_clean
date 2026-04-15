@@ -37,7 +37,7 @@ def _make_public_ds(X, y, batch_size):
     from torch.utils.data import DataLoader, TensorDataset
     ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
     return DataLoader(ds, batch_size=batch_size, shuffle=False,
-                      pin_memory=torch.cuda.is_available(), num_workers=0)
+                      pin_memory=False, num_workers=0)
 
 
 def _base_public_path() -> str:
@@ -106,7 +106,7 @@ def train_discriminator(
         from torch.utils.data import DataLoader, TensorDataset
         ds = TensorDataset(torch.from_numpy(dis_X), torch.from_numpy(dis_y))
         dataset = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                             pin_memory=torch.cuda.is_available(), num_workers=0)
+                             pin_memory=False, num_workers=0)
         for _ in range(dis_rounds):
             discri_model.fit(dataset, epochs=1, verbose=0)
 

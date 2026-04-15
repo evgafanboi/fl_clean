@@ -125,7 +125,7 @@ def _create_client_dataloader(X_path, y_path, num_classes, batch_size, poison_lo
         X, y = X, y_oh
     idx = np.random.permutation(len(X))
     ds = TensorDataset(torch.from_numpy(X[idx].copy()), torch.from_numpy(y[idx]))
-    return DataLoader(ds, batch_size=batch_size, shuffle=False, pin_memory=torch.cuda.is_available(), num_workers=0)
+    return DataLoader(ds, batch_size=batch_size, shuffle=False, pin_memory=False, num_workers=0)
 
 
 def load_test_dataset(batch_size: int, num_classes: int):
@@ -168,6 +168,6 @@ def _load_test_dataloader(batch_size: int, num_classes: int):
     _test_pt_dataloader_num_classes = num_classes
     _test_pt_dataloader_batch_size = batch_size
     _test_pt_dataloader_cache = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                                           pin_memory=torch.cuda.is_available(), num_workers=0)
+                                           pin_memory=False, num_workers=0)
     print(f"{COLORS.OKGREEN}PT test dataloader cached ({X_test.shape[0]} samples){COLORS.ENDC}")
     return _test_pt_dataloader_cache

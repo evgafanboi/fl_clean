@@ -108,7 +108,7 @@ python3 -m FL --n_clients 10 --partition_type iid-500 --strategy FedSSD
 
 ### Checkpointing
 
-- Add client checkpoint with `--checkpoint N`, where N is the the number of clients between checkpoints (for a start, set $N = \frac{1}{N_{clients}}$. Note that the configs are hashed to the checkpoint, so if any hyperparameter change for the same partition type and strategy, or there's no checkpoint at all, the simulation will start fresh (there will be a warning).
+- Add client checkpoint with `--checkpoint N`, where N is the the number of clients between checkpoints (for a start, set $N = \frac{N_{clients}}{10}$. Note that the configs are hashed to the checkpoint, so if any hyperparameter change for the same partition type and strategy, or there's no checkpoint at all, the simulation will start fresh (there will be a warning).
 - **Important:** Note that checkpointing stores the global model weights and a text holding the run's settings. In the context of _FD strategy_ that does not have a global model, client weights will be stored instead. For large `--n_clients`, checkpoints would consume significant storage. Make sure to clean checkpoints properly. The simulation should cleans up checkpoint automatically if the simulation ended successfully.
 ---
 

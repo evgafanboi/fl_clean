@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -87,15 +88,31 @@ class _PTLogitsWrapper:
 
 
 class _PTModelWrapper:
-    def __init__(self, nn_module, input_dim, num_classes, batch_size, lr):
+    def __init__(self, nn_module, input_dim, num_classes, batch_size, lr,
+                 l2_modules=None, optimizer_eps=1e-7):
         self.nn = nn_module
         self.input_dim = input_dim
         self.num_classes = num_classes
         self.batch_size = batch_size
         self.learning_rate = lr
-        self.optimizer = torch.optim.Adam(self.nn.parameters(), lr=lr, weight_decay=1e-4)
+        l2_ids = {id(m.weight) for m in (l2_modules or []) if hasattr(m, 'weight')}
+        decay, no_decay = [], []
+        for p in nn_module.parameters():
+            (decay if id(p) in l2_ids else no_decay).append(p)
+        groups = []
+        if decay:
+            groups.append({'params': decay, 'weight_decay': 1e-4})
+        if no_decay:
+            groups.append({'params': no_decay, 'weight_decay': 0.0})
+        self.optimizer = torch.optim.Adam(groups, lr=lr, eps=optimizer_eps)
         self.criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
         self._logits_model = None
+
+    def _lr_for_epoch(self, epoch):
+        if epoch < 5:
+            return self.learning_rate * (epoch + 1) / 5
+        decay_epochs = max(1, epoch - 5)
+        return self.learning_rate * 0.5 * (1 + math.cos(math.pi * decay_epochs / 50))
 
     def fit(self, dataloader, epochs=5, **kwargs):
         dev = _dev()
@@ -103,6 +120,9 @@ class _PTModelWrapper:
         self.nn.train()
         history = {"loss": []}
         for epoch in range(epochs):
+            lr = self._lr_for_epoch(epoch)
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = lr
             total_loss, batches = 0.0, 0
             for X_b, y_b in dataloader:
                 X_b = X_b.to(dev, non_blocking=True)
@@ -128,7 +148,10 @@ class _PTModelWrapper:
         bs = batch_size or self.batch_size
         results = []
         with torch.no_grad():
-            if isinstance(X, np.ndarray):
+            if isinstance(X, torch.Tensor):
+                for i in range(0, len(X), bs):
+                    results.append(self.nn(X[i:i + bs]).cpu().numpy())
+            elif isinstance(X, np.ndarray):
                 X_t = torch.from_numpy(X.astype(np.float32))
                 for i in range(0, len(X_t), bs):
                     results.append(self.nn(X_t[i:i + bs].to(dev)).cpu().numpy())
@@ -175,9 +198,6 @@ class _PTModelWrapper:
         if not hasattr(self, '_feature_model') or self._feature_model is None:
             self._feature_model = _PTFeatureWrapper(self)
         return self._feature_model
-
-    def get_feature_model(self):
-        return self.get_logits_model()
 
     def expand_classes(self, new_num_classes):
         pass

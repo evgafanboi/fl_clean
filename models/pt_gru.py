@@ -37,8 +37,11 @@ class _GRUNet(nn.Module):
 class PTGRUModel(_PTModelWrapper):
     def __init__(self, input_dim, num_classes, batch_size=4096, learning_rate=None, gru_units=128):
         lr = learning_rate or 0.001 * (batch_size / 1024) ** 0.5
-        print(f"PT GRU Model - lr={lr:.6f} bs={batch_size}")
-        super().__init__(_GRUNet(input_dim, num_classes, gru_units), input_dim, num_classes, batch_size, lr)
+        print(f"PT GRU Model - Using learning rate: {lr:.6f} for batch size {batch_size}")
+        net = _GRUNet(input_dim, num_classes, gru_units)
+        eps = 1e-6 if batch_size >= 2048 else 1e-7
+        super().__init__(net, input_dim, num_classes, batch_size, lr,
+                         l2_modules=[net.head], optimizer_eps=eps)
 
 
 def create_gru_model(input_dim, num_classes, batch_size=4096, learning_rate=None, gru_units=128):

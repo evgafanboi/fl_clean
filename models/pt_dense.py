@@ -32,8 +32,11 @@ class _DenseNet(nn.Module):
 class PTDenseModel(_PTModelWrapper):
     def __init__(self, input_dim, num_classes, batch_size=4096, learning_rate=None):
         lr = learning_rate or 0.001 * (batch_size / 1024) ** 0.5
-        print(f"PT Dense Model - lr={lr:.6f} bs={batch_size}")
-        super().__init__(_DenseNet(input_dim, num_classes), input_dim, num_classes, batch_size, lr)
+        print(f"PT Dense Model - Using learning rate: {lr:.6f} for batch size {batch_size}")
+        net = _DenseNet(input_dim, num_classes)
+        eps = 1e-6 if batch_size >= 2048 else 1e-7
+        super().__init__(net, input_dim, num_classes, batch_size, lr,
+                         l2_modules=[net.d1, net.d2, net.d3], optimizer_eps=eps)
 
 
 def create_dense_model(input_dim, num_classes, batch_size=4096, learning_rate=None):

@@ -197,7 +197,7 @@ def _ekd_stage_pt(
             idx = perm[start : start + batch_size]
             bX = feat_t[idx]
             bT = logits_t[idx]
-            s_logits = net(bX)
+            s_logits = net(bX, return_logits=True)
             alpha_T = torch.exp(bT) + 1.0
             alpha_S = torch.exp(s_logits) + 1.0
             a0_T = alpha_T.sum(-1, keepdim=True)
@@ -209,6 +209,7 @@ def _ekd_stage_pt(
             loss = (L1 + lam * L2).mean()
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
             opt.step()
             epoch_loss += loss.item()
             batches += 1
@@ -327,7 +328,7 @@ def _abkd_stage_pt(
             idx = perm[start : start + batch_size]
             bX = feat_t[idx]
             bT_logits = teacher_t[idx]
-            s_logits = net(bX)
+            s_logits = net(bX, return_logits=True)
             p = torch.softmax(bT_logits / T, dim=-1)
             q = torch.softmax(s_logits / T, dim=-1)
             if a == 0.0 and b == 0.0:
@@ -354,6 +355,7 @@ def _abkd_stage_pt(
             loss = divergence.mean()
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
             opt.step()
             epoch_loss += loss.item()
             batches += 1
@@ -374,6 +376,7 @@ def ce_stage(model_wrapper, private_dataset, epochs: int) -> None:
 
 class Ours(DistillationStrategy):
     name = "Ours"
+    prefer_in_memory_pool = True
 
     def __init__(self, config) -> None:
         super().__init__(config)
@@ -466,6 +469,31 @@ class Ours(DistillationStrategy):
 
         return logit_files, logit_shape
 
+    def _generate_logits_mean(self, context, public_features):
+        """Accumulate mean consensus in-memory during logit generation (no file I/O)."""
+        config = context.config
+        pool = context.model_pool
+        n_clients = len(context.client_states)
+        accumulator = None
+        cleanup_interval = min(getattr(config, 'cleanup_interval', 10), n_clients)
+
+        for client_idx, state in enumerate(context.client_states):
+            model = pool.checkout(state.client_id)
+            logits_model = model.get_logits_model() if hasattr(model, "get_logits_model") else model
+            logits = logits_model.predict(public_features, batch_size=config.batch_size, verbose=0)
+            if accumulator is None:
+                accumulator = logits.astype(np.float64)
+            else:
+                accumulator += logits
+            pool.release(model)
+            del logits
+            print(f"  Client {state.client_id}: logits accumulated ({client_idx + 1}/{n_clients})")
+            if (client_idx + 1) % cleanup_interval == 0:
+                aggressive_memory_cleanup()
+
+        accumulator /= n_clients
+        return accumulator.astype(np.float32)
+
     def _run_kd_stage(self, context, consensus_logits, public_features, first_client=0):
         config = context.config
         kd_method = getattr(config, "ours_kd", "ekd")
@@ -536,6 +564,7 @@ class Ours(DistillationStrategy):
         round_start = time.time()
         config = context.config
         public_features = np.load(context.shared_state["public_features_path"], mmap_mode="r")
+        no_filter = config.robust_epsilon >= 0.5
 
         os.makedirs(LOGITS_CACHE_DIR, exist_ok=True)
 
@@ -570,52 +599,62 @@ class Ours(DistillationStrategy):
         if not skip_ce:
             self._run_ce_stage(context, first_client=first_ce)
 
-        if not skip_logits:
-            print(f"\n{COLORS.OKCYAN}Generating public logits{COLORS.ENDC}")
-            logit_files, logit_shape = self._generate_logits(context, public_features, first_client=first_logit)
-        else:
-            logit_files = saved_logit_files or []
-            logit_shape = None
-            if logit_files:
-                row_bytes_test = os.path.getsize(logit_files[0])
-                n_classes = context.num_classes
-                logit_shape = (row_bytes_test // (n_classes * 4), n_classes)
-
-        if not skip_kd:
-            consensus_path = os.path.join(LOGITS_CACHE_DIR, f"r{round_number}_consensus.npy")
-            if logit_shape is None and not os.path.exists(consensus_path):
-                raise RuntimeError(
-                    "logit_shape is None — no logit files were produced or recovered. "
-                    "Check that client logit .bin files exist in the cache directory."
-                )
-            if os.path.exists(consensus_path):
-                print(f"\n{COLORS.OKCYAN}Loading cached consensus logits{COLORS.ENDC}")
-                consensus_logits = np.load(consensus_path)
-            else:
-                print(f"\n{COLORS.OKCYAN}Computing robust consensus logits (eps={config.robust_epsilon}){COLORS.ENDC}")
-                consensus_logits, max_eig, max_ratio, removal_counts = compute_robust_consensus_from_files(
-                    logit_files, logit_shape, self.robust_filter,
-                )
+        if no_filter:
+            if not skip_logits and not skip_kd:
+                print(f"\n{COLORS.OKCYAN}Generating logits + mean consensus in-memory (eps>={config.robust_epsilon}, no filtering){COLORS.ENDC}")
+                consensus_logits = self._generate_logits_mean(context, public_features)
                 print(f"  Consensus shape: {consensus_logits.shape}")
-                eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
-                ratio_s = f"{max_ratio:.4f}" if max_ratio is not None else "N/A"
-                top_removed = sorted(removal_counts.items(), key=lambda x: -x[1])
-                print(f"  max_eig={eig_s}  max_ratio={ratio_s}  top removals (client_idx: count): {top_removed[:5]}")
-                context.logger.info(
-                    "Round %s | RobustConsensus | max_eig=%s | max_ratio=%s | removals=%s",
-                    round_number, eig_s, ratio_s, top_removed,
-                )
-                np.save(consensus_path, consensus_logits)
+                context.logger.info("Round %s | MeanConsensus (no filter) | shape=%s", round_number, consensus_logits.shape)
+                self._run_kd_stage(context, consensus_logits, public_features)
+                del consensus_logits
+        else:
+            if not skip_logits:
+                print(f"\n{COLORS.OKCYAN}Generating public logits{COLORS.ENDC}")
+                logit_files, logit_shape = self._generate_logits(context, public_features, first_client=first_logit)
+            else:
+                logit_files = saved_logit_files or []
+                logit_shape = None
+                if logit_files:
+                    row_bytes_test = os.path.getsize(logit_files[0])
+                    n_classes = context.num_classes
+                    logit_shape = (row_bytes_test // (n_classes * 4), n_classes)
 
-            for fpath in logit_files:
-                if os.path.exists(fpath):
-                    os.remove(fpath)
+            if not skip_kd:
+                consensus_path = os.path.join(LOGITS_CACHE_DIR, f"r{round_number}_consensus.npy")
+                if logit_shape is None and not os.path.exists(consensus_path):
+                    raise RuntimeError(
+                        "logit_shape is None — no logit files were produced or recovered. "
+                        "Check that client logit .bin files exist in the cache directory."
+                    )
+                if os.path.exists(consensus_path):
+                    print(f"\n{COLORS.OKCYAN}Loading cached consensus logits{COLORS.ENDC}")
+                    consensus_logits = np.load(consensus_path)
+                else:
+                    print(f"\n{COLORS.OKCYAN}Computing robust consensus logits (eps={config.robust_epsilon}){COLORS.ENDC}")
+                    consensus_logits, max_eig, max_ratio, removal_counts = compute_robust_consensus_from_files(
+                        logit_files, logit_shape, self.robust_filter,
+                    )
+                    print(f"  Consensus shape: {consensus_logits.shape}")
+                    eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
+                    ratio_s = f"{max_ratio:.4f}" if max_ratio is not None else "N/A"
+                    top_removed = sorted(removal_counts.items(), key=lambda x: -x[1])
+                    print(f"  max_eig={eig_s}  max_ratio={ratio_s}  top removals (client_idx: count): {top_removed[:5]}")
+                    context.logger.info(
+                        "Round %s | RobustConsensus | max_eig=%s | max_ratio=%s | removals=%s",
+                        round_number, eig_s, ratio_s, top_removed,
+                    )
+                    np.save(consensus_path, consensus_logits)
 
-            self._run_kd_stage(context, consensus_logits, public_features, first_client=first_kd)
+                for fpath in logit_files:
+                    if os.path.exists(fpath):
+                        os.remove(fpath)
 
-            del consensus_logits
-            if os.path.exists(consensus_path):
-                os.remove(consensus_path)
+                self._run_kd_stage(context, consensus_logits, public_features, first_client=first_kd)
+
+                del consensus_logits
+                if os.path.exists(consensus_path):
+                    os.remove(consensus_path)
+
         del public_features
         aggressive_memory_cleanup()
 

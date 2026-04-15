@@ -27,7 +27,7 @@ class _DiscriminatorNet(nn.Module):
 class PTDiscriminator:
     def __init__(self, input_dim, learning_rate=0.0001):
         self.model = _DiscriminatorNet(input_dim)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate, eps=1e-7)
         self.criterion = nn.BCELoss()
 
     def fit(self, dataset, epochs=1, verbose=0):

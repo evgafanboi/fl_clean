@@ -63,6 +63,7 @@ def _record_round_weights(log_filename, round_num, global_weights=None, context=
                 pickle.dump(w, f, protocol=pickle.HIGHEST_PROTOCOL)
             os.replace(tmp, path)
             saved_any = True
+            continue
 
     if saved_any or context.model_pool is None:
         return
@@ -125,6 +126,7 @@ class FLConfig:
     checkpoint: int = 0
     skip_eval: bool = False
     fresh_run: bool = False
+    cache_test_set: bool = False
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -728,7 +730,7 @@ class FederatedLearningPipeline:
                 train_dataset,
                 epochs=self.config.epochs,
                 callbacks=callbacks if callbacks else None,
-                verbose=2,
+                verbose=1,
             )
             loss = float(history.history.get("loss", [0.0])[-1])
 
@@ -846,11 +848,11 @@ class FederatedLearningPipeline:
             from torch.utils.data import DataLoader, TensorDataset
             ds = TensorDataset(torch.from_numpy(combined_X), torch.from_numpy(combined_y))
             root_dataset = DataLoader(ds, batch_size=self.config.batch_size, shuffle=False,
-                                      pin_memory=torch.cuda.is_available(), num_workers=0)
+                                      pin_memory=False, num_workers=0)
         
         print(f"  [SERVER] Training on root dataset ({len(combined_X)} samples) for {self.config.root_iterations} iterations")
         
-        model.fit(root_dataset, epochs=self.config.root_iterations, verbose=0)
+        model.fit(root_dataset, epochs=self.config.root_iterations, verbose=1)
         
         new_weights = model.get_weights()
         if current_weights is None:
@@ -1609,6 +1611,20 @@ def run_distillation_pipeline(config, strategy) -> None:
                     context.results = pd.read_pickle(results_path)
                 print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {ckpt_info['round']}) -> starting round {start_round}{COLORS.ENDC}")
     
+    # Seed in-memory pool from last completed round's weight records
+    if start_round > 1 and model_pool is not None and model_pool.in_memory:
+        prev_round = start_round - 1
+        prev_dir = os.path.join("temp_weights", f"{os.path.splitext(os.path.basename(log_filename))[0]}_weight_record", f"round_{prev_round}")
+        if os.path.isdir(prev_dir):
+            seeded = 0
+            for i in range(n_clients):
+                wp = os.path.join(prev_dir, f"client_{i}_weight.bin")
+                if os.path.exists(wp):
+                    with open(wp, "rb") as _f:
+                        model_pool._weights_cache[(i, "")] = model_pool._clone_weights(pickle.load(_f))
+                    seeded += 1
+            print(f"{COLORS.OKCYAN}Seeded in-memory pool from round {prev_round} weight records ({seeded}/{n_clients} clients){COLORS.ENDC}")
+
     # Check if final weight records already exist — skip training entirely
     stem = os.path.splitext(os.path.basename(log_filename))[0]
     record_base = os.path.join("temp_weights", f"{stem}_weight_record")
@@ -1714,18 +1730,51 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     log_timestamp(logger, "=== EVALUATION ===")
     print(f"\n{COLORS.HEADER}[EVALUATION]{COLORS.ENDC}")
 
-    context.results = {}
+    evaluated_rounds: set = set()
+    if os.path.exists(excel_filename):
+        try:
+            existing = pd.read_excel(excel_filename, sheet_name=0)
+            if context.results is None:
+                context.results = {}
+            for _, row in existing.iterrows():
+                pass
+            if "Round" in existing.columns:
+                evaluated_rounds = set(existing.columns.str.extract(r'Round_(\d+)_', expand=False).dropna().astype(int))
+        except Exception:
+            pass
+    if not evaluated_rounds and context.results:
+        for cid, metrics_dict in context.results.items():
+            for k in metrics_dict:
+                import re as _re
+                m = _re.match(r'Round_(\d+)_', k)
+                if m:
+                    evaluated_rounds.add(int(m.group(1)))
+    if evaluated_rounds:
+        print(f"{COLORS.OKCYAN}Resuming eval — rounds already done: {sorted(evaluated_rounds)}{COLORS.ENDC}")
+
+    if context.results is None:
+        context.results = {}
+
     X_test = np.load("data/X_test.npy").astype(np.float32)
     y_test = np.load("data/y_test.npy")
     test_labels = y_test.astype(np.int32).ravel() if y_test.ndim == 1 or y_test.shape[1] == 1 else np.argmax(y_test, axis=1).astype(np.int32)
 
+    if getattr(config, 'cache_test_set', False) and not _use_tf():
+        import torch
+        X_test = torch.from_numpy(X_test).cuda()
+        print(f"{COLORS.OKCYAN}X_test pinned to GPU ({X_test.element_size() * X_test.nelement() / 1e6:.0f} MB){COLORS.ENDC}")
+
     eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
 
-    for round_number in range(1, config.rounds + 1):
-        round_dir = os.path.join(record_base, f"round_{round_number}")
+    for round_number in range(config.rounds, 0, -1):
+        if round_number in evaluated_rounds:
+            print(f"{COLORS.OKCYAN}Round {round_number}: already evaluated, skipping{COLORS.ENDC}")
+            continue
 
         if config.skip_eval and round_number != config.rounds:
             continue
+
+        round_dir = os.path.join(record_base, f"round_{round_number}")
 
         if global_model_eval:
             weight_path = os.path.join(round_dir, "global_weight.bin")
@@ -1760,6 +1809,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                 continue
 
             all_client_metrics = []
+            _eval_t0 = time.time()
             for client_id in range(n_clients):
                 with open(expected[client_id], "rb") as _f:
                     weights = pickle.load(_f)
@@ -1773,10 +1823,13 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     round_number, client_id,
                     metrics["Acc"], metrics["F1"], metrics["Precision"], metrics["Recall"], metrics["Loss"],
                 )
+                elapsed = time.time() - _eval_t0
+                eta = elapsed / (client_id + 1) * (n_clients - client_id - 1)
                 print(
-                    f"{COLORS.OKGREEN}Client {client_id}: Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                    f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+                    f"\r  Client {client_id+1}/{n_clients} | Acc={metrics['Acc']:.4f} F1={metrics['F1']:.4f} | {elapsed:.0f}s elapsed, ~{eta:.0f}s left",
+                    end="", flush=True,
                 )
+            print()
 
             avg_metrics = {k: np.mean([m[k] for m in all_client_metrics]) for k in ("Acc", "F1", "Precision", "Recall", "Loss")}
             round_metrics = {i: all_client_metrics[i] for i in range(n_clients)}
