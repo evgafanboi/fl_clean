@@ -3,6 +3,17 @@
 
 ## Data Preprocessing
 
+### Quick data setup for FL (with `CIC23_test.pkl` and `CIC23_train.pkl` already in `data/`) for `500 clients` with **label skewed** Non-IID:
+```bash
+# split all classes in CIC23_train.pkl to 34 dedicated per-class files
+python CIC23_groupsplit.py
+# partition data using the splitted 34 files, to 500 clients with label skew setting, Dirichlet alpha 0.1
+python partition_data.py --n_clients 500 --partition_type label_skew --alpha 0.1
+# since partitions are split to public and private slices (to accomodate public-data FL strategies like FedMD) and FL would take time to merge them into full client partitions for standard FL, pre-create the merged partitions with
+python restore_partition.py data/partitions/500_client/label_skew_0.1
+```
+> After this, FL simulations can be started immediately. See **Federated Learning** section.
+
 ##### Extract data/data.zip to CIC23_train.pkl and CIC23_test.pkl
 
 **1. Group class splits** (creates per-class PKL files in `data/CIC23/`):
@@ -15,7 +26,7 @@ python CIC23_groupsplit.py
 
 **2. Create client partitions**:
 ```sh
-python partition_data.py --num-clients 10 --partition-type iid
+python partition_data.py --n_clients 10 --partition_type iid
 ```
 
 Partition types:
@@ -24,7 +35,7 @@ Partition types:
 
 Heterogeneity in label skewing: (lower α = more skewed):
 ```sh
-python partition_data.py --num-clients 10 --partition-type label_skew --alpha 0.1
+python partition_data.py --n_clients 10 --partition_type label_skew --alpha 0.1
 ```
 
 - **Note:**
@@ -114,20 +125,34 @@ python3 -m FL --n_clients 10 --partition_type iid-500 --strategy FedSSD
 
 ## Federated Class Incremental Learning
 
+### 1. Further create per-task partitions for clients.
+
+- On existing FL partitions, random class-task mapping and split each client's partitions (both public and private slice) into tasks with `partition_task.py`. Note that the randomized class-task mapping is written to `results/` and used by `FCIL` to determine the class mask to be used at each task.
+
+```bash
+python partition_task.py --task_size 5 --benign_class 0 --partition_root data/partitions/ --partition_type label_skew_0.1 --n_clients 500 --data_dir data/CIC23
+```
+- `--task_size`: default `5`, determines the number of tasks to be created, where each task contains $\frac{N_{class}}{N_{task}}$ classes.
+- `--benign_class`: default `0`, determines the class to be always in the first task, for IDS datasets. Should be harmless for other types of dataset.
+- `--partition_root`, `--partition_type` and `--n_clients` are used to trace the exact FL partition folder.
+- `--data_dir` is used to determine the number of classes, given that there are already per-class files splitted from the training set.
+
+### 2. Run Federated class-incremental learning simulations
+
 ```sh
 python -m FCIL --n_clients <> --partition_type <> --strategy <> --rounds <> --cil <CIL method>
 ```
 **Strategies**:
-- `FedAvg`: Standard federated averaging
-- `FedCoMed`: Coordinate-wise Median
-- `FedSSD`: Federated Selective Self Distillation
+- `FedAvg`: Supported for all `CIL` methods.
+- `FedCoMed`: Coordinate-wise Median.
+- `FedSSD`: Federated Selective Self Distillation. Partially supported.
 
 **Class Incremental Learning method**
 #### For FedAvg and FedCoMed:
 - **finetune**: lower bound, normal finetune learning without CIL methods.
 - **LwF**: learning without forgetting, `--lwf_alpha` (default `0.5`) to control the LwF loss weight, and --lwf_temperature (default `2`) to control distillation temperature.
-- **EWC**: Elastic Weight Consolidation, `--ewc_lambda` control EWC $\lambda$, (default `10` - highest performance).
-- **iCaRL**[1]: Incremental Classifier and Representation Learning. **LwF** w/ **_exemplars_** management. `--mem` to control memory budget $K$ (default `200`), add `--bce` to use paper's binary cross entropy (default `off`, better for CICIoT23).
+- **EWC**: Elastic Weight Consolidation, `--ewc_lambda` control EWC $\lambda$, (default `10` - highest tested performance on MLP model).
+- **iCaRL**[1]: Incremental Classifier and Representation Learning. **LwF** w/ **_exemplars_** management. `--mem` to control memory budget $K$ (default `200`), add `--bce` to use paper's binary cross entropy (default `off` for CICIoT23).
     > **note**: `--mem` is used for all CIL methods that use exemplars.
 - **BiC**[20]: Large Scale Incremental Learning. Applies linear correction (bias correction) in addition to **iCaRL** exemplar-based learning. `--bic_val_split` to control validation set ratio for each class exemplar set (used to train the linear corrector), `--mem` to control exemplar size (same as **iCaRL**), and all **LwF** arguments `--lwf_alpha` and `--lwf_temperature`.
 
