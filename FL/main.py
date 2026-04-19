@@ -32,6 +32,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # ssfl-ids
     parser.add_argument("--dis_rounds", type=int, default=3, help="Discriminator rounds (SSFL-IDS)")
     parser.add_argument("--dist_rounds", type=int, default=2, help="Distillation rounds (SSFL-IDS)")
+    parser.add_argument("--train_rounds", type=int, default=3, help="Training rounds for SSFL-IDS")
     # robust filter
     parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (Byzantine ratio)")
     # cronus
@@ -68,7 +69,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--partition_type", type=str, default="iid-10", help="Partition descriptor, e.g., iid-10")
     parser.add_argument("--rounds", type=int, default=10, help="Number of federated rounds")
     parser.add_argument("--model", type=str, default="dense", help="Model architecture identifier (default: dense)")
-    parser.add_argument("--train_rounds", type=int, default=3, help="Training rounds for discriminator-based methods")
     parser.add_argument("--batch_size", type=int, default=8192, help="Minibatch size for local training")
     parser.add_argument("--epochs", type=int, default=5, help="Local epochs per round")
 
@@ -98,6 +98,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fresh_run", action="store_true", help="Delete existing weight records for this run and start fresh")
     parser.add_argument("--cache_test_set", action="store_true", help="Pin X_test to GPU VRAM before evaluation (avoids repeated host↔device transfers; ~1 GB VRAM)")
     parser.add_argument("--use_tf", action="store_true", help="Use TensorFlow backend (default: PyTorch)")
+    parser.add_argument("--mixed_models", action="store_true", help="Assign different model architectures to client quartiles (GRU/DCBLSTM/MLP/CNN)")
 
     return parser
 
@@ -108,6 +109,12 @@ def main(argv=None):
 
     from .backend import set_backend
     set_backend(args.use_tf)
+
+    MIXED_COMPATIBLE = {"FedProto", "Cronus", "SSFL-IDS", "Ours"}
+    if getattr(args, 'mixed_models', False) and args.strategy not in MIXED_COMPATIBLE:
+        print(f"\033[95mIncompatible strategy\033[0m")
+        return
+
     if args.strategy in DISTILLATION_STRATEGIES:
         from .strategy import FD, FedDKD, FedProto, FedMD, FedSSD, SSFLIDS, Exp1, ours, Cronus
         from .config import FDConfig
@@ -158,6 +165,7 @@ def main(argv=None):
             skip_eval=args.skip_eval,
             fresh_run=args.fresh_run,
             cache_test_set=args.cache_test_set,
+            mixed_models=args.mixed_models,
         )
         
         strategy = strategy_registry[args.strategy](config)

@@ -106,8 +106,10 @@ def evaluate_model_with_metrics(
     collect_details: bool = True,
     y_true_cache: Optional[np.ndarray] = None,
 ):
-    base_model = model.base_model if hasattr(model, 'base_model') else model
-    if hasattr(base_model, 'model'):
+    base_model = model
+    if hasattr(model, 'base_model') and hasattr(model.base_model, 'predict'):
+        base_model = model.base_model
+    if hasattr(base_model, 'model') and hasattr(base_model.model, 'predict'):
         base_model = base_model.model
 
     y_pred_proba = base_model.predict(test_dataset, verbose=0)

@@ -214,12 +214,16 @@ class Cronus(DistillationStrategy):
 
         from ..memory import clear_session
         clear_session()
-        reusable = create_model(context.input_dim, context.num_classes,
-                                cfg.batch_size, model_type=cfg.model_type)
-        init_w = reusable.get_weights()
 
-        context.shared_state["init_w"] = init_w
-        self._model = reusable
+        _mixed = getattr(cfg, 'mixed_models', False)
+        if not _mixed:
+            reusable = create_model(context.input_dim, context.num_classes,
+                                    cfg.batch_size, model_type=cfg.model_type)
+            init_w = reusable.get_weights()
+            context.shared_state["init_w"] = init_w
+            self._model = reusable
+        else:
+            self._model = None
 
         for cid, paths in enumerate(context.paths):
             st = context.add_client_state(cid, None, paths)
@@ -234,11 +238,12 @@ class Cronus(DistillationStrategy):
         t0 = time.time()
         cfg = context.config
         n_pub = context.shared_state["n_public"]
+        _mixed = getattr(cfg, 'mixed_models', False)
         model = self._model
         _REFRESH_EVERY = getattr(cfg, "cleanup_interval", 25)
 
         # Round-boundary refresh
-        if round_number > 1:
+        if round_number > 1 and not _mixed:
             del model
             from ..memory import clear_session
             clear_session()
@@ -246,6 +251,10 @@ class Cronus(DistillationStrategy):
             model = create_model(context.input_dim, context.num_classes,
                                  cfg.batch_size, model_type=cfg.model_type)
             self._model = model
+        elif round_number > 1:
+            from ..memory import clear_session
+            clear_session()
+            aggressive_memory_cleanup()
 
         base = np.load(_pub_path(), mmap_mode="r")
         perm = np.random.permutation(n_pub)
@@ -286,17 +295,28 @@ class Cronus(DistillationStrategy):
             cid = st.client_id
             poisoned = cid in context.poisoned_clients
 
-            # Periodic refresh to defrag GPU memory (same as FedAvg)
-            if idx > 0 and idx % _REFRESH_EVERY == 0:
-                del model
-                from ..memory import clear_session
-                clear_session()
-                aggressive_memory_cleanup()
+            if _mixed:
+                if idx > 0 and idx % _REFRESH_EVERY == 0:
+                    from ..memory import clear_session
+                    clear_session()
+                    aggressive_memory_cleanup()
+                from models.mixed_models import get_model_type_for_client
+                arch = get_model_type_for_client(cid, context.n_clients)
                 model = create_model(context.input_dim, context.num_classes,
-                                     cfg.batch_size, model_type=cfg.model_type)
-                self._model = model
-
-            model.set_weights(st.data["w"] or context.shared_state["init_w"])
+                                     cfg.batch_size, model_type=arch)
+                if st.data["w"]:
+                    model.set_weights(st.data["w"])
+            else:
+                # Periodic refresh to defrag GPU memory (same as FedAvg)
+                if idx > 0 and idx % _REFRESH_EVERY == 0:
+                    del model
+                    from ..memory import clear_session
+                    clear_session()
+                    aggressive_memory_cleanup()
+                    model = create_model(context.input_dim, context.num_classes,
+                                         cfg.batch_size, model_type=cfg.model_type)
+                    self._model = model
+                model.set_weights(st.data["w"] or context.shared_state["init_w"])
 
             print(f"\n{COLORS.BOLD}Client {cid}{COLORS.ENDC}")
 
@@ -328,6 +348,9 @@ class Cronus(DistillationStrategy):
             pred_cids.append(cid)
 
             del ds
+            if _mixed:
+                del model
+                model = None
             aggressive_memory_cleanup()
 
             # Per-client checkpoint (matches FedAvg pipeline pattern)

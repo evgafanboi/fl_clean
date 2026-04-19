@@ -1,4 +1,5 @@
 import dataclasses
+import glob
 import logging
 import os
 import pickle
@@ -489,6 +490,7 @@ class FederatedLearningPipeline:
             f"config_hash: {_config_fingerprint(self.config)}",
             f"strategy: {self.config.strategy}",
             f"n_clients: {n_clients}",
+            f"backend: {'tensorflow' if _use_tf() else 'pytorch'}",
         ]
         with open(os.path.join(ckpt_dir, "info.txt"), "w") as f:
             f.write("\n".join(info_lines) + "\n")
@@ -517,6 +519,7 @@ class FederatedLearningPipeline:
             f"selected_server: {selected_server if selected_server is not None else 'N/A'}",
             f"completed_rounds: {len(round_times)}",
             f"avg_round_time: {sum(round_times) / len(round_times):.2f}s" if round_times else "avg_round_time: N/A",
+            f"backend: {'tensorflow' if _use_tf() else 'pytorch'}",
         ]
         with open(os.path.join(ckpt_dir, "info.txt"), "w") as f:
             f.write("\n".join(info_lines) + "\n")
@@ -553,6 +556,13 @@ class FederatedLearningPipeline:
         current_hash = _config_fingerprint(self.config)
         if saved_hash and saved_hash != current_hash:
             print(f"{COLORS.WARNING}No checkpoint found, starting fresh{COLORS.ENDC}")
+            return None
+
+        saved_backend = info.get("backend", "")
+        current_backend = "tensorflow" if _use_tf() else "pytorch"
+        if saved_backend and saved_backend != current_backend:
+            print(f"{COLORS.WARNING}Checkpoint backend mismatch (saved={saved_backend}, current={current_backend}) "
+                  f"— weight arrays are incompatible across backends. Starting fresh{COLORS.ENDC}")
             return None
 
         with open(os.path.join(ckpt_dir, "global_weights.bin"), "rb") as f:
@@ -968,6 +978,8 @@ class FederatedLearningPipeline:
         extra_log_tokens = self.strategy_runtime.extra_log_tokens() if hasattr(self.strategy_runtime, 'extra_log_tokens') else {}
 
         extra_tokens = [self.config.model, *list(extra_log_tokens.values())]
+        if getattr(self.config, 'mixed_models', False):
+            extra_tokens.append("mixed_models")
         if self.config.decentralized:
             extra_tokens.append(self.config.decentralized)
 
@@ -1024,6 +1036,16 @@ class FederatedLearningPipeline:
         log_timestamp(self.logger, f"Strategy: {self.config.strategy}, Clients: {n_clients}, Rounds: {self.config.rounds}")
         round_times: List[float] = []
 
+        if self.config.fresh_run:
+            stem = os.path.splitext(os.path.basename(self.log_filename))[0]
+            _wr_base = os.path.join("temp_weights", f"{stem}_weight_record")
+            if os.path.isdir(_wr_base):
+                shutil.rmtree(_wr_base)
+            _ckpt_base = self._checkpoint_dir()
+            if os.path.isdir(_ckpt_base):
+                shutil.rmtree(_ckpt_base)
+            print(f"{COLORS.OKCYAN}fresh_run: cleared weight records and checkpoint{COLORS.ENDC}")
+
         if self.config.checkpoint:
             ckpt = self._load_checkpoint()
             if ckpt:
@@ -1040,8 +1062,6 @@ class FederatedLearningPipeline:
         # Check if final weight records already exist — skip training entirely
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
         record_base = os.path.join("temp_weights", f"{stem}_weight_record")
-        if self.config.fresh_run and os.path.isdir(record_base):
-            shutil.rmtree(record_base)
         _final_record_exists = os.path.exists(
             os.path.join(record_base, f"round_{self.config.rounds}", "global_weight.bin")
         )
@@ -1485,18 +1505,21 @@ def run_distillation_pipeline(config, strategy) -> None:
     n_clients = min(config.n_clients, client_count)
     
     extra_log_tokens = strategy.extra_log_tokens()
-    
+    extra_tokens = [config.model_type, *list(extra_log_tokens.values())]
+    if getattr(config, 'mixed_models', False):
+        extra_tokens.insert(0, "mixed_models")
+
     poison_suffix = ""
     if config.poison:
         poison_suffix = config.poison.replace(" ", "_")
-    
+
     logger, log_filename, detailed_logger = setup_logger(
         algorithm_name=strategy.name,
         n_clients=n_clients,
         partition_label=partition_label,
-        extra_tokens=[config.model_type, *list(extra_log_tokens.values())],
+        extra_tokens=extra_tokens,
         poison_suffix=poison_suffix,
-        resume=config.checkpoint,
+        resume=bool(config.checkpoint) and not getattr(config, 'fresh_run', False),
     )
     excel_filename = log_filename.replace(".log", ".xlsx")
     
@@ -1522,11 +1545,18 @@ def run_distillation_pipeline(config, strategy) -> None:
     model_type = getattr(config, "model_type", "dense")
     model_pool = None
     if getattr(strategy, "use_model_pool", True):
-        model_pool = ModelPool(
-            pool_size=min(10, n_clients),
-            factory_fn=lambda: create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type),
-            in_memory=True,
-        )
+        if getattr(config, 'mixed_models', False):
+            from .context import MixedModelPool
+            from models.mixed_models import get_model_type_for_client
+            archs = set(get_model_type_for_client(i, n_clients) for i in range(n_clients))
+            factory_map = {a: (lambda _a=a: create_strategy_model(input_dim, num_classes, config.batch_size, model_type=_a)) for a in archs}
+            model_pool = MixedModelPool(n_clients, factory_map)
+        else:
+            model_pool = ModelPool(
+                pool_size=min(10, n_clients),
+                factory_fn=lambda: create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type),
+                in_memory=True,
+            )
     
     poisoned_clients = []
     poison_loader = None
@@ -1571,6 +1601,14 @@ def run_distillation_pipeline(config, strategy) -> None:
     start_round = 1
     ckpt_stem = os.path.splitext(os.path.basename(log_filename))[0]
     ckpt_dir = os.path.join("checkpoint", ckpt_stem)
+    if getattr(config, 'fresh_run', False):
+        _wr_stem = os.path.splitext(os.path.basename(log_filename))[0]
+        _wr_base = os.path.join("temp_weights", f"{_wr_stem}_weight_record")
+        if os.path.isdir(_wr_base):
+            shutil.rmtree(_wr_base)
+        if os.path.isdir(ckpt_dir):
+            shutil.rmtree(ckpt_dir)
+        print(f"{COLORS.OKCYAN}fresh_run: cleared weight records and checkpoint{COLORS.ENDC}")
     if config.checkpoint:
         ckpt_info_path = os.path.join(ckpt_dir, "info.txt")
         if os.path.exists(ckpt_info_path):
@@ -1581,10 +1619,17 @@ def run_distillation_pipeline(config, strategy) -> None:
                     ckpt_info[key] = val
             saved_hash = ckpt_info.get("config_hash", "")
             current_hash = _config_fingerprint(config)
-            if saved_hash and saved_hash != current_hash:
+            saved_backend = ckpt_info.get("backend", "")
+            current_backend = "tensorflow" if _use_tf() else "pytorch"
+            if saved_backend and saved_backend != current_backend:
+                print(f"{COLORS.WARNING}Checkpoint backend mismatch (saved={saved_backend}, current={current_backend}) "
+                      f"— weight arrays are incompatible across backends. Starting fresh{COLORS.ENDC}")
+            elif saved_hash and saved_hash != current_hash:
                 print(f"{COLORS.WARNING}Checkpoint config mismatch (saved={saved_hash}, current={current_hash}) \u2014 starting fresh{COLORS.ENDC}")
             else:
-                start_round = int(ckpt_info["round"]) + 1
+                _ckpt_round = int(ckpt_info["round"])
+                _round_done = ckpt_info.get("round_complete", "true") == "true"
+                start_round = _ckpt_round + 1 if _round_done else _ckpt_round
                 shared_path = os.path.join(ckpt_dir, "shared_state.bin")
                 if os.path.exists(shared_path) and os.path.getsize(shared_path) > 0:
                     with open(shared_path, "rb") as _f:
@@ -1593,27 +1638,38 @@ def run_distillation_pipeline(config, strategy) -> None:
                 results_path = os.path.join(ckpt_dir, "results.pkl")
                 if os.path.exists(results_path):
                     context.results = pd.read_pickle(results_path)
-                print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {ckpt_info['round']}) -> starting round {start_round}{COLORS.ENDC}")
+                if _round_done:
+                    print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {_ckpt_round}) -> starting round {start_round}{COLORS.ENDC}")
+                else:
+                    _stg = ckpt_info.get('stage', '?')
+                    _sc = ckpt_info.get('stage_client', '?')
+                    print(f"{COLORS.OKGREEN}Resuming incomplete round {start_round} (stage={_stg}, client={_sc}){COLORS.ENDC}")
     
-    # Seed pool from last completed round's weight records on resume
-    if start_round > 1 and model_pool is not None:
-        prev_round = start_round - 1
-        prev_dir = os.path.join("temp_weights", f"{os.path.splitext(os.path.basename(log_filename))[0]}_weight_record", f"round_{prev_round}")
-        if os.path.isdir(prev_dir):
+    # Seed pool from weight records on resume
+    # For incomplete rounds: try current round's mid-round records first
+    #   (written by save_mid_round → _record_checkpoint_weights)
+    # For completed rounds: use previous round's records
+    if model_pool is not None:
+        _wr_stem = os.path.splitext(os.path.basename(log_filename))[0]
+        _wr_base = os.path.join("temp_weights", f"{_wr_stem}_weight_record")
+        _seed_dir = os.path.join(_wr_base, f"round_{start_round}")
+        if not os.path.isdir(_seed_dir) and start_round > 1:
+            _seed_dir = os.path.join(_wr_base, f"round_{start_round - 1}")
+        if os.path.isdir(_seed_dir):
             seeded = 0
             for i in range(n_clients):
-                wp = os.path.join(prev_dir, f"client_{i}_weight.bin")
+                wp = os.path.join(_seed_dir, f"client_{i}_weight.bin")
                 if os.path.exists(wp):
                     with open(wp, "rb") as _f:
                         model_pool._weights_cache[(i, "")] = model_pool._clone_weights(pickle.load(_f))
                     seeded += 1
-            print(f"{COLORS.OKCYAN}Seeded in-memory pool from round {prev_round} weight records ({seeded}/{n_clients} clients){COLORS.ENDC}")
+            if seeded > 0:
+                _seed_label = os.path.basename(_seed_dir)
+                print(f"{COLORS.OKCYAN}Seeded pool from {_seed_label} weight records ({seeded}/{n_clients} clients){COLORS.ENDC}")
 
     # Check if final weight records already exist — skip training entirely
     stem = os.path.splitext(os.path.basename(log_filename))[0]
     record_base = os.path.join("temp_weights", f"{stem}_weight_record")
-    if config.fresh_run and os.path.isdir(record_base):
-        shutil.rmtree(record_base)
     final_round_dir = os.path.join(record_base, f"round_{config.rounds}")
     _global_model_strategy = getattr(strategy, "has_global_model", False)
 
@@ -1630,10 +1686,30 @@ def run_distillation_pipeline(config, strategy) -> None:
         _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, _global_model_strategy)
         return
 
+    def _write_ckpt_info(rnd, complete):
+        os.makedirs(ckpt_dir, exist_ok=True)
+        _lines = [
+            f"round: {rnd}",
+            f"round_complete: {str(complete).lower()}",
+            f"total_rounds: {config.rounds}",
+            f"config_hash: {_config_fingerprint(config)}",
+            f"strategy: {strategy.name}",
+            f"n_clients: {n_clients}",
+            f"partition_type: {config.partition_type}",
+            f"poisoned_clients: {poisoned_clients if poisoned_clients else 'none'}",
+            f"backend: {'tensorflow' if _use_tf() else 'pytorch'}",
+        ]
+        with open(os.path.join(ckpt_dir, "info.txt"), "w") as _f:
+            _f.write("\n".join(_lines) + "\n")
+
     for round_number in range(start_round, config.rounds + 1):
         logger.info(f"Round {round_number}/{config.rounds}")
         print(f"\n{COLORS.HEADER}Round {round_number}/{config.rounds}{COLORS.ENDC}")
         log_timestamp(logger, f"Round {round_number} started")
+
+        # Mark round in-progress so a crash is distinguishable from completion
+        if config.checkpoint:
+            _write_ckpt_info(round_number, False)
         
         round_metrics = strategy.run_round(context, round_number)
         
@@ -1641,18 +1717,7 @@ def run_distillation_pipeline(config, strategy) -> None:
             _record_metrics(context, round_number, round_metrics, excel_filename)
 
         if config.checkpoint:
-            os.makedirs(ckpt_dir, exist_ok=True)
-            info_lines = [
-                f"round: {round_number}",
-                f"total_rounds: {config.rounds}",
-                f"config_hash: {_config_fingerprint(config)}",
-                f"strategy: {strategy.name}",
-                f"n_clients: {n_clients}",
-                f"partition_type: {config.partition_type}",
-                f"poisoned_clients: {poisoned_clients if poisoned_clients else 'none'}",
-            ]
-            with open(os.path.join(ckpt_dir, "info.txt"), "w") as _f:
-                _f.write("\n".join(info_lines) + "\n")
+            _write_ckpt_info(round_number, True)
             _SKIP_KEYS = {"extra_log_tokens", "global_model", "disc_pool"}
             saveable_shared = {}
             for k, v in context.shared_state.items():
@@ -1743,11 +1808,17 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     y_test = np.load("data/y_test.npy")
     test_labels = y_test.astype(np.int32).ravel() if y_test.ndim == 1 or y_test.shape[1] == 1 else np.argmax(y_test, axis=1).astype(np.int32)
 
+    if not _use_tf():
+        import torch
+        torch.cuda.empty_cache()
+
     if getattr(config, 'cache_test_set', False) and not _use_tf():
         import torch
         X_test = torch.from_numpy(X_test).cuda()
         print(f"{COLORS.OKCYAN}X_test pinned to GPU ({X_test.element_size() * X_test.nelement() / 1e6:.0f} MB){COLORS.ENDC}")
 
+    _mixed = getattr(config, 'mixed_models', False)
+    _eval_model_arch = model_type
     eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
 
     for round_number in range(config.rounds, 0, -1):
@@ -1786,49 +1857,99 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                 f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
             )
         else:
-            expected = [os.path.join(round_dir, f"client_{i}_weight.bin") for i in range(n_clients)]
-            if not all(os.path.exists(p) for p in expected):
-                logger.info(f"Round {round_number} | SKIPPED (incomplete weight records)")
-                print(f"{COLORS.WARNING}Round {round_number}: skipped (incomplete weight records){COLORS.ENDC}")
-                continue
+            global_weight_path = os.path.join(round_dir, "global_weight.bin")
+            _is_ssfl = getattr(config, 'algorithm', '') == "SSFL-IDS"
 
-            all_client_metrics = []
-            _eval_t0 = time.time()
-            for client_id in range(n_clients):
-                with open(expected[client_id], "rb") as _f:
-                    weights = pickle.load(_f)
-                eval_model.set_weights(weights)
-                del weights
-
-                metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
-                all_client_metrics.append(metrics)
+            if _is_ssfl and round_number == config.rounds:
+                client_bins = sorted(glob.glob(os.path.join(round_dir, "client_*_weight.bin")), key=lambda p: int(os.path.basename(p).split("_")[1]))
+                if not client_bins and not os.path.exists(global_weight_path):
+                    logger.info(f"Round {round_number} | SKIPPED (no weight record)")
+                    print(f"{COLORS.WARNING}Round {round_number}: skipped (no weight record){COLORS.ENDC}")
+                    continue
+                if client_bins:
+                    round_metrics: dict[int, dict] = {}
+                    for bin_path in client_bins:
+                        cid = int(os.path.basename(bin_path).split("_")[1])
+                        with open(bin_path, "rb") as _f:
+                            c_weights = pickle.load(_f)
+                        eval_model.set_weights(c_weights)
+                        del c_weights
+                        m = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
+                        round_metrics[cid] = m
+                        logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                                    round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["Loss"])
+                        print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
+                    avg = {k: float(np.mean([v[k] for v in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
+                    round_metrics[-1] = avg
+                    _record_metrics(context, round_number, round_metrics, excel_filename)
+                    logger.info("Round %s | AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                                round_number, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["Loss"])
+                    print(f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
+                          f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
+                if os.path.exists(global_weight_path):
+                    with open(global_weight_path, "rb") as _f:
+                        g_weights = pickle.load(_f)
+                    eval_model.set_weights(g_weights)
+                    del g_weights
+                    g_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
+                    _record_metrics(context, round_number, {-2: g_metrics}, excel_filename)
+                    logger.info("Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                                round_number, g_metrics["Acc"], g_metrics["F1"],
+                                g_metrics["Precision"], g_metrics["Recall"], g_metrics["Loss"])
+                    print(f"{COLORS.OKGREEN}Round {round_number} Global | Acc={g_metrics['Acc']:.4f}, F1={g_metrics['F1']:.4f}, "
+                          f"Precision={g_metrics['Precision']:.4f}, Recall={g_metrics['Recall']:.4f}, Loss={g_metrics['Loss']:.4f}{COLORS.ENDC}")
+            elif os.path.exists(global_weight_path):
+                with open(global_weight_path, "rb") as _f:
+                    g_weights = pickle.load(_f)
+                eval_model.set_weights(g_weights)
+                del g_weights
+                g_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
+                _record_metrics(context, round_number, {-2: g_metrics}, excel_filename)
                 logger.info(
-                    "Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                    round_number, client_id,
-                    metrics["Acc"], metrics["F1"], metrics["Precision"], metrics["Recall"], metrics["Loss"],
+                    "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                    round_number, g_metrics["Acc"], g_metrics["F1"],
+                    g_metrics["Precision"], g_metrics["Recall"], g_metrics["Loss"],
                 )
-                elapsed = time.time() - _eval_t0
-                eta = elapsed / (client_id + 1) * (n_clients - client_id - 1)
                 print(
-                    f"\r  Client {client_id+1}/{n_clients} | Acc={metrics['Acc']:.4f} F1={metrics['F1']:.4f} | {elapsed:.0f}s elapsed, ~{eta:.0f}s left",
-                    end="", flush=True,
+                    f"{COLORS.OKGREEN}Round {round_number} Global | Acc={g_metrics['Acc']:.4f}, F1={g_metrics['F1']:.4f}, "
+                    f"Precision={g_metrics['Precision']:.4f}, Recall={g_metrics['Recall']:.4f}, Loss={g_metrics['Loss']:.4f}{COLORS.ENDC}"
                 )
-            print()
-
-            avg_metrics = {k: np.mean([m[k] for m in all_client_metrics]) for k in ("Acc", "F1", "Precision", "Recall", "Loss")}
-            round_metrics = {i: all_client_metrics[i] for i in range(n_clients)}
-            round_metrics[-1] = avg_metrics
-            _record_metrics(context, round_number, round_metrics, excel_filename)
-
-            logger.info(
-                "Round %s | Avg | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                round_number, avg_metrics["Acc"], avg_metrics["F1"],
-                avg_metrics["Precision"], avg_metrics["Recall"], avg_metrics["Loss"],
-            )
-            print(
-                f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg_metrics['Acc']:.4f}, F1={avg_metrics['F1']:.4f}, "
-                f"Precision={avg_metrics['Precision']:.4f}, Recall={avg_metrics['Recall']:.4f}, Loss={avg_metrics['Loss']:.4f}{COLORS.ENDC}"
-            )
+            else:
+                client_bins = sorted(glob.glob(os.path.join(round_dir, "client_*_weight.bin")), key=lambda p: int(os.path.basename(p).split("_")[1]))
+                if not client_bins:
+                    logger.info(f"Round {round_number} | SKIPPED (no weight record)")
+                    print(f"{COLORS.WARNING}Round {round_number}: skipped (no weight record){COLORS.ENDC}")
+                    continue
+                round_metrics: dict[int, dict] = {}
+                for bin_path in client_bins:
+                    cid = int(os.path.basename(bin_path).split("_")[1])
+                    if _mixed:
+                        from models.mixed_models import get_model_type_for_client
+                        arch = get_model_type_for_client(cid, n_clients)
+                        if arch != _eval_model_arch:
+                            del eval_model
+                            eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=arch)
+                            _eval_model_arch = arch
+                    with open(bin_path, "rb") as _f:
+                        c_weights = pickle.load(_f)
+                    eval_model.set_weights(c_weights)
+                    del c_weights
+                    m = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
+                    round_metrics[cid] = m
+                    logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                                round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["Loss"])
+                    print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
+                avg = {k: float(np.mean([m[k] for m in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
+                round_metrics[-1] = avg
+                _record_metrics(context, round_number, round_metrics, excel_filename)
+                logger.info(
+                    "Round %s | AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                    round_number, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["Loss"],
+                )
+                print(
+                    f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
+                    f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
+                )
 
     del eval_model, X_test, y_test, test_labels
     aggressive_memory_cleanup()

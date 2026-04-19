@@ -51,6 +51,12 @@ def _create_pt_model(input_dim: int, num_classes: int, batch_size: int, model_ty
     if mt == "dcblstm":
         from models import pt_dcblstm
         return pt_dcblstm.create_dcblstm_model(input_dim, num_classes, batch_size)
+    if mt == "cnn":
+        from models.mixed_models import create_cnn_model
+        return create_cnn_model(input_dim, num_classes, batch_size)
+    if mt == "mixed_dcblstm":
+        from models.mixed_models import create_mixed_dcblstm_model
+        return create_mixed_dcblstm_model(input_dim, num_classes, batch_size)
     raise ValueError(f"Unknown model type: {model_type}")
 
 

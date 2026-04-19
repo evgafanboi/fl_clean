@@ -599,13 +599,28 @@ class Ours(DistillationStrategy):
             self._run_ce_stage(context, first_client=first_ce)
 
         if no_filter:
-            if not skip_logits and not skip_kd:
+            consensus_path = os.path.join(LOGITS_CACHE_DIR, f"r{round_number}_consensus.npy")
+
+            # Stage 1b — generate or load mean consensus
+            if not skip_logits:
                 print(f"\n{COLORS.OKCYAN}Generating logits + mean consensus in-memory (eps>={config.robust_epsilon}, no filtering){COLORS.ENDC}")
                 consensus_logits = self._generate_logits_mean(context, public_features)
                 print(f"  Consensus shape: {consensus_logits.shape}")
                 context.logger.info("Round %s | MeanConsensus (no filter) | shape=%s", round_number, consensus_logits.shape)
-                self._run_kd_stage(context, consensus_logits, public_features)
-                del consensus_logits
+                np.save(consensus_path, consensus_logits)
+            elif os.path.exists(consensus_path):
+                print(f"\n{COLORS.OKCYAN}Loading cached consensus logits for KD resume{COLORS.ENDC}")
+                consensus_logits = np.load(consensus_path)
+            else:
+                # Cache lost — regenerate from pool (post-CE weights still intact)
+                print(f"\n{COLORS.OKCYAN}Regenerating mean consensus for KD resume{COLORS.ENDC}")
+                consensus_logits = self._generate_logits_mean(context, public_features)
+
+            # Stage 2 — KD distillation
+            self._run_kd_stage(context, consensus_logits, public_features, first_client=first_kd)
+            del consensus_logits
+            if os.path.exists(consensus_path):
+                os.remove(consensus_path)
         else:
             if not skip_logits:
                 print(f"\n{COLORS.OKCYAN}Generating public logits{COLORS.ENDC}")

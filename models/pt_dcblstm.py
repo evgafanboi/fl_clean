@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .pt_common import _PTModelWrapper
@@ -25,15 +26,15 @@ class _DCBLSTMNet(nn.Module):
         x = self.ln_conv(F.relu(self.conv(x.unsqueeze(1))).transpose(1, 2))
         x, _ = self.bilstm1(x)
         x = self.ln_b1(x)
-        x, _ = self.bilstm2(x)
-        x = self.drop_b(x[:, -1, :])
+        x, (h_n, _) = self.bilstm2(x)
+        x = self.drop_b(torch.cat([h_n[0], h_n[1]], dim=-1))
         x = self.ln_feat(self.dnn(x))
         lg = self.logits(x)
         return lg if return_logits else F.softmax(lg, dim=-1)
 
 
 class PTDCBLSTMModel(_PTModelWrapper):
-    def __init__(self, input_dim, num_classes, batch_size=4096, learning_rate=None):
+    def __init__(self, input_dim, num_classes, batch_size=8192, learning_rate=None):
         lr = learning_rate or 0.001 * (batch_size / 1024) ** 0.5
         print(f"PT DCBLSTM Model - Using learning rate: {lr:.6f} for batch size {batch_size}")
         net = _DCBLSTMNet(input_dim, num_classes)
@@ -41,5 +42,5 @@ class PTDCBLSTMModel(_PTModelWrapper):
                          l2_modules=[], optimizer_eps=1e-7)
 
 
-def create_dcblstm_model(input_dim, num_classes, batch_size=4096, learning_rate=None):
+def create_dcblstm_model(input_dim, num_classes, batch_size=8192, learning_rate=None):
     return PTDCBLSTMModel(input_dim, num_classes, batch_size, learning_rate)

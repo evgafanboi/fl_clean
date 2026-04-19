@@ -69,6 +69,48 @@ class ModelPool:
         self._available = [self._factory_fn() for _ in range(self._pool_size)]
 
 
+class MixedModelPool:
+    def __init__(self, n_clients, factory_map):
+        self._n_clients = n_clients
+        self._factory_map = factory_map
+        self._weights_cache: Dict = {}
+        self.in_memory = True
+
+    @staticmethod
+    def _clone_weights(weights):
+        return [np.array(w, copy=True) for w in weights]
+
+    def _get_arch(self, client_id):
+        from models.mixed_models import get_model_type_for_client
+        return get_model_type_for_client(client_id, self._n_clients)
+
+    def _get_weights(self, model):
+        return model.get_weights()
+
+    def _set_weights(self, model, weights):
+        model.set_weights(self._clone_weights(weights))
+
+    def checkout(self, client_id, tag=""):
+        arch = self._get_arch(client_id)
+        model = self._factory_map[arch]()
+        key = (client_id, tag)
+        if key in self._weights_cache:
+            model.set_weights(self._clone_weights(self._weights_cache[key]))
+        return model
+
+    def checkin(self, client_id, model, tag=""):
+        self._weights_cache[(client_id, tag)] = self._clone_weights(model.get_weights())
+
+    def release(self, model):
+        pass
+
+    def save(self, client_id, model, tag=""):
+        self._weights_cache[(client_id, tag)] = self._clone_weights(model.get_weights())
+
+    def refresh(self):
+        pass
+
+
 @dataclass
 class ClientState:
     client_id: int
@@ -139,7 +181,9 @@ def evaluate_model(model: Any, X_test: np.ndarray, y_labels: np.ndarray,
     if hasattr(base, "model"):
         base = base.model
 
-    preds = base.predict(X_test, batch_size=batch_size, verbose=0)
+    # No gradients needed for eval — use a larger batch to saturate the GPU.
+    infer_bs = batch_size * 4 if not _use_tf() else batch_size
+    preds = base.predict(X_test, batch_size=infer_bs, verbose=0)
     pred_labels = np.argmax(preds, axis=1).astype(np.int32)
     y_oh = np.zeros((len(y_labels), num_classes), dtype=np.float32)
     y_oh[np.arange(len(y_labels)), y_labels] = 1.0

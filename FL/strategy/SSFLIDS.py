@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pickle
 import time
 from typing import Dict, List
 
@@ -58,6 +59,7 @@ def train_discriminator(
     dis_rounds: int,
     batch_size: int,
     private_X_path: str,
+    dis_rng: np.random.RandomState,
 ) -> bool:
     logits_model = classify_model.get_logits_model() if hasattr(classify_model, "get_logits_model") else classify_model
 
@@ -80,8 +82,12 @@ def train_discriminator(
         return False
 
     X_mmap = np.load(private_X_path, mmap_mode="r")
-    sure_known_feature = np.array(X_mmap[: len(sure_unknown_feature)], dtype=np.float32)
+    sure_known_feature = np.array(X_mmap, dtype=np.float32)
     del X_mmap
+
+    if len(sure_unknown_feature) > len(sure_known_feature):
+        idx = dis_rng.choice(len(sure_unknown_feature), len(sure_known_feature), replace=False)
+        sure_unknown_feature = sure_unknown_feature[idx]
 
     dis_X = np.vstack([sure_known_feature, sure_unknown_feature])
     dis_y = np.concatenate([
@@ -122,26 +128,26 @@ def predict_with_discriminator(
     output_path: str,
 ) -> None:
     logits_model = classify_model.get_logits_model() if hasattr(classify_model, "get_logits_model") else classify_model
-
     boundary = 1.0 / num_classes
-    hard_labels: List[int] = []
 
-    for start in range(0, len(X_open), batch_size):
-        X_batch = X_open[start:start + batch_size]
-        logits = logits_model.predict(X_batch, batch_size=batch_size, verbose=0)
-        probs = _softmax_np(logits)
-        dis_pred = discri_model.predict(X_batch, batch_size=batch_size, verbose=0).reshape(-1)
-        probs[dis_pred > 0.5] = 1.0 / num_classes
-        for row in probs:
-            max_p = float(np.max(row))
-            hard_labels.append(int(np.argmax(row)) if max_p > boundary else num_classes)
-        del X_batch, probs, dis_pred
+    logits = logits_model.predict(X_open, batch_size=batch_size, verbose=0)
+    probs = _softmax_np(logits)
+    del logits
 
-    np.save(output_path, np.array(hard_labels, dtype=np.int32))
+    dis_pred = discri_model.predict(X_open, batch_size=batch_size, verbose=0).reshape(-1)
+    probs[dis_pred > 0.5] = 1.0 / num_classes
+    del dis_pred
+
+    max_p = np.max(probs, axis=1)
+    best = np.argmax(probs, axis=1).astype(np.int32)
+    hard_labels = np.where(max_p > boundary, best, np.int32(num_classes)).astype(np.int32)
+    del probs, max_p, best
+
+    np.save(output_path, hard_labels)
     del hard_labels
 
 
-def hard_label_vote(pred_files: List[str], num_classes: int) -> np.ndarray:
+def hard_label_vote(pred_files: List[str], num_classes: int, logger=None) -> np.ndarray:
     mmaps = [np.load(f, mmap_mode="r") for f in pred_files]
     sample_cnt = mmaps[0].shape[0]
     voted = np.empty(sample_cnt, dtype=np.int32)
@@ -159,6 +165,16 @@ def hard_label_vote(pred_files: List[str], num_classes: int) -> np.ndarray:
         del label_votes
 
     del mmaps
+
+    total = max(len(voted), 1)
+    counts = np.bincount(voted, minlength=num_classes)[:num_classes]
+    parts = [f"{i} ({100 * c / total:.1f} %)" for i, c in enumerate(counts)]
+    lines = [" | ".join(parts[i:i + 10]) for i in range(0, len(parts), 10)]
+    msg = "Vote: " + "\n      ".join(lines)
+    print(msg)
+    if logger is not None:
+        logger.info("Vote: %s", " | ".join(parts))
+
     return voted
 
 
@@ -189,16 +205,22 @@ class SSFLIDS(DistillationStrategy):
 
         from ..memory import clear_session
         clear_session()
-        reusable = create_model(context.input_dim, context.num_classes,
-                                config.batch_size, model_type=config.model_type)
-        context.shared_state["init_w"] = reusable.get_weights()
-        self._model = reusable
+
+        _mixed = getattr(config, 'mixed_models', False)
+        if not _mixed:
+            reusable = create_model(context.input_dim, context.num_classes,
+                                    config.batch_size, model_type=config.model_type)
+            context.shared_state["init_w"] = reusable.get_weights()
+            self._model = reusable
+        else:
+            self._model = None
 
         disc_pool = ModelPool(
             pool_size=min(5, len(context.paths)),
             factory_fn=lambda: create_discriminator(context.input_dim),
         )
         context.shared_state["disc_pool"] = disc_pool
+        context.shared_state["dis_rng"] = np.random.RandomState(42)
 
         for client_id, paths in enumerate(context.paths):
             st = context.add_client_state(client_id, None, paths)
@@ -214,10 +236,12 @@ class SSFLIDS(DistillationStrategy):
         config = context.config
         n_public = context.shared_state["public_sample_count"]
         disc_pool = context.shared_state["disc_pool"]
+        dis_rng = context.shared_state["dis_rng"]
+        _mixed = getattr(config, 'mixed_models', False)
         model = self._model
         _REFRESH_EVERY = getattr(config, "cleanup_interval", 25)
 
-        if round_number > 1:
+        if round_number > 1 and not _mixed:
             del model
             from ..memory import clear_session
             clear_session()
@@ -225,6 +249,11 @@ class SSFLIDS(DistillationStrategy):
             model = create_model(context.input_dim, context.num_classes,
                                  config.batch_size, model_type=config.model_type)
             self._model = model
+            disc_pool.refresh()
+        elif round_number > 1:
+            from ..memory import clear_session
+            clear_session()
+            aggressive_memory_cleanup()
             disc_pool.refresh()
 
         base_mmap = np.load(_base_public_path(), mmap_mode="r")
@@ -266,19 +295,31 @@ class SSFLIDS(DistillationStrategy):
             if client_idx < first_s1:
                 continue
 
-            if client_idx > 0 and client_idx % _REFRESH_EVERY == 0:
-                del model
-                from ..memory import clear_session
-                clear_session()
-                aggressive_memory_cleanup()
+            if _mixed:
+                if client_idx > 0 and client_idx % _REFRESH_EVERY == 0:
+                    from ..memory import clear_session
+                    clear_session()
+                    aggressive_memory_cleanup()
+                    disc_pool.refresh()
+                from models.mixed_models import get_model_type_for_client
+                arch = get_model_type_for_client(state.client_id, context.n_clients)
                 model = create_model(context.input_dim, context.num_classes,
-                                     config.batch_size, model_type=config.model_type)
-                self._model = model
-                disc_pool.refresh()
+                                     config.batch_size, model_type=arch)
+                if state.data["w"]:
+                    model.set_weights(state.data["w"])
+            else:
+                if client_idx > 0 and client_idx % _REFRESH_EVERY == 0:
+                    del model
+                    from ..memory import clear_session
+                    clear_session()
+                    aggressive_memory_cleanup()
+                    model = create_model(context.input_dim, context.num_classes,
+                                         config.batch_size, model_type=config.model_type)
+                    self._model = model
+                    disc_pool.refresh()
+                model.set_weights(state.data["w"] or context.shared_state["init_w"])
 
             cid = state.client_id
-            model.set_weights(state.data["w"] or context.shared_state["init_w"])
-
             print(f"\n{COLORS.BOLD}Client {cid} Stage I{COLORS.ENDC}")
             ds = create_client_dataset(
                 state.paths["train_X"], state.paths["train_y"],
@@ -290,6 +331,8 @@ class SSFLIDS(DistillationStrategy):
             if np.sum(state.data["class_counts"] > 0) <= 1:
                 print("  Skipping discriminator (insufficient classes)")
                 state.data["w"] = model.get_weights()
+                if _mixed:
+                    del model
                 aggressive_memory_cleanup()
                 continue
 
@@ -297,12 +340,14 @@ class SSFLIDS(DistillationStrategy):
             trained = train_discriminator(
                 model, disc, open_feature,
                 config.dis_rounds, config.batch_size,
-                state.paths["train_X"],
+                state.paths["train_X"], dis_rng,
             )
             if not trained:
                 print("  Discriminator training skipped (no uncertain samples)")
                 disc_pool.checkin(cid, disc)
                 state.data["w"] = model.get_weights()
+                if _mixed:
+                    del model
                 aggressive_memory_cleanup()
                 continue
 
@@ -332,13 +377,16 @@ class SSFLIDS(DistillationStrategy):
                     },
                 })
 
+            if _mixed:
+                del model
+
         del open_feature
         aggressive_memory_cleanup()
 
         print(f"\n{COLORS.HEADER}Round {round_number} Stage II{COLORS.ENDC}")
         pseudo_y_path = os.path.join(SSFLIDS_CACHE_DIR, f"r{round_number}_pseudo_y.npy")
         if not skip_stage2_init and not os.path.exists(pseudo_y_path):
-            global_labels_np = hard_label_vote(pred_files, context.num_classes)
+            global_labels_np = hard_label_vote(pred_files, context.num_classes, logger=context.logger)
             np.save(pseudo_y_path, global_labels_np)
             del global_labels_np
         aggressive_memory_cleanup()
@@ -360,13 +408,15 @@ class SSFLIDS(DistillationStrategy):
                 continue
 
             if s2_idx > 0 and s2_idx % _REFRESH_EVERY == 0:
-                del model
+                if not _mixed:
+                    del model
                 from ..memory import clear_session
                 clear_session()
                 aggressive_memory_cleanup()
-                model = create_model(context.input_dim, context.num_classes,
-                                     config.batch_size, model_type=config.model_type)
-                self._model = model
+                if not _mixed:
+                    model = create_model(context.input_dim, context.num_classes,
+                                         config.batch_size, model_type=config.model_type)
+                    self._model = model
                 pub_X = np.array(np.load(pub_X_path, mmap_mode="r"), dtype=np.float32)
                 pseudo_y_arr = np.array(np.load(pseudo_y_path, mmap_mode="r"), dtype=np.int32)
                 valid_mask = pseudo_y_arr >= 0
@@ -377,6 +427,12 @@ class SSFLIDS(DistillationStrategy):
                 p = np.random.permutation(len(pub_X))
                 public_ds = _make_public_ds(pub_X[p], y_cat[p], config.batch_size)
                 del pub_X, pseudo_y_arr, y_cat, p, valid_mask
+
+            if _mixed:
+                from models.mixed_models import get_model_type_for_client
+                arch = get_model_type_for_client(state.client_id, context.n_clients)
+                model = create_model(context.input_dim, context.num_classes,
+                                     config.batch_size, model_type=arch)
 
             model.set_weights(state.data["w"])
             print(f"Client {state.client_id}: training on pseudo-labeled public data")
@@ -399,7 +455,53 @@ class SSFLIDS(DistillationStrategy):
                     },
                 })
 
+            if _mixed:
+                del model
+
         del public_ds
+
+        print(f"\n{COLORS.HEADER}Round {round_number} Global model{COLORS.ENDC}")
+        pub_X = np.array(np.load(pub_X_path, mmap_mode="r"), dtype=np.float32)
+        pseudo_y_arr = np.array(np.load(pseudo_y_path, mmap_mode="r"), dtype=np.int32)
+        valid_mask = pseudo_y_arr >= 0
+        pub_X = pub_X[valid_mask]
+        pseudo_y_arr = pseudo_y_arr[valid_mask]
+        y_cat = np.zeros((len(pseudo_y_arr), context.num_classes), dtype=np.float32)
+        y_cat[np.arange(len(pseudo_y_arr)), pseudo_y_arr] = 1.0
+        p = np.random.permutation(len(pub_X))
+        global_ds = _make_public_ds(pub_X[p], y_cat[p], config.batch_size)
+        del pub_X, pseudo_y_arr, y_cat, p, valid_mask
+
+        if not _mixed:
+            del model
+        from ..memory import clear_session
+        clear_session()
+        aggressive_memory_cleanup()
+        global_model = create_model(context.input_dim, context.num_classes,
+                                    config.batch_size, model_type=config.model_type)
+        if not _mixed:
+            global_model.set_weights(context.shared_state["init_w"])
+        global_model.fit(global_ds, epochs=config.dist_rounds, verbose=0)
+        del global_ds
+
+        stem = os.path.splitext(os.path.basename(context.log_filename))[0]
+        record_dir = os.path.join("temp_weights", f"{stem}_weight_record", f"round_{round_number}")
+        os.makedirs(record_dir, exist_ok=True)
+        g_path = os.path.join(record_dir, "global_weight.bin")
+        tmp = g_path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(global_model.get_weights(), f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, g_path)
+        print(f"  Global model saved to {g_path}")
+
+        del global_model
+        clear_session()
+        aggressive_memory_cleanup()
+        if not _mixed:
+            model = create_model(context.input_dim, context.num_classes,
+                                 config.batch_size, model_type=config.model_type)
+            self._model = model
+
         for name in os.listdir(SSFLIDS_CACHE_DIR):
             if name.startswith(f"r{round_number}_"):
                 os.remove(os.path.join(SSFLIDS_CACHE_DIR, name))

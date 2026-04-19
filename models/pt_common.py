@@ -1,7 +1,31 @@
+import contextlib
 import math
 import numpy as np
 import torch
 import torch.nn as nn
+
+
+def _infer_ctx(dev):
+    """Return an autocast context for GPU inference, or a no-op for CPU."""
+    if dev.type == 'cuda':
+        return torch.cuda.amp.autocast()
+    return contextlib.nullcontext()
+
+
+def _to_gpu_once(X, dev):
+    """Pin a numpy array in host memory and transfer to *dev* in one DMA shot.
+
+    Returns a CUDA tensor.  Much faster than per-batch .to(dev) because the
+    PCIe DMA engine runs without CPU involvement when the source buffer is
+    pinned, and only one round-trip is needed for the entire array.
+    """
+    if isinstance(X, torch.Tensor):
+        return X if X.device.type == dev.type else X.to(dev, non_blocking=True)
+    arr = X if X.dtype == np.float32 else X.astype(np.float32)
+    t = torch.from_numpy(arr)
+    if dev.type == 'cuda':
+        t = t.pin_memory()
+    return t.to(dev, non_blocking=True)
 
 
 def _dev():
@@ -64,17 +88,21 @@ class _PTLogitsWrapper:
         self._w.nn.to(dev)
         self._w.nn.eval()
         bs = batch_size or self._w.batch_size
-        results = []
-        with torch.no_grad():
-            if isinstance(X, np.ndarray):
-                X_t = torch.from_numpy(X.astype(np.float32))
-                for i in range(0, len(X_t), bs):
-                    results.append(self._w.nn(X_t[i:i + bs].to(dev), return_logits=True).cpu().numpy())
+        parts = []
+        with torch.no_grad(), _infer_ctx(dev):
+            if isinstance(X, torch.Tensor) and X.device.type == dev.type:
+                for i in range(0, len(X), bs):
+                    parts.append(self._w.nn(X[i:i + bs], return_logits=True))
+            elif isinstance(X, (np.ndarray, torch.Tensor)):
+                arr = X.cpu().numpy() if isinstance(X, torch.Tensor) else X
+                arr = arr if arr.dtype == np.float32 else arr.astype(np.float32)
+                for i in range(0, len(arr), bs):
+                    parts.append(self._w.nn(torch.from_numpy(arr[i:i + bs]).to(dev, non_blocking=True), return_logits=True))
             else:
                 for batch in X:
                     x = batch[0] if isinstance(batch, (list, tuple)) else batch
-                    results.append(self._w.nn(x.to(dev), return_logits=True).cpu().numpy())
-        return np.concatenate(results)
+                    parts.append(self._w.nn(x.to(dev, non_blocking=True), return_logits=True))
+        return torch.cat(parts).cpu().numpy()
 
     def __call__(self, X, training=False):
         dev = _dev()
@@ -146,20 +174,21 @@ class _PTModelWrapper:
         self.nn.to(dev)
         self.nn.eval()
         bs = batch_size or self.batch_size
-        results = []
-        with torch.no_grad():
-            if isinstance(X, torch.Tensor):
+        parts = []
+        with torch.no_grad(), _infer_ctx(dev):
+            if isinstance(X, torch.Tensor) and X.device.type == dev.type:
                 for i in range(0, len(X), bs):
-                    results.append(self.nn(X[i:i + bs]).cpu().numpy())
-            elif isinstance(X, np.ndarray):
-                X_t = torch.from_numpy(X.astype(np.float32))
-                for i in range(0, len(X_t), bs):
-                    results.append(self.nn(X_t[i:i + bs].to(dev)).cpu().numpy())
+                    parts.append(self.nn(X[i:i + bs]))
+            elif isinstance(X, (np.ndarray, torch.Tensor)):
+                arr = X.cpu().numpy() if isinstance(X, torch.Tensor) else X
+                arr = arr if arr.dtype == np.float32 else arr.astype(np.float32)
+                for i in range(0, len(arr), bs):
+                    parts.append(self.nn(torch.from_numpy(arr[i:i + bs]).to(dev, non_blocking=True)))
             else:
                 for batch in X:
                     x = batch[0] if isinstance(batch, (list, tuple)) else batch
-                    results.append(self.nn(x.to(dev)).cpu().numpy())
-        return np.concatenate(results)
+                    parts.append(self.nn(x.to(dev, non_blocking=True)))
+        return torch.cat(parts).cpu().numpy()
 
     def predict_proba(self, X, **kwargs):
         return self.predict(X, **kwargs)
@@ -169,10 +198,10 @@ class _PTModelWrapper:
         self.nn.to(dev)
         self.nn.eval()
         total_loss, total = 0.0, 0
-        with torch.no_grad():
+        with torch.no_grad(), _infer_ctx(dev):
             for X_b, y_b in dataset:
-                X_b = X_b.to(dev)
-                y_cls = y_b.argmax(dim=1).to(dev) if y_b.ndim > 1 else y_b.long().to(dev)
+                X_b = X_b.to(dev, non_blocking=True)
+                y_cls = y_b.argmax(dim=1).to(dev, non_blocking=True) if y_b.ndim > 1 else y_b.long().to(dev, non_blocking=True)
                 loss = self.criterion(self.nn(X_b, return_logits=True), y_cls)
                 total_loss += loss.item() * len(X_b)
                 total += len(X_b)
@@ -183,6 +212,13 @@ class _PTModelWrapper:
 
     def set_weights(self, weights):
         sd = self.nn.state_dict()
+        if len(weights) != len(sd):
+            raise ValueError(
+                f"Weight count mismatch: model expects {len(sd)} arrays "
+                f"but received {len(weights)}. This usually means the "
+                f"checkpoint was saved with a different backend (TF vs PT) "
+                f"or a different model architecture."
+            )
         new_sd = {
             k: torch.from_numpy(np.array(w, dtype=np.float32)).to(dtype=v.dtype)
             for (k, v), w in zip(sd.items(), weights)

@@ -39,11 +39,6 @@ class _FedMLBDenseNet(nn.Module):
         self.logits_g = nn.Linear(64, num_classes)
         _freeze([self.b2g, self.b3g, self.logits_g])
 
-    def train(self, mode=True):
-        super().train(mode)
-        self.b2g.eval(); self.b3g.eval(); self.logits_g.eval()
-        return self
-
     def forward(self, x, return_logits=False):
         _, _, lg, probs = self._local(x)
         return lg if return_logits else probs
@@ -117,11 +112,6 @@ class _FedMLBGRUNet(nn.Module):
         self.logits_g = nn.Linear(64, num_classes)
         _freeze([self.gru2g, self.gru3g, self.headg, self.logits_g])
 
-    def train(self, mode=True):
-        super().train(mode)
-        self.gru2g.eval(); self.gru3g.eval(); self.headg.eval(); self.logits_g.eval()
-        return self
-
     def forward(self, x, return_logits=False):
         _, _, _, lg, probs = self._local(x)
         return lg if return_logits else probs
@@ -184,8 +174,8 @@ class _BiLSTMBlock(nn.Module):
     def forward(self, x):
         x, _ = self.bilstm1(x)
         x = self.ln(x)
-        x, _ = self.bilstm2(x)
-        return self.drop(x[:, -1, :])
+        x, (h_n, _) = self.bilstm2(x)
+        return self.drop(torch.cat([h_n[0], h_n[1]], dim=-1))
 
 
 class _MLPBlock(nn.Module):
@@ -217,12 +207,6 @@ class _FedMLBDCBLSTMNet(nn.Module):
         self.mlp3_g = _MLPBlock(dnn_sizes[1], dnn_sizes[2], 0.1, has_ln=True)
         self.logits_g = nn.Linear(dnn_sizes[2], num_classes)
         _freeze([self.bilstm_g, self.mlp1_g, self.mlp2_g, self.mlp3_g, self.logits_g])
-
-    def train(self, mode=True):
-        super().train(mode)
-        for m in [self.bilstm_g, self.mlp1_g, self.mlp2_g, self.mlp3_g, self.logits_g]:
-            m.eval()
-        return self
 
     def forward(self, x, return_logits=False):
         _, _, _, _, lg, probs = self._local(x)
@@ -303,9 +287,9 @@ class _FedMLBWrapper:
         self.nn.train()
         T = self.temperature
         l1, l2 = self.lambda1, self.lambda2
-        history = {"loss": []}
+        history = {"loss": [], "loss_main": [], "loss_hybrid_ce": [], "loss_hybrid_kl": []}
         for epoch in range(epochs):
-            total_loss, batches = 0.0, 0
+            sum_loss, sum_main, sum_hce, sum_hkl, batches = 0.0, 0.0, 0.0, 0.0, 0
             for X_b, y_b in dataloader:
                 X_b = X_b.to(dev, non_blocking=True)
                 y_b = y_b.to(dev, non_blocking=True)
@@ -326,40 +310,49 @@ class _FedMLBWrapper:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.nn.parameters(), 0.5)
                 self.optimizer.step()
-                total_loss += loss.item()
+                sum_loss += loss.item()
+                sum_main += loss_main.item()
+                sum_hce += loss_hce.item()
+                sum_hkl += loss_hkl.item()
                 batches += 1
-            avg = total_loss / max(batches, 1)
+            n = max(batches, 1)
+            avg, avg_m, avg_hce, avg_hkl = sum_loss / n, sum_main / n, sum_hce / n, sum_hkl / n
             history["loss"].append(avg)
-            print(f"    epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
+            history["loss_main"].append(avg_m)
+            history["loss_hybrid_ce"].append(avg_hce)
+            history["loss_hybrid_kl"].append(avg_hkl)
+            print(f"    epoch {epoch + 1}/{epochs}  loss={avg:.4f}  main={avg_m:.4f}  hce={avg_hce:.4f}  hkl={avg_hkl:.4f}")
         return _PTHistory(history)
 
     def predict(self, X, batch_size=None, verbose=None, **kwargs):
+        from .pt_common import _infer_ctx, _to_gpu_once
         dev = _dev()
         self.nn.to(dev)
         self.nn.eval()
         bs = batch_size or self.batch_size
-        results = []
-        with torch.no_grad():
-            if isinstance(X, np.ndarray):
-                X_t = torch.from_numpy(X.astype(np.float32))
-                for i in range(0, len(X_t), bs):
-                    results.append(self.nn(X_t[i:i + bs].to(dev)).cpu().numpy())
+        parts = []
+        with torch.no_grad(), _infer_ctx(dev):
+            if isinstance(X, (np.ndarray, torch.Tensor)):
+                X_gpu = _to_gpu_once(X, dev)
+                for i in range(0, len(X_gpu), bs):
+                    parts.append(self.nn(X_gpu[i:i + bs]))
             else:
                 for batch in X:
                     x = batch[0] if isinstance(batch, (list, tuple)) else batch
-                    results.append(self.nn(x.to(dev)).cpu().numpy())
-        return np.concatenate(results)
+                    parts.append(self.nn(x.to(dev, non_blocking=True)))
+        return torch.cat(parts).cpu().numpy()
 
     def evaluate(self, dataset, verbose=0):
+        from .pt_common import _infer_ctx
         dev = _dev()
         self.nn.to(dev)
         self.nn.eval()
         total_loss, total = 0.0, 0
         criterion = nn.CrossEntropyLoss()
-        with torch.no_grad():
+        with torch.no_grad(), _infer_ctx(dev):
             for X_b, y_b in dataset:
-                X_b = X_b.to(dev)
-                y_cls = y_b.argmax(dim=1).to(dev) if y_b.ndim > 1 else y_b.long().to(dev)
+                X_b = X_b.to(dev, non_blocking=True)
+                y_cls = y_b.argmax(dim=1).to(dev, non_blocking=True) if y_b.ndim > 1 else y_b.long().to(dev, non_blocking=True)
                 loss = criterion(self.nn(X_b, return_logits=True), y_cls)
                 total_loss += loss.item() * len(X_b)
                 total += len(X_b)
@@ -370,6 +363,13 @@ class _FedMLBWrapper:
 
     def set_weights(self, weights):
         sd = self.nn.state_dict()
+        if len(weights) != len(sd):
+            raise ValueError(
+                f"Weight count mismatch: model expects {len(sd)} arrays "
+                f"but received {len(weights)}. This usually means the "
+                f"checkpoint was saved with a different backend (TF vs PT) "
+                f"or a different model architecture."
+            )
         new_sd = {
             k: torch.from_numpy(np.array(w, dtype=np.float32)).to(dtype=v.dtype)
             for (k, v), w in zip(sd.items(), weights)

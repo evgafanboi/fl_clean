@@ -48,8 +48,10 @@ def _ckpt_dir(context: Any) -> str:
 
 def save_mid_round(context: Any, tag: str, payload: Dict[str, Any]) -> None:
     """Atomically write *payload* to ``<ckpt_dir>/<tag>_mid.bin``.
-    
-    Also records client weights for eval replay up to last_client_idx.
+
+    Also records client weights for eval replay up to last_client_idx
+    and updates ``info.txt`` with stage progress so a crash mid-round
+    can be resumed correctly.
     """
     d = _ckpt_dir(context)
     os.makedirs(d, exist_ok=True)
@@ -60,6 +62,9 @@ def save_mid_round(context: Any, tag: str, payload: Dict[str, Any]) -> None:
     os.replace(tmp, dst)
     last = payload.get("last_client_idx", "?")
     print(f"{COLORS.OKCYAN}  Mid-round checkpoint saved ({tag}, client {last}){COLORS.ENDC}")
+
+    # Update info.txt with stage progress
+    _update_info_stage(d, payload)
 
     round_num = payload.get("round")
     last_idx = payload.get("last_client_idx")
@@ -80,6 +85,25 @@ def _record_checkpoint_weights(context: Any, round_num: int, last_client_idx: in
         w = context.model_pool._get_weights(model)
         context.model_pool.release(model)
         context.record_client_weight(round_num, st.client_id, w)
+
+
+def _update_info_stage(ckpt_dir: str, payload: Dict[str, Any]) -> None:
+    """Merge stage progress into the existing ``info.txt``."""
+    info_path = os.path.join(ckpt_dir, "info.txt")
+    if not os.path.exists(info_path):
+        return
+    info: Dict[str, str] = {}
+    with open(info_path) as f:
+        for line in f:
+            key, _, val = line.strip().partition(": ")
+            if key:
+                info[key] = val
+    if "stage" in payload:
+        info["stage"] = str(payload["stage"])
+    if "last_client_idx" in payload:
+        info["stage_client"] = str(payload["last_client_idx"])
+    with open(info_path, "w") as f:
+        f.write("\n".join(f"{k}: {v}" for k, v in info.items()) + "\n")
 
 
 def load_mid_round(context: Any, tag: str, round_number: int) -> Optional[Dict[str, Any]]:

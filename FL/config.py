@@ -35,6 +35,7 @@ class FDConfig:
     skip_eval: bool = False
     fresh_run: bool = False
     cache_test_set: bool = False
+    mixed_models: bool = False
 
     def to_algorithm_params(self) -> dict:
         return {
