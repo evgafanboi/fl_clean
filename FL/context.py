@@ -107,6 +107,9 @@ class MixedModelPool:
     def save(self, client_id, model, tag=""):
         self._weights_cache[(client_id, tag)] = self._clone_weights(model.get_weights())
 
+    def get_cached_weights(self, client_id, tag=""):
+        return self._weights_cache.get((client_id, tag))
+
     def refresh(self):
         pass
 
@@ -169,6 +172,11 @@ class PipelineContext:
                 continue
             if self.model_pool is None:
                 continue
+            if hasattr(self.model_pool, 'get_cached_weights'):
+                w = self.model_pool.get_cached_weights(st.client_id)
+                if w is not None:
+                    self.record_client_weight(round_num, st.client_id, w)
+                    continue
             model = self.model_pool.checkout(st.client_id)
             w = self.model_pool._get_weights(model)
             self.model_pool.release(model)

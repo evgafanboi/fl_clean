@@ -57,6 +57,19 @@ def save_mid_round(context: Any, tag: str, payload: Dict[str, Any]) -> None:
     os.makedirs(d, exist_ok=True)
     tmp = os.path.join(d, f"{tag}_mid.bin.tmp")
     dst = os.path.join(d, f"{tag}_mid.bin")
+
+    # Determine first_idx: only write clients that are new since the last checkpoint
+    # (same stage = incremental; stage transition = full rewrite from 0)
+    first_idx = 0
+    if os.path.exists(dst):
+        try:
+            with open(dst, "rb") as f:
+                prev = pickle.load(f)
+            if prev.get("stage") == payload.get("stage"):
+                first_idx = prev.get("last_client_idx", -1) + 1
+        except Exception:
+            pass
+
     with open(tmp, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, dst)
@@ -69,21 +82,27 @@ def save_mid_round(context: Any, tag: str, payload: Dict[str, Any]) -> None:
     round_num = payload.get("round")
     last_idx = payload.get("last_client_idx")
     if round_num is not None and last_idx is not None:
-        _record_checkpoint_weights(context, round_num, last_idx)
+        _record_checkpoint_weights(context, round_num, first_idx, last_idx)
 
 
-def _record_checkpoint_weights(context: Any, round_num: int, last_client_idx: int) -> None:
-    """Record client weights for all completed clients up to last_client_idx."""
-    for st in context.client_states[:last_client_idx + 1]:
+def _record_checkpoint_weights(context: Any, round_num: int, first_client_idx: int, last_client_idx: int) -> None:
+    """Record client weights for clients from first_client_idx to last_client_idx."""
+    for st in context.client_states[first_client_idx:last_client_idx + 1]:
         w = st.data.get("w")
         if w is not None:
             context.record_client_weight(round_num, st.client_id, w)
             continue
         if context.model_pool is None:
             continue
-        model = context.model_pool.checkout(st.client_id)
-        w = context.model_pool._get_weights(model)
-        context.model_pool.release(model)
+        pool = context.model_pool
+        if hasattr(pool, 'get_cached_weights'):
+            w = pool.get_cached_weights(st.client_id)
+            if w is not None:
+                context.record_client_weight(round_num, st.client_id, w)
+                continue
+        model = pool.checkout(st.client_id)
+        w = pool._get_weights(model)
+        pool.release(model)
         context.record_client_weight(round_num, st.client_id, w)
 
 
