@@ -1,7 +1,9 @@
-numpy==2.1.3
-pandas==2.2.3
-scikit-learn==1.6.1
-tensorflow==2.19.0
-matplotlib==3.10.3
+numpy
+pandas
+scikit-learn
+tensorflow
+matplotlib
 phe==1.5.0
-torch==2.12.0.dev20260408+cu128
+torch
+tqdm
+openpyxl
