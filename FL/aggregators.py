@@ -67,7 +67,9 @@ def _fedcomed_client_factory(_: Any, __: Dict[str, Any]) -> FedAvg:
 
 def _robust_filter_factory(params: Dict[str, Any]) -> RobustFilterWeights:
     epsilon = params.get('epsilon', params.get('robust_epsilon', 0.2))
-    return RobustFilterWeights(epsilon=epsilon)
+    n_clients = int(params.get('n_clients', 100))
+    budget = params.get('robust_rm_budget', max(0, n_clients // 2 - 1))
+    return RobustFilterWeights(epsilon=epsilon, budget=budget)
 
 
 def _robust_filter_client_factory(_: Any, __: Dict[str, Any]) -> FedAvg:

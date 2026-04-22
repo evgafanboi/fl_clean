@@ -20,40 +20,25 @@ class RobustFilter:
     Parameters
     ----------
     epsilon : float
-        Assumed Byzantine fraction.  Higher epsilon = MORE lenient
-        (the filter tolerates more variance before triggering).
-        Must be in (0, 0.5); values >= 0.5 disable filtering.
-    expansion : float
-        Tolerance multiplier for the spectral stop condition.
-        Ref 2 uses 20.0.  Combined with the auto-estimated sigma
-        and the eps-dependent slack, this sets the threshold:
-            max_eig  <=  expansion * sigma * (1 + eps * log(1/eps))
-        where sigma is the median positive eigenvalue (auto).
+        Assumed Byzantine fraction.  Controls threshold sensitivity only.
+        Higher epsilon = more lenient threshold. Must be in (0, 0.5);
+        values >= 0.5 disable filtering.
+    budget : int
+        Maximum number of clients to remove. Decoupled from epsilon.
+        Early stopping prevents over-filtering when budget > actual outliers.
     """
 
-    def __init__(self, epsilon: float = 0.2, expansion: float = 20.0, **_kw):
+    def __init__(self, epsilon: float = 0.2, budget: Optional[int] = None, **_kw):
         self.epsilon = epsilon
-        self.expansion = expansion
-
-    def _max_removals(self, K: int) -> int:
-        if self.epsilon >= 0.5:
-            return 0
-        return max(1, int(np.ceil(self.epsilon * K)))
+        self.budget = int(budget) if budget is not None else 0
 
     def _threshold(self, eigenvalues: np.ndarray) -> float:
-        """Spectral stop threshold, auto-scaled to the data.
-
-        sigma  = median of positive eigenvalues (robust scale estimate).
-        slack  = 1 + eps * ln(1/eps)      (from Ref 1, Theorem 1.2).
-
-        Higher epsilon  →  larger slack  →  higher threshold  →  more lenient.
-        """
         if self.epsilon >= 0.5:
             return float('inf')
         pos = eigenvalues[eigenvalues > 1e-10]
         sigma = float(np.median(pos)) if len(pos) > 0 else 1.0
         slack = 1.0 + self.epsilon * np.log(1.0 / self.epsilon)
-        return self.expansion * sigma * slack
+        return sigma * slack
 
     # ── iterative scalar path ────────────────────────────────────────────
 
@@ -69,12 +54,11 @@ class RobustFilter:
         d = samples[0].shape[0]
         S = np.vstack(samples)
         active = np.ones(n, dtype=bool)
-        budget = self._max_removals(n)
 
         w = np.ones(n, dtype=np.float64) / n if weights is None \
             else np.asarray(weights, dtype=np.float64) / np.sum(weights)
 
-        for _ in range(budget):
+        for _ in range(self.budget):
             if active.sum() <= 1:
                 break
             aw = w[active] / w[active].sum()
@@ -111,7 +95,6 @@ class RobustFilter:
         d = samples[0].shape[0]
         S = np.vstack(samples)
         active = np.ones(n, dtype=bool)
-        budget = self._max_removals(n)
 
         w = np.ones(n, dtype=np.float64) / n if weights is None \
             else np.asarray(weights, dtype=np.float64) / np.sum(weights)
@@ -119,7 +102,7 @@ class RobustFilter:
         g_max_eig = None
         g_max_ratio = None
 
-        for _ in range(budget):
+        for _ in range(self.budget):
             if active.sum() <= 1:
                 break
             aw = w[active] / w[active].sum()
@@ -159,60 +142,63 @@ class RobustFilter:
 
     def compute_robust_mean_batch(self, S_batch: np.ndarray) -> tuple:
         """
-        Vectorised batch robust mean for logit consensus.
+        Iterative batch robust mean for logit consensus.
         S_batch: (N, K, D).
+        Removes up to budget clients globally (one per iteration, the client
+        with the highest total projection magnitude across triggered samples).
         Returns (means, max_eigenvalue, removal_counts, max_ratio).
         """
         N, K, D = S_batch.shape
-        mu_S = S_batch.mean(axis=1)
 
         if self.epsilon >= 0.5:
-            return mu_S.astype(np.float32), None, np.zeros(K, dtype=np.int64), None
+            return S_batch.mean(axis=1).astype(np.float32), None, np.zeros(K, dtype=np.int64), None
 
-        centered = S_batch - mu_S[:, np.newaxis, :]
-        Sigma = np.einsum('nkd,nke->nde', centered, centered) / (K - 1)
-
-        eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
-        max_eigs = eigenvalues[:, -1]
-
-        # auto sigma: median of positive eigenvalues per sample
-        effective_rank = min(K - 1, D)
-        top_eigs = np.sort(np.abs(eigenvalues), axis=1)[:, -effective_rank:]
-        median_eigs = np.median(top_eigs, axis=1)
+        active = np.ones(K, dtype=bool)
+        removal_counts = np.zeros(K, dtype=np.int64)
+        g_max_eig = None
+        g_max_ratio = None
         slack = 1.0 + self.epsilon * np.log(1.0 / self.epsilon)
-        thresholds = self.expansion * median_eigs * slack
-        below_thresh = max_eigs <= thresholds
 
-        # ratio for logging: max / median
-        ratios = max_eigs / np.maximum(median_eigs, 1e-10)
+        for _ in range(self.budget):
+            K_act = int(active.sum())
+            if K_act <= 1:
+                break
+            S_act = S_batch[:, active, :]
+            mu_S = S_act.mean(axis=1)
+            centered = S_act - mu_S[:, np.newaxis, :]
+            Sigma = np.einsum('nkd,nke->nde', centered, centered) / (K_act - 1)
+            eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
+            max_eigs = eigenvalues[:, -1]
 
-        # top eigenvector & projections
-        v_star = eigenvectors[:, :, -1]
-        abs_proj = np.abs(np.einsum('nkd,nd->nk', centered, v_star))
+            effective_rank = min(K_act - 1, D)
+            top_eigs = np.sort(np.abs(eigenvalues), axis=1)[:, -effective_rank:]
+            median_eigs = np.median(top_eigs, axis=1)
+            thresholds = median_eigs * slack
+            below_thresh = max_eigs <= thresholds
 
-        # remove single most-extreme client per triggered sample
-        n_idx = np.arange(N)
-        worst_client = np.argmax(abs_proj, axis=1)
-        filt_mask = np.ones((N, K), dtype=bool)
-        filt_mask[n_idx, worst_client] = False
-        filt_mask[below_thresh] = True
+            above = ~below_thresh
+            if above.any():
+                cur_max_eig = float(max_eigs[above].max())
+                if g_max_eig is None or cur_max_eig > g_max_eig:
+                    g_max_eig = cur_max_eig
+                ratios = max_eigs / np.maximum(median_eigs, 1e-10)
+                cur_max_ratio = float(ratios[above].max())
+                if g_max_ratio is None or cur_max_ratio > g_max_ratio:
+                    g_max_ratio = cur_max_ratio
 
-        mask_sum = filt_mask.sum(axis=1, keepdims=True).astype(np.float64)
-        filt_float = filt_mask.astype(np.float64)
-        filtered_means = (np.einsum('nkd,nk->nd', S_batch, filt_float)
-                          / np.maximum(mask_sum, 1.0))
+            if below_thresh.all():
+                break
 
-        use_filtered = ~below_thresh
-        means = np.where(use_filtered[:, np.newaxis], filtered_means, mu_S).astype(np.float32)
+            v_star = eigenvectors[:, :, -1]
+            abs_proj = np.abs(np.einsum('nkd,nd->nk', centered, v_star))
+            abs_proj[below_thresh] = 0.0
+            worst_active = int(np.argmax(abs_proj.sum(axis=0)))
+            worst_global = int(np.where(active)[0][worst_active])
+            active[worst_global] = False
+            removal_counts[worst_global] = 1
 
-        removed_mask = (~filt_mask) & use_filtered[:, np.newaxis]
-        removal_counts = removed_mask.sum(axis=0).astype(np.int64)
-
-        above = ~below_thresh
-        batch_max_eig = float(max_eigs[above].max()) if above.any() else None
-        batch_max_ratio = float(ratios[above].max()) if above.any() else None
-
-        return means, batch_max_eig, removal_counts, batch_max_ratio
+        means = S_batch[:, active, :].mean(axis=1).astype(np.float32)
+        return means, g_max_eig, removal_counts, g_max_ratio
 
     # ── convenience ──────────────────────────────────────────────────────
 
@@ -228,9 +214,58 @@ class RobustFilter:
         return self.compute_robust_mean(client_updates, weights)
 
 
+class CronusRobustFilter:
+    """
+    Cronus-specific robust filter with a fixed eigenvalue threshold of 9.
+    No epsilon, no slack, no tail bound — just budget-limited removal.
+    """
+
+    THRESHOLD = 9.0
+
+    def __init__(self, budget: int = 0):
+        self.budget = int(budget)
+
+    def compute_robust_mean_batch(self, S_batch: np.ndarray) -> tuple:
+        N, K, D = S_batch.shape
+        active = np.ones(K, dtype=bool)
+        removal_counts = np.zeros(K, dtype=np.int64)
+        g_max_eig = None
+
+        for _ in range(self.budget):
+            K_act = int(active.sum())
+            if K_act <= 1:
+                break
+            S_act = S_batch[:, active, :]
+            mu_S = S_act.mean(axis=1)
+            centered = S_act - mu_S[:, np.newaxis, :]
+            Sigma = np.einsum('nkd,nke->nde', centered, centered) / (K_act - 1)
+            eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
+            max_eigs = eigenvalues[:, -1]
+
+            above = max_eigs > self.THRESHOLD
+            if above.any():
+                cur = float(max_eigs[above].max())
+                if g_max_eig is None or cur > g_max_eig:
+                    g_max_eig = cur
+
+            if not above.any():
+                break
+
+            v_star = eigenvectors[:, :, -1]
+            abs_proj = np.abs(np.einsum('nkd,nd->nk', centered, v_star))
+            abs_proj[~above] = 0.0
+            worst_active = int(np.argmax(abs_proj.sum(axis=0)))
+            worst_global = int(np.where(active)[0][worst_active])
+            active[worst_global] = False
+            removal_counts[worst_global] = 1
+
+        means = S_batch[:, active, :].mean(axis=1).astype(np.float32)
+        return means, g_max_eig, removal_counts, None
+
+
 class RobustFilterWeights(RobustFilter):
-    def __init__(self, epsilon: float = 0.2, **_kw):
-        super().__init__(epsilon=epsilon, expansion=20.0)
+    def __init__(self, epsilon: float = 0.2, budget: Optional[int] = None, **_kw):
+        super().__init__(epsilon=epsilon, budget=budget)
 
     def aggregate(
         self,
@@ -247,8 +282,8 @@ class RobustFilterWeights(RobustFilter):
 
 
 class RobustFilterLogits(RobustFilter):
-    def __init__(self, epsilon: float = 0.2, **_kw):
-        super().__init__(epsilon=epsilon, expansion=20.0)
+    def __init__(self, epsilon: float = 0.2, budget: Optional[int] = None, **_kw):
+        super().__init__(epsilon=epsilon, budget=budget)
 
     def aggregate_per_class_logits(
         self,

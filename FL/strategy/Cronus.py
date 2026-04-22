@@ -14,10 +14,10 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, apply_gaussian_noise_scale
+from ..poison_utils import parse_poison_config
 from .base import DistillationStrategy
 from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
-from .robust_filter import RobustFilter
+from .robust_filter import CronusRobustFilter
 from tqdm import tqdm
 
 CACHE_DIR = os.path.join("temp_weights", "cronus_cache")
@@ -50,9 +50,9 @@ def _predict_to_file(model, X: np.ndarray, num_classes: int,
 
 
 def _robust_filter(pred_files: List[str], n_samples: int,
-                   num_classes: int, epsilon: float,
+                   num_classes: int, budget: int,
                    ) -> Tuple[np.ndarray, Optional[float], Optional[float], Set[int]]:
-    rf = RobustFilter(epsilon=epsilon)
+    rf = CronusRobustFilter(budget=budget)
     row_bytes = num_classes * 4
     CHUNK = 50_000
     pseudo = np.empty(n_samples, dtype=np.int32)
@@ -335,11 +335,13 @@ class Cronus(DistillationStrategy):
                     context.input_dim, context.num_classes,
                     cfg.batch_size, poison_loader=p_loader)
 
+            old_w = model.get_weights()
             model.fit(ds, epochs=cfg.epochs)
-            st.data["w"] = model.get_weights()
+            new_w = model.get_weights()
+            st.data["w"] = new_w
 
             if poisoned and attack_type == "gradient_scale":
-                apply_gaussian_noise_scale(model, poison_value)
+                model.set_weights([o + poison_value * (n - o) for o, n in zip(old_w, new_w)])
 
             pf = _pred_path(cid, round_number)
             _predict_to_file(model, open_X, context.num_classes,
@@ -365,36 +367,36 @@ class Cronus(DistillationStrategy):
         aggressive_memory_cleanup()
 
         # ---- robust filter ----
-        print(f"\n{COLORS.HEADER}Robust filtering{COLORS.ENDC}")
-        eps = getattr(cfg, "robust_epsilon", 0.2)
-        pseudo_file = _pseudo_path(round_number)
-        if not os.path.exists(pseudo_file):
-            pseudo, max_eig, max_ratio, removed_idx = _robust_filter(
-                pred_files, n_pub, context.num_classes, eps)
+        if round_number < cfg.rounds:
+            print(f"\n{COLORS.HEADER}Robust filtering{COLORS.ENDC}")
+            budget = getattr(cfg, "robust_rm_budget", getattr(cfg, "n_clients", 100) // 2 - 1)
+            pseudo_file = _pseudo_path(round_number)
+            if not os.path.exists(pseudo_file):
+                pseudo, max_eig, max_ratio, removed_idx = _robust_filter(
+                    pred_files, n_pub, context.num_classes, budget)
 
-            removed_cids = sorted({pred_cids[i] for i in removed_idx})
-            eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
-            ratio_s = f"{max_ratio:.4f}" if max_ratio is not None else "N/A"
-            valid_n = int(np.sum(pseudo >= 0))
-            print(f"  epsilon={eps}  max_eig={eig_s}  max_ratio={ratio_s}  removed={removed_cids or 'none'}")
-            print(f"  {valid_n}/{n_pub} pseudo-labeled")
-            context.logger.info(
-                "Round %s | RobustFilter | eps=%.4f | max_eig=%s | max_ratio=%s | removed=%s | valid=%d/%d",
-                round_number, eps, eig_s, ratio_s, removed_cids or "none", valid_n, n_pub)
+                removed_cids = sorted({pred_cids[i] for i in removed_idx})
+                eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
+                valid_n = int(np.sum(pseudo >= 0))
+                print(f"  budget={budget}  max_eig={eig_s}  threshold=9  removed={removed_cids or 'none'}")
+                print(f"  {valid_n}/{n_pub} pseudo-labeled")
+                context.logger.info(
+                    "Round %s | RobustFilter | threshold=9 | max_eig=%s | removed=%s | valid=%d/%d",
+                    round_number, eig_s, removed_cids or "none", valid_n, n_pub)
 
-            np.save(pseudo_file, pseudo)
-            del pseudo
+                np.save(pseudo_file, pseudo)
+                del pseudo
 
-            for f in pred_files:
-                if os.path.exists(f):
-                    os.remove(f)
-        else:
-            print(f"  Pseudo labels already exist, skipping robust filter")
-        if round_number > 1:
-            self._cleanup(round_number - 1)
+                for f in pred_files:
+                    if os.path.exists(f):
+                        os.remove(f)
+            else:
+                print(f"  Pseudo labels already exist, skipping robust filter")
+            if round_number > 1:
+                self._cleanup(round_number - 1)
 
-        context.shared_state["pseudo_path"] = pseudo_file
-        context.shared_state["pub_X_path"] = pub_X_file
+            context.shared_state["pseudo_path"] = pseudo_file
+            context.shared_state["pub_X_path"] = pub_X_file
 
         # Clear mid-round checkpoint now that the round completed successfully
         if getattr(cfg, "checkpoint", 0):

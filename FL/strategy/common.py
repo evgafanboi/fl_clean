@@ -248,6 +248,8 @@ def _load_public_dataloader_from_clients(
             y_oh = np.zeros((len(y_raw), num_classes), dtype=np.float32)
             y_oh[np.arange(len(y_raw)), y_raw] = 1.0
             y_parts.append(y_oh)
+    if not X_parts:
+        raise ValueError("No public data found in client partitions")
     X_all = np.concatenate(X_parts, axis=0)
     if shuffle:
         idx = np.random.permutation(len(X_all))

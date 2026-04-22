@@ -17,6 +17,7 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, ModelPool
+from ..poison_utils import parse_poison_config
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
@@ -240,6 +241,7 @@ class SSFLIDS(DistillationStrategy):
         _mixed = getattr(config, 'mixed_models', False)
         model = self._model
         _REFRESH_EVERY = getattr(config, "cleanup_interval", 25)
+        attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
 
         if round_number > 1 and not _mixed:
             del model
@@ -325,12 +327,14 @@ class SSFLIDS(DistillationStrategy):
                 state.paths["train_X"], state.paths["train_y"],
                 context.input_dim, context.num_classes, config.batch_size,
             )
+            old_w = model.get_weights()
             model.fit(ds, epochs=config.train_rounds, verbose=0)
             del ds
+            new_w = model.get_weights()
 
             if np.sum(state.data["class_counts"] > 0) <= 1:
                 print("  Skipping discriminator (insufficient classes)")
-                state.data["w"] = model.get_weights()
+                state.data["w"] = new_w
                 if _mixed:
                     del model
                 aggressive_memory_cleanup()
@@ -345,12 +349,14 @@ class SSFLIDS(DistillationStrategy):
             if not trained:
                 print("  Discriminator training skipped (no uncertain samples)")
                 disc_pool.checkin(cid, disc)
-                state.data["w"] = model.get_weights()
+                state.data["w"] = new_w
                 if _mixed:
                     del model
                 aggressive_memory_cleanup()
                 continue
 
+            if cid in context.poisoned_clients and attack_type == "gradient_scale":
+                model.set_weights([o + poison_value * (n - o) for o, n in zip(old_w, new_w)])
             pred_path = _pred_path(cid, round_number)
             predict_with_discriminator(
                 model, disc, open_feature,
@@ -359,7 +365,7 @@ class SSFLIDS(DistillationStrategy):
             disc_pool.checkin(cid, disc)
             pred_files.append(pred_path)
 
-            state.data["w"] = model.get_weights()
+            state.data["w"] = new_w
 
             if _ckpt and (
                 client_idx == len(context.client_states) - 1

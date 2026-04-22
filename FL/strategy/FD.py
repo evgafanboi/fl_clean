@@ -11,6 +11,7 @@ if _use_tf():
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
+from ..poison_utils import parse_poison_config
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
@@ -323,6 +324,7 @@ class FederatedDistillation(DistillationStrategy):
         all_client_metrics = []
         round_metrics: Dict[int, Dict[str, float]] = {}
         pool = context.model_pool
+        attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
 
         _ckpt = getattr(config, "checkpoint", 0)
         first_client = 0
@@ -372,6 +374,7 @@ class FederatedDistillation(DistillationStrategy):
             global_logits = global_logits_per_client.get(state.client_id, {})
 
             model = pool.checkout(state.client_id)
+            old_w = model.get_weights()
             model = local_training_with_distillation(
                 model,
                 private_dataset,
@@ -382,6 +385,9 @@ class FederatedDistillation(DistillationStrategy):
                 config.batch_size,
                 client_class_counts=client_counts,
             )
+            new_w = model.get_weights()
+            if state.client_id in context.poisoned_clients and attack_type == "gradient_scale":
+                model.set_weights([o + poison_value * (n - o) for o, n in zip(old_w, new_w)])
 
             logits, counts = generate_per_class_logits(
                 model,
@@ -392,6 +398,8 @@ class FederatedDistillation(DistillationStrategy):
             all_client_logits[state.client_id] = logits
             all_client_counts_for_round[state.client_id] = counts
 
+            if state.client_id in context.poisoned_clients and attack_type == "gradient_scale":
+                model.set_weights(new_w)
             pool.checkin(state.client_id, model)
 
             del private_dataset

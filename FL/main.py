@@ -34,7 +34,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dist_rounds", type=int, default=2, help="Distillation rounds (SSFL-IDS)")
     parser.add_argument("--train_rounds", type=int, default=3, help="Training rounds for SSFL-IDS")
     # robust filter
-    parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (Byzantine ratio)")
+    parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (threshold sensitivity, not budget)")
+    parser.add_argument("--robust_rm_budget", type=int, default=None, help="RobustFilter max removals (default: n_clients//2 - 1)")
     # cronus
     parser.add_argument("--remove_dis", action="store_true", help="Cronus: use plain softmax predictions")
     # fedssd
@@ -115,6 +116,8 @@ def main(argv=None):
         print(f"\033[95mIncompatible strategy\033[0m")
         return
 
+    robust_rm_budget = args.robust_rm_budget if args.robust_rm_budget is not None else (args.n_clients // 2 - 1)
+
     if args.strategy in DISTILLATION_STRATEGIES:
         from .strategy import FD, FedDKD, FedProto, FedMD, FedSSD, SSFLIDS, Exp1, ours, Cronus
         from .config import FDConfig
@@ -159,6 +162,7 @@ def main(argv=None):
             ab_beta=args.ab_beta,
             ours_temperature=args.ours_temperature,
             robust_epsilon=args.robust_epsilon,
+            robust_rm_budget=robust_rm_budget,
             remove_dis=args.remove_dis,
             checkpoint=args.checkpoint,
             cleanup_interval=args.cleanup_interval,
@@ -184,6 +188,7 @@ def main(argv=None):
 
             model=args.model,
             robust_epsilon=args.robust_epsilon,
+            robust_rm_budget=robust_rm_budget,
             poison=" ".join(args.poison) if args.poison else None,
             root_iterations=args.root_iterations,
             lambda1=args.lambda1,

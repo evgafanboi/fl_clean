@@ -105,6 +105,7 @@ class FLConfig:
 
     model: str = "dense"
     robust_epsilon: float = 0.2
+    robust_rm_budget: Optional[int] = None
     robust_tau: float = 0.1
     cleanup_interval: int = 10
     poison: Optional[str] = None
@@ -134,6 +135,7 @@ class FLConfig:
 
             'feddyn_alpha': self.feddyn_alpha,
             'epsilon': self.robust_epsilon,
+            'robust_rm_budget': self.robust_rm_budget,
             'robust_tau': self.robust_tau,
             'lambda1': self.lambda1,
             'lambda2': self.lambda2,

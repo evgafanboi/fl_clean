@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -29,6 +30,7 @@ class FDConfig:
     ab_beta: float = 0.0
     ours_temperature: float = 4.0
     robust_epsilon: float = 0.2
+    robust_rm_budget: Optional[int] = None
     remove_dis: bool = False
     checkpoint: int = 0
     cleanup_interval: int = 10

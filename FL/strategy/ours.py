@@ -14,6 +14,7 @@ from tqdm import tqdm
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
+from ..poison_utils import parse_poison_config
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .robust_filter import RobustFilter
@@ -383,6 +384,7 @@ class Ours(DistillationStrategy):
         self.ce_epochs = config.epochs
         self.robust_filter = RobustFilter(
             epsilon=config.robust_epsilon,
+            budget=getattr(config, "robust_rm_budget", None),
         )
 
     def extra_log_tokens(self) -> Dict[str, float]:
@@ -424,6 +426,7 @@ class Ours(DistillationStrategy):
         pool = context.model_pool
         logit_files = []
         logit_shape = None
+        attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
 
         for skipped_idx in range(first_client):
@@ -436,7 +439,9 @@ class Ours(DistillationStrategy):
                 continue
             fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{state.client_id}.bin")
             model = pool.checkout(state.client_id)
-
+            pre_ce_w = state.data.get("pre_ce_w") if state.client_id in context.poisoned_clients and attack_type == "gradient_scale" else None
+            if pre_ce_w is not None:
+                model.set_weights([o + poison_value * (n - o) for o, n in zip(pre_ce_w, model.get_weights())])
             _, shape = generate_logits_to_file(
                 model, public_features, config.batch_size, fpath,
             )
@@ -533,12 +538,15 @@ class Ours(DistillationStrategy):
     def _run_ce_stage(self, context, first_client=0):
         config = context.config
         pool = context.model_pool
+        attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_client:
                 continue
             print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 1 (CE){COLORS.ENDC}")
             model = pool.checkout(state.client_id)
+            if state.client_id in context.poisoned_clients and attack_type == "gradient_scale":
+                state.data["pre_ce_w"] = model.get_weights()
             private_dataset = create_private_dataset(
                 state.paths["train_X"], state.paths["train_y"],
                 context.input_dim, context.num_classes, config.batch_size,
