@@ -142,7 +142,9 @@ class PipelineContext:
     shared_state: Dict[str, Any] = field(default_factory=dict)
     poisoned_clients: List[int] = field(default_factory=list)
     poison_loader: Any = None
+    per_client_loaders: Dict[int, Any] = field(default_factory=dict)
     model_pool: Any = None
+    poisoned_fl_state: Any = None
 
     def add_client_state(self, client_id: int, model: Any, paths: Dict[str, str], **extras: Any) -> ClientState:
         state = ClientState(client_id=client_id, model=model, paths=paths, data=dict(extras))

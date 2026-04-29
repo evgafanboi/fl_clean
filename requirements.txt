@@ -1,7 +1,8 @@
 numpy
+scipy
 pandas
 scikit-learn
-tensorflow
+tensorflow==2.19.0
 matplotlib
 phe==1.5.0
 torch

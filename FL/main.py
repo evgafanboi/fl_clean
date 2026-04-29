@@ -9,7 +9,7 @@ warnings.filterwarnings('ignore')
 
 
 WEIGHT_AGGREGATION_STRATEGIES = {"FedAvg", "FedProx", "FedDyn", "FedCoMed", "RobustFilter", "DeepFed", "FLTrust", "SecureAggregation", "FedSSD1", "FedSSDexp", "FedSSD2", "None"}
-DISTILLATION_STRATEGIES = {"FD", "FedDKD", "FedProto", "FedMD", "FedSSD", "SSFL-IDS", "Exp1", "Ours", "Cronus"}
+DISTILLATION_STRATEGIES = {"FD", "FedDistill", "FedDKD", "FedProto", "FedMD", "FedSSD", "SSFL-IDS", "FedKD-IDS", "Exp1", "Ours", "Cronus"}
 ALL_STRATEGIES = sorted(WEIGHT_AGGREGATION_STRATEGIES | DISTILLATION_STRATEGIES)
 
 
@@ -29,10 +29,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # feddkd
     parser.add_argument("--dkd_steps", type=int, default=3, help="DKD gradient steps per round (for FedDKD)")
     parser.add_argument("--dkd_lr", type=float, default=0.001, help="Learning rate for DKD SGD updates (for FedDKD)")
-    # ssfl-ids
-    parser.add_argument("--dis_rounds", type=int, default=3, help="Discriminator rounds (SSFL-IDS)")
-    parser.add_argument("--dist_rounds", type=int, default=2, help="Distillation rounds (SSFL-IDS)")
-    parser.add_argument("--train_rounds", type=int, default=3, help="Training rounds for SSFL-IDS")
+    # ssfl-ids & fedkd-ids
+    parser.add_argument("--dis_rounds", type=int, default=3, help="Discriminator rounds (SSFL-IDS) & Verifier rounds (FedKD-IDS)")
+    parser.add_argument("--dist_rounds", type=int, default=2, help="Distillation rounds (SSFL-IDS & FedKD-IDS)")
+    parser.add_argument("--train_rounds", type=int, default=3, help="Training rounds for SSFL-IDS stage 1 and FedKD-IDS stage 1")
+    # fedkd-ids
+    parser.add_argument("--hamming_tau", type=float, default=0.5, help="FedKD-IDS: threshold = tau * mean(HM), range [0.5, 1.0]")
+    # feddistill
+    parser.add_argument("--exp_rho", type=float, default=0.05, help="ExpGuard step size (FedDistill)")
     # robust filter
     parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (threshold sensitivity, not budget)")
     parser.add_argument("--robust_rm_budget", type=int, default=None, help="RobustFilter max removals (default: n_clients//2 - 1)")
@@ -111,7 +115,7 @@ def main(argv=None):
     from .backend import set_backend
     set_backend(args.use_tf)
 
-    MIXED_COMPATIBLE = {"FedProto", "Cronus", "SSFL-IDS", "Ours"}
+    MIXED_COMPATIBLE = {"FedProto", "Cronus", "SSFL-IDS", "FedKD-IDS", "Ours"}
     if getattr(args, 'mixed_models', False) and args.strategy not in MIXED_COMPATIBLE:
         print(f"\033[95mIncompatible strategy\033[0m")
         return
@@ -119,7 +123,7 @@ def main(argv=None):
     robust_rm_budget = args.robust_rm_budget if args.robust_rm_budget is not None else (args.n_clients // 2 - 1)
 
     if args.strategy in DISTILLATION_STRATEGIES:
-        from .strategy import FD, FedDKD, FedProto, FedMD, FedSSD, SSFLIDS, Exp1, ours, Cronus
+        from .strategy import FD, FedDistill, FedDKD, FedProto, FedMD, FedSSD, SSFLIDS, FedKDIDS, Exp1, ours, Cronus
         from .config import FDConfig
         from .pipeline import run_distillation_pipeline
         
@@ -130,6 +134,8 @@ def main(argv=None):
             "FedMD": FedMD.FedMD,
             "FedSSD": FedSSD.FedSSD,
             "SSFL-IDS": SSFLIDS.SSFLIDS,
+            "FedDistill": FedDistill.FedDistillExpGuard,
+            "FedKD-IDS": FedKDIDS.FedKDIDS,
             "Exp1": Exp1.Exp1,
             "Ours": ours.Ours,
             "Cronus": Cronus.Cronus,
@@ -170,6 +176,8 @@ def main(argv=None):
             fresh_run=args.fresh_run,
             cache_test_set=args.cache_test_set,
             mixed_models=args.mixed_models,
+            hamming_tau=args.hamming_tau,
+            exp_rho=args.exp_rho,
         )
         
         strategy = strategy_registry[args.strategy](config)

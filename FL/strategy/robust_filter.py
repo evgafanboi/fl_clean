@@ -263,6 +263,101 @@ class CronusRobustFilter:
         return means, g_max_eig, removal_counts, None
 
 
+class AdaptiveRobustFilter:
+    """
+    Distribution-aware Byzantine filter using MAD standardisation and
+    Blom half-normal order statistics.  See docs/robust_filter.md.
+
+    Parameters
+    ----------
+    budget : int
+        Maximum total number of clients to remove across all passes.
+    tail_threshold : float
+        Minimum fraction of samples (default 0.75) for which a client must
+        appear in the contiguous outer tail to be flagged as Byzantine.
+    """
+
+    def __init__(self, budget: int = 0, tail_threshold: float = 0.75):
+        self.budget = int(budget)
+        self.tail_threshold = tail_threshold
+
+    def compute_robust_mean_batch(self, S_batch: np.ndarray) -> tuple:
+        from scipy.special import ndtri
+
+        N, K, D = S_batch.shape
+        active = np.ones(K, dtype=bool)
+        removal_counts = np.zeros(K, dtype=np.int64)
+        g_max_eig = None
+        removed_total = 0
+
+        while removed_total < self.budget:
+            K_act = int(active.sum())
+            if K_act <= 2:
+                break
+
+            S_act = S_batch[:, active, :]
+            mu_S = S_act.mean(axis=1)                         # (N, D)
+            centered = S_act - mu_S[:, np.newaxis, :]         # (N, K_act, D)
+            Sigma = np.einsum('nkd,nke->nde', centered, centered) / (K_act - 1)
+            eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
+            v_star = eigenvectors[:, :, -1]                   # (N, D)
+
+            cur_max = float(eigenvalues[:, -1].max())
+            if g_max_eig is None or cur_max > g_max_eig:
+                g_max_eig = cur_max
+
+            projections = np.einsum('nkd,nd->nk', centered, v_star)  # (N, K_act)
+
+            # MAD-based robust scale: resistant to < 50% corruption
+            med_p = np.median(projections, axis=1, keepdims=True)
+            sigma_r = np.maximum(
+                np.median(np.abs(projections - med_p), axis=1, keepdims=True) * 1.4826,
+                1e-10,
+            )                                                  # (N, 1)
+            abs_z = np.abs(projections - med_p) / sigma_r     # (N, K_act)
+
+            # Sort ascending per sample
+            sort_idx = np.argsort(abs_z, axis=1)              # (N, K_act)
+            sorted_z = abs_z[np.arange(N)[:, None], sort_idx]
+
+            # Blom expected order statistics of |N(0,1)|
+            k_vals = np.arange(1, K_act + 1, dtype=np.float64)
+            ref_hn = ndtri(0.5 + 0.5 * (k_vals - 0.375) / (K_act + 0.25))  # (K_act,)
+
+            # Contiguous outer tail (cum-AND from outermost inward):
+            # rank r is in the tail block iff sorted_z[r] > ref_hn[r] AND
+            # every rank beyond r also exceeds its reference.
+            in_tail = sorted_z > ref_hn[np.newaxis, :]        # (N, K_act)
+            cum_and = np.flip(
+                np.cumprod(np.flip(in_tail.astype(np.int8), axis=1), axis=1).astype(bool),
+                axis=1,
+            )
+
+            # Map rank-space tail membership back to client indices
+            is_byzantine = np.zeros((N, K_act), dtype=bool)
+            np.put_along_axis(is_byzantine, sort_idx, cum_and, axis=1)
+
+            # Byzantine score per active client: fraction of N samples flagging it
+            scores = is_byzantine.mean(axis=0)                 # (K_act,) ∈ [0, 1]
+
+            flagged = np.where(scores >= self.tail_threshold)[0]
+            if len(flagged) == 0:
+                break
+
+            # Remove all flagged clients, capped by remaining budget
+            budget_left = self.budget - removed_total
+            if len(flagged) > budget_left:
+                flagged = flagged[np.argsort(scores[flagged])[::-1][:budget_left]]
+
+            global_idx = np.where(active)[0][flagged]
+            active[global_idx] = False
+            removal_counts[global_idx] = 1
+            removed_total += len(flagged)
+
+        means = S_batch[:, active, :].mean(axis=1).astype(np.float32)
+        return means, g_max_eig, removal_counts, None
+
+
 class RobustFilterWeights(RobustFilter):
     def __init__(self, epsilon: float = 0.2, budget: Optional[int] = None, **_kw):
         super().__init__(epsilon=epsilon, budget=budget)

@@ -14,7 +14,7 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
 from .robust_filter import CronusRobustFilter
@@ -129,6 +129,28 @@ def _make_merged_dataset(priv_X_path, priv_y_path, pub_X_path, pseudo_y_path,
               .batch(batch_size).prefetch(tf.data.AUTOTUNE))
 
 
+# ── public-only dataset for PoisonedFL byzantine clients ──────────────────────
+
+def _make_public_only_dataset(pub_X_path, pseudo_y_path, input_dim, num_classes, batch_size):
+    from ..backend import use_tf
+    pseudo = np.array(np.load(pseudo_y_path, mmap_mode="r"), dtype=np.int32)
+    valid = pseudo >= 0
+    pub_X = np.array(np.load(pub_X_path, mmap_mode="r")[valid], dtype=np.float32)
+    pub_y_oh = np.zeros((int(valid.sum()), num_classes), dtype=np.float32)
+    pub_y_oh[np.arange(int(valid.sum())), pseudo[valid]] = 1.0
+    del pseudo
+    perm = np.random.permutation(len(pub_X))
+    pub_X, pub_y_oh = pub_X[perm], pub_y_oh[perm]
+    del perm
+    if not use_tf():
+        import torch
+        from torch.utils.data import DataLoader, TensorDataset
+        ds = TensorDataset(torch.from_numpy(pub_X), torch.from_numpy(pub_y_oh))
+        return DataLoader(ds, batch_size=batch_size, shuffle=False, pin_memory=False, num_workers=0)
+    return (tf.data.Dataset.from_tensor_slices((pub_X, pub_y_oh))
+              .batch(batch_size).prefetch(tf.data.AUTOTUNE))
+
+
 # ── checkpoint helpers ──────────────────────────────────────────────────
 
 def _ckpt_dir(context: PipelineContext) -> str:
@@ -195,6 +217,11 @@ def _clear_mid_round(context: PipelineContext) -> None:
 class Cronus(DistillationStrategy):
     name = "Cronus"
     use_model_pool = False
+
+    def extra_log_tokens(self):
+        return {
+            "budget": self.config.robust_rm_budget,
+        }
 
     # ── setup ──────────────────────────────────────────────────────────
 
@@ -320,28 +347,39 @@ class Cronus(DistillationStrategy):
 
             print(f"\n{COLORS.BOLD}Client {cid}{COLORS.ENDC}")
 
-            p_loader = (context.poison_loader
-                        if poisoned and context.poison_loader else None)
+            poisoned = cid in context.poisoned_clients
+            p_loader = context.per_client_loaders.get(cid, context.poison_loader) if poisoned else None
 
-            if is_init:
-                ds = create_client_dataset(
-                    st.paths["train_X"], st.paths["train_y"],
-                    context.input_dim, context.num_classes,
-                    cfg.batch_size, poison_loader=p_loader)
+            if poisoned and attack_type == "poisonedfl":
+                context.logger.info("Round %s | Client %s [PoisonedFL] all stages skipped", round_number, cid)
+                if _mixed:
+                    del model
+                aggressive_memory_cleanup()
+                continue
             else:
-                ds = _make_merged_dataset(
-                    st.paths["train_X"], st.paths["train_y"],
-                    prev_pub, prev_pseudo,
-                    context.input_dim, context.num_classes,
-                    cfg.batch_size, poison_loader=p_loader)
-
-            old_w = model.get_weights()
-            model.fit(ds, epochs=cfg.epochs)
-            new_w = model.get_weights()
-            st.data["w"] = new_w
+                if is_init:
+                    ds = create_client_dataset(
+                        st.paths["train_X"], st.paths["train_y"],
+                        context.input_dim, context.num_classes,
+                        cfg.batch_size, poison_loader=p_loader)
+                else:
+                    ds = _make_merged_dataset(
+                        st.paths["train_X"], st.paths["train_y"],
+                        prev_pub, prev_pseudo,
+                        context.input_dim, context.num_classes,
+                        cfg.batch_size, poison_loader=p_loader)
+                model.fit(ds, epochs=cfg.epochs)
+                new_w = model.get_weights()
+                del ds
 
             if poisoned and attack_type == "gradient_scale":
-                model.set_weights([o + poison_value * (n - o) for o, n in zip(old_w, new_w)])
+                poisoned_w = apply_gradient_scale_poison(new_w, poison_value)
+                model.set_weights(poisoned_w)
+                print(f"{COLORS.WARNING}  [POISON] Client {cid}: gradient_scale applied (×{poison_value}){COLORS.ENDC}")
+                context.logger.info("Round %s | Client %s [POISON] gradient_scale ×%s applied", round_number, cid, poison_value)
+                st.data["w"] = poisoned_w
+            else:
+                st.data["w"] = new_w
 
             pf = _pred_path(cid, round_number)
             _predict_to_file(model, open_X, context.num_classes,
@@ -349,7 +387,18 @@ class Cronus(DistillationStrategy):
             pred_files.append(pf)
             pred_cids.append(cid)
 
-            del ds
+            _row_bytes = context.num_classes * 4
+            with open(pf, "rb") as _f:
+                _raw = _f.read()
+            _preds = np.frombuffer(_raw, dtype=np.float32).reshape(-1, context.num_classes)
+            _argmax = np.argmax(_preds, axis=1)
+            _counts = np.bincount(_argmax, minlength=context.num_classes)
+            _top3 = np.argsort(_counts)[::-1][:3]
+            _top = " | ".join(f"cls{c}:{100*_counts[c]/max(len(_argmax),1):.1f}%" for c in _top3 if _counts[c] > 0)
+            _poison_tag = " [POISONED]" if poisoned else ""
+            context.logger.info("Round %s | Client %s%s | top3 pred-argmax: %s", round_number, cid, _poison_tag, _top)
+            del _raw, _preds, _argmax, _counts
+
             if _mixed:
                 del model
                 model = None
@@ -362,6 +411,60 @@ class Cronus(DistillationStrategy):
             ):
                 _save_mid_round(context, round_number, idx,
                                 pred_files, pred_cids, pub_X_file)
+
+        # ---- PoisonedFL: ghost model ----
+        if attack_type == "poisonedfl" and context.poisoned_clients and context.poisoned_fl_state is not None:
+            _pfl = context.poisoned_fl_state
+            ghost_w = context.shared_state.get("poisonedfl_ghost_w")
+            if ghost_w is None:
+                ghost_w = context.shared_state.get("init_w")
+            if not is_init and prev_pub is not None and prev_pseudo is not None:
+                if not _mixed:
+                    from ..memory import clear_session
+                    clear_session()
+                    aggressive_memory_cleanup()
+                ghost_model = create_model(context.input_dim, context.num_classes,
+                                           cfg.batch_size, model_type=cfg.model_type)
+                if ghost_w is not None:
+                    ghost_model.set_weights(ghost_w)
+                ds_ghost = _make_public_only_dataset(
+                    prev_pub, prev_pseudo,
+                    context.input_dim, context.num_classes, cfg.batch_size)
+                ghost_model.fit(ds_ghost, epochs=cfg.epochs)
+                del ds_ghost
+                ghost_w = ghost_model.get_weights()
+                del ghost_model
+            poisoned_w = poisonedfl_unified_weights([ghost_w] if ghost_w is not None else [context.shared_state["init_w"]], _pfl)
+            context.shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
+            if not _mixed:
+                from ..memory import clear_session
+                clear_session()
+                aggressive_memory_cleanup()
+                self._model = create_model(context.input_dim, context.num_classes,
+                                           cfg.batch_size, model_type=cfg.model_type)
+                model = self._model
+            model.set_weights(poisoned_w)
+            for st in context.client_states:
+                if st.client_id not in context.poisoned_clients:
+                    continue
+                st.data["w"] = poisoned_w
+                pf = _pred_path(st.client_id, round_number)
+                _predict_to_file(model, open_X, context.num_classes, cfg.batch_size, pf)
+                if pf not in pred_files:
+                    pred_files.append(pf)
+                    pred_cids.append(st.client_id)
+                _row_bytes = context.num_classes * 4
+                with open(pf, "rb") as _f:
+                    _raw = _f.read()
+                _preds = np.frombuffer(_raw, dtype=np.float32).reshape(-1, context.num_classes)
+                _argmax = np.argmax(_preds, axis=1)
+                _counts = np.bincount(_argmax, minlength=context.num_classes)
+                _top3 = np.argsort(_counts)[::-1][:3]
+                _top = " | ".join(f"cls{c}:{100*_counts[c]/max(len(_argmax),1):.1f}%" for c in _top3 if _counts[c] > 0)
+                context.logger.info("Round %s | Client %s [POISONED] | top3 pred-argmax: %s", round_number, st.client_id, _top)
+                del _raw, _preds, _argmax, _counts
+            context.logger.info("Round %s | PoisonedFL | Ghost model injected into %d byzantine clients", round_number, len(context.poisoned_clients))
+            del poisoned_w
 
         del open_X
         aggressive_memory_cleanup()

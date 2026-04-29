@@ -12,6 +12,7 @@ if _use_tf():
 from ..colors import COLORS
 from ..context import PipelineContext
 from ..memory import aggressive_memory_cleanup
+from ..poison_utils import parse_poison_config, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
@@ -247,6 +248,7 @@ class FedProto(DistillationStrategy):
         config = context.config
         round_start = time.time()
         pool = context.model_pool
+        attack_type, _, _ = parse_poison_config(getattr(config, "poison", None))
 
         global_prototypes: Dict[int, np.ndarray] = context.shared_state.get("global_prototypes", {})
 
@@ -286,6 +288,9 @@ class FedProto(DistillationStrategy):
                 context.input_dim,
                 context.num_classes,
                 config.batch_size,
+                poison_loader=context.per_client_loaders.get(
+                    state.client_id, context.poison_loader
+                ) if state.client_id in context.poisoned_clients else None,
             )
             prototypes, supports = local_training_with_prototypes(
                 model, dataset, global_prototypes,
@@ -315,6 +320,28 @@ class FedProto(DistillationStrategy):
                     "all_client_metrics": all_client_metrics,
                     "round_metrics": round_metrics,
                 })
+
+        # ---- PoisonedFL: unified weights post-loop, re-extract prototypes ----
+        _pfl = getattr(context, 'poisoned_fl_state', None)
+        if _pfl is not None and context.poisoned_clients:
+            pool = context.model_pool
+            byz_w = []
+            for st in context.client_states:
+                if st.client_id in context.poisoned_clients:
+                    m = pool.checkout(st.client_id)
+                    byz_w.append(m.get_weights())
+                    pool.release(m)
+            if byz_w:
+                poisoned_w = poisonedfl_unified_weights(byz_w, _pfl)
+                for st in context.client_states:
+                    if st.client_id not in context.poisoned_clients:
+                        continue
+                    m = pool.checkout(st.client_id)
+                    m.set_weights(poisoned_w)
+                    prototypes, supports = extract_class_prototypes(m, st.paths["train_X"], st.paths["train_y"], context.num_classes)
+                    all_client_prototypes[st.client_id] = {cls: {"prototype": p, "support": supports[cls]} for cls, p in prototypes.items()}
+                    pool.checkin(st.client_id, m)
+                context.logger.info("Round %s | PoisonedFL | FedProto byzantine clients unified prototypes applied", round_number)
 
         print(f"\n{COLORS.OKCYAN}[STEP 2/2] Aggregating prototypes & summary{COLORS.ENDC}")
 

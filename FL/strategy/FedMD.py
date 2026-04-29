@@ -13,6 +13,7 @@ from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
 from .base import DistillationStrategy
+from ..poison_utils import poisonedfl_unified_weights
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import (
     create_model,
@@ -203,16 +204,19 @@ class FedMD(DistillationStrategy):
             print(f"Client {state.client_id}: initial transfer learning")
             model.fit(public_labeled_ds, epochs=self.transfer_epochs, verbose=1)
 
-            private_dataset = create_private_dataset(
-                paths["train_X"],
-                paths["train_y"],
-                context.input_dim,
-                context.num_classes,
-                context.config.batch_size,
-            )
-            model.fit(private_dataset, epochs=self.revisit_epochs, verbose=1)
-            context.model_pool.checkin(client_id, model)
-            del private_dataset
+            if client_id not in context.poisoned_clients or not hasattr(context, 'poisoned_fl_state') or context.poisoned_fl_state is None:
+                private_dataset = create_private_dataset(
+                    paths["train_X"],
+                    paths["train_y"],
+                    context.input_dim,
+                    context.num_classes,
+                    context.config.batch_size,
+                )
+                model.fit(private_dataset, epochs=self.revisit_epochs, verbose=1)
+                context.model_pool.checkin(client_id, model)
+                del private_dataset
+            else:
+                context.model_pool.checkin(client_id, model)
             aggressive_memory_cleanup()
 
     def run_round(self, context: PipelineContext, round_number: int) -> Dict[int, Dict[str, float]]:
@@ -255,6 +259,9 @@ class FedMD(DistillationStrategy):
             for client_idx, state in enumerate(context.client_states):
                 if client_idx < first_logit:
                     continue
+                _pfl_lgt = getattr(context, 'poisoned_fl_state', None)
+                if _pfl_lgt is not None and state.client_id in context.poisoned_clients:
+                    continue
                 fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{state.client_id}.bin")
                 model = pool.checkout(state.client_id)
                 _, shape = generate_public_logits_to_file(model, public_features, config.batch_size, fpath)
@@ -293,20 +300,28 @@ class FedMD(DistillationStrategy):
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_digest:
                 continue
+            _pfl_dgt = getattr(context, 'poisoned_fl_state', None)
+            if _pfl_dgt is not None and state.client_id in context.poisoned_clients:
+                context.logger.info("Round %s | Client %s [PoisonedFL] all stages skipped", round_number, state.client_id)
+                continue
             print(f"\n{COLORS.BOLD}Client {state.client_id}{COLORS.ENDC}")
             model = pool.checkout(state.client_id)
             digest_phase(model, consensus_logits, public_features, config.batch_size, self.digest_epochs)
 
-            private_dataset = create_private_dataset(
-                state.paths["train_X"],
-                state.paths["train_y"],
-                context.input_dim,
-                context.num_classes,
-                config.batch_size,
-            )
-            revisit_phase(model, private_dataset, self.revisit_epochs)
+            _pfl = getattr(context, 'poisoned_fl_state', None)
+            if state.client_id not in context.poisoned_clients or _pfl is None:
+                private_dataset = create_private_dataset(
+                    state.paths["train_X"],
+                    state.paths["train_y"],
+                    context.input_dim,
+                    context.num_classes,
+                    config.batch_size,
+                )
+                revisit_phase(model, private_dataset, self.revisit_epochs)
+                del private_dataset
+            else:
+                context.logger.info("Round %s | Client %s [PoisonedFL] revisit skipped", round_number, state.client_id)
             pool.checkin(state.client_id, model)
-            del private_dataset
             aggressive_memory_cleanup()
 
             if _ckpt and (
@@ -318,6 +333,27 @@ class FedMD(DistillationStrategy):
                     "stage": "digest",
                     "last_client_idx": client_idx,
                 })
+
+        # ---- PoisonedFL: ghost model (digest only, no private data) ----
+        _pfl = getattr(context, 'poisoned_fl_state', None)
+        if _pfl is not None and context.poisoned_clients:
+            ghost = create_model(context.input_dim, context.num_classes,
+                                 config.batch_size, model_type=config.model_type)
+            if context.shared_state.get("poisonedfl_ghost_w") is not None:
+                ghost.set_weights(context.shared_state["poisonedfl_ghost_w"])
+            digest_phase(ghost, consensus_logits, public_features, config.batch_size, self.digest_epochs)
+            ghost_w = ghost.get_weights()
+            del ghost
+            poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
+            context.shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
+            for st in context.client_states:
+                if st.client_id in context.poisoned_clients:
+                    m = pool.checkout(st.client_id)
+                    m.set_weights(poisoned_w)
+                    pool.checkin(st.client_id, m)
+            context.logger.info("Round %s | PoisonedFL | Ghost digest'd, injected into %d byzantine clients", round_number, len(context.poisoned_clients))
+            del ghost_w, poisoned_w
+            aggressive_memory_cleanup()
 
         del consensus_logits, public_features
         aggressive_memory_cleanup()

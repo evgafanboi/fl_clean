@@ -49,6 +49,7 @@ def setup_logger(
     results_dir: str = "results",
     poison_suffix: str = "",
     resume: bool = False,
+    create_detailed_log: bool = True,
 ) -> Tuple[logging.Logger, str, logging.Logger]:
     """Configure loggers for the federated learning pipeline. Supports both FL and FD style arguments."""
     if not os.path.islink(results_dir):
@@ -66,14 +67,13 @@ def setup_logger(
         parts.append(poison_suffix)
     log_filename = f"{results_dir}/{'_'.join(parts)}.log"
 
+    mode = 'a' if resume else 'w'
     if resume:
         _truncate_after_last_round(log_filename)
-        detailed_log_filename = log_filename.replace('.log', '_detailed_class_metrics.log')
-        _truncate_after_last_round(detailed_log_filename)
-    else:
-        detailed_log_filename = log_filename.replace('.log', '_detailed_class_metrics.log')
+        if create_detailed_log:
+            detailed_log_filename = log_filename.replace('.log', '_detailed_class_metrics.log')
+            _truncate_after_last_round(detailed_log_filename)
 
-    mode = 'a' if resume else 'w'
     logging.basicConfig(
         filename=log_filename,
         level=logging.INFO,
@@ -86,9 +86,13 @@ def setup_logger(
     detailed_logger = logging.getLogger('detailed_metrics')
     detailed_logger.handlers.clear()
     detailed_logger.setLevel(logging.INFO)
-    detailed_handler = logging.FileHandler(detailed_log_filename, mode=mode)
-    detailed_handler.setFormatter(logging.Formatter('%(message)s'))
-    detailed_logger.addHandler(detailed_handler)
+    if create_detailed_log:
+        detailed_log_filename = log_filename.replace('.log', '_detailed_class_metrics.log')
+        detailed_handler = logging.FileHandler(detailed_log_filename, mode=mode)
+        detailed_handler.setFormatter(logging.Formatter('%(message)s'))
+        detailed_logger.addHandler(detailed_handler)
+    else:
+        detailed_logger.addHandler(logging.NullHandler())
     detailed_logger.propagate = False
 
     return logging.getLogger(), log_filename, detailed_logger

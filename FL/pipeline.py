@@ -35,7 +35,7 @@ from .decentralized import (
     braintorrent_select_server, log_braintorrent_selection,
     compute_model_similarity_scores, select_model_similarity_server, log_model_similarity_selection,
 )
-from .poison_utils import parse_poison_config, get_or_create_poisoned_clients, PoisonedDataLoader
+from .poison_utils import parse_poison_config, get_or_create_poisoned_clients, PoisonedDataLoader, apply_gradient_scale_poison, PoisonedFLState
 
 
 def _record_round_weights(log_filename, round_num, global_weights=None, context=None):
@@ -161,6 +161,7 @@ class FederatedLearningPipeline:
         self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
         self.poisoned_clients: List[int] = []
         self.poison_loader: Optional[PoisonedDataLoader] = None
+        self.per_client_loaders: Dict[int, Optional[PoisonedDataLoader]] = {}
         self.test_dataset = None
         self.eval_batch_size: Optional[int] = None
         self.class_names: List[str] = []
@@ -172,6 +173,7 @@ class FederatedLearningPipeline:
         # Secure Aggregation state
         self.dh_private_keys: Dict[int, int] = {}
         self.dh_public_keys: Dict[int, int] = {}
+        self.poisoned_fl_state: Optional[PoisonedFLState] = None
 
     def _load_class_metadata(self, partition_label: str, client_count: int) -> tuple[List[str], int]:
         class_names_file = os.path.join(
@@ -667,12 +669,30 @@ class FederatedLearningPipeline:
             model.set_global_weights(latest_weights)
 
         poisoned = client_id in self.poisoned_clients
-        poison_loader = self.poison_loader if poisoned and self.poison_attack == "label_flip" else None
-        if poisoned and self.poison_attack == "label_flip":
-            print(f"  \u26a0\ufe0f  POISONED CLIENT - Labels flipped")
+        poison_loader = self.per_client_loaders.get(client_id, self.poison_loader if poisoned else None)
+        if poisoned and self.poison_attack in ("label_flip", "targeted_flip"):
+            print(f"  \u26a0\ufe0f  POISONED CLIENT - Labels flipped ({self.poison_attack})")
         if poisoned and self.poison_attack == "gradient_scale":
             scale = self.poison_value or 1.0
             print(f"  \u26a0\ufe0f  POISONED CLIENT - Scaling gradients x{scale:.1f}")
+
+        if poisoned and self.poison_attack == "poisonedfl" and self.poisoned_fl_state is not None and latest_weights is not None:
+            _mmap = np.load(paths['train_X'], mmap_mode='r')
+            sample_size = _mmap.shape[0]
+            del _mmap
+            if self.poisoned_fl_state.cached_update is not None:
+                poisoned_weights = self._apply_poison_to_weights(latest_weights, latest_weights, client_id)
+            else:
+                poisoned_weights = latest_weights
+            if self.config.strategy == "FLTrust":
+                result_data = [nw - ow for nw, ow in zip(poisoned_weights, latest_weights)]
+            else:
+                result_data = poisoned_weights
+            if reuse_model is None:
+                del model
+            aggressive_memory_cleanup()
+            print(f"{COLORS.WARNING}Client {client_id}, (poisonedfl attack) - skipping training and returning poisoned weights{COLORS.ENDC}")
+            return result_data, sample_size, 0.0
 
         train_dataset = create_client_dataset(
             paths['train_X'],
@@ -865,13 +885,24 @@ class FederatedLearningPipeline:
         
         return global_update
 
+    def _prepare_poisonedfl_round(self, latest_weights):
+        state = self.poisoned_fl_state
+        current_flat = np.concatenate([w.ravel() for w in latest_weights]).astype(np.float32)
+        mal_update = state.compute_update(current_flat)
+        state.cached_update = mal_update
+
     def _apply_poison_to_weights(self, weights, latest_weights, client_id):
-        if self.poison_attack == "gradient_scale" and latest_weights is not None and client_id in self.poisoned_clients:
-            scale = self.poison_value or 1.0
-            scaled = []
-            for new_w, old_w in zip(weights, latest_weights):
-                scaled.append(old_w + (new_w - old_w) * scale)
-            return scaled
+        if self.poison_attack == "gradient_scale" and client_id in self.poisoned_clients:
+            return apply_gradient_scale_poison(weights, self.poison_value or 1.0)
+        if self.poison_attack == "poisonedfl" and client_id in self.poisoned_clients:
+            state = self.poisoned_fl_state
+            if state.cached_update is not None and latest_weights is not None:
+                offset, poisoned = 0, []
+                for w in latest_weights:
+                    n = w.size
+                    poisoned.append((w.ravel() + state.cached_update[offset:offset + n]).reshape(w.shape).astype(w.dtype))
+                    offset += n
+                return poisoned
         return weights
 
     def _evaluate_personalized_client(self, model, client_id: int, num_classes: int):
@@ -1019,12 +1050,31 @@ class FederatedLearningPipeline:
             )
             if attack_type == "label_flip":
                 self.poison_loader = PoisonedDataLoader(attack_type, num_classes)
-            log_timestamp(self.logger, f"POISONING ENABLED: {attack_type} attack value={poison_value} on {len(self.poisoned_clients)} clients")
+            elif attack_type == "targeted_flip":
+                target_label = int(poison_value)
+                for cid in self.poisoned_clients:
+                    y = np.load(paths_list[cid]['train_y'], mmap_mode='r').astype(np.int32)
+                    dominant = int(np.argmax(np.bincount(y, minlength=num_classes)))
+                    del y
+                    self.per_client_loaders[cid] = PoisonedDataLoader(
+                        "targeted_flip", num_classes,
+                        dominant_class=dominant, target_label=target_label,
+                    )
+            elif attack_type == "targeted_flip":
+                target_label = int(poison_value)
+                for cid in self.poisoned_clients:
+                    y = np.load(paths_list[cid]['train_y'], mmap_mode='r').astype(np.int32)
+                    dominant = int(np.argmax(np.bincount(y, minlength=num_classes)))
+                    del y
+                    self.per_client_loaders[cid] = PoisonedDataLoader(
+                        "targeted_flip", num_classes,
+                        dominant_class=dominant, target_label=target_label,
+                    )
+            elif attack_type == "poisonedfl":
+                self.poisoned_fl_state = PoisonedFLState(c0=poison_value)
             log_timestamp(self.logger, f"Poisoned clients: {self.poisoned_clients}")
             print(f"\n  POISONING ENABLED: {attack_type} attack (value={poison_value})")
             print(f"    Poisoned clients: {self.poisoned_clients} ({len(self.poisoned_clients)}/{n_clients})")
-
-        # Initialize Secure Aggregation DH keys if needed
         self._init_secure_aggregation_keys(n_clients)
 
         ms_prev_scores = None
@@ -1112,6 +1162,9 @@ class FederatedLearningPipeline:
             self.logger.info(f"Round {round_num}/{self.config.rounds}")
             print(f"\n{COLORS.HEADER}Round {round_num}/{self.config.rounds}{COLORS.ENDC}")
             log_timestamp(self.logger, f"--- Round {round_num} started ---")
+
+            if self.poison_attack == "poisonedfl" and latest_weights is not None:
+                self._prepare_poisonedfl_round(latest_weights)
 
             # BrainTorrent: select server before each round
             if self.config.decentralized == "braintorrent":
@@ -1522,6 +1575,7 @@ def run_distillation_pipeline(config, strategy) -> None:
         extra_tokens=extra_tokens,
         poison_suffix=poison_suffix,
         resume=bool(config.checkpoint) and not getattr(config, 'fresh_run', False),
+        create_detailed_log=False,
     )
     excel_filename = log_filename.replace(".log", ".xlsx")
     
@@ -1562,6 +1616,7 @@ def run_distillation_pipeline(config, strategy) -> None:
     
     poisoned_clients = []
     poison_loader = None
+    per_client_loaders = {}
     attack_type, poison_value, poison_ratio = parse_poison_config(config.poison)
     if attack_type:
         poisoned_clients = get_or_create_poisoned_clients(
@@ -1569,8 +1624,22 @@ def run_distillation_pipeline(config, strategy) -> None:
         )
         if attack_type == "label_flip":
             poison_loader = PoisonedDataLoader(attack_type, num_classes)
+        elif attack_type == "targeted_flip":
+            target_label = int(poison_value)
+            for cid in poisoned_clients:
+                y = np.load(paths_list[cid]['train_y'], mmap_mode='r').astype(np.int32)
+                dominant = int(np.argmax(np.bincount(y, minlength=num_classes)))
+                del y
+                per_client_loaders[cid] = PoisonedDataLoader(
+                    "targeted_flip", num_classes,
+                    dominant_class=dominant, target_label=target_label,
+                )
+        _pc_display = poisoned_clients[:10] if len(poisoned_clients) > 10 else poisoned_clients
+        _pc_str = str(_pc_display) + (" ..." if len(poisoned_clients) > 10 else "")
         print(f"\n  POISONING ENABLED: {attack_type} attack (value={poison_value})")
-        print(f"    Poisoned clients: {poisoned_clients} ({len(poisoned_clients)}/{n_clients})")
+        print(f"    Poisoned clients ({len(poisoned_clients)}/{n_clients}): {_pc_str}")
+        logger.info("POISONING: %s attack value=%s | %d/%d clients: %s",
+                    attack_type, poison_value, len(poisoned_clients), n_clients, _pc_str)
     
     context = PipelineContext(
         config=config,
@@ -1589,7 +1658,9 @@ def run_distillation_pipeline(config, strategy) -> None:
         shared_state={"extra_log_tokens": extra_log_tokens},
         poisoned_clients=poisoned_clients,
         poison_loader=poison_loader,
+        per_client_loaders=per_client_loaders,
         model_pool=model_pool,
+        poisoned_fl_state=PoisonedFLState(c0=poison_value) if attack_type == "poisonedfl" else None,
     )
     
     log_timestamp(logger, "SIMULATION STARTED")
@@ -1888,6 +1959,15 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                                 round_number, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["Loss"])
                     print(f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
                           f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
+                    if context.poisoned_clients:
+                        _benign_cids = [c for c in round_metrics if c >= 0 and c not in context.poisoned_clients]
+                        if _benign_cids:
+                            _b_avg = {k: float(np.mean([round_metrics[c][k] for c in _benign_cids])) for k in avg}
+                            _record_metrics(context, round_number, {-3: _b_avg}, excel_filename)
+                            logger.info("Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                                        round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["Loss"])
+                            print(f"{COLORS.OKGREEN}Round {round_number} Benign Avg | Acc={_b_avg['Acc']:.4f}, F1={_b_avg['F1']:.4f}, "
+                                  f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}")
                 if os.path.exists(global_weight_path):
                     with open(global_weight_path, "rb") as _f:
                         g_weights = pickle.load(_f)
@@ -1952,6 +2032,19 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
                     f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
                 )
+                if context.poisoned_clients:
+                    _benign_cids = [c for c in round_metrics if c >= 0 and c not in context.poisoned_clients]
+                    if _benign_cids:
+                        _b_avg = {k: float(np.mean([round_metrics[c][k] for c in _benign_cids])) for k in avg}
+                        _record_metrics(context, round_number, {-3: _b_avg}, excel_filename)
+                        logger.info(
+                            "Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                            round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["Loss"],
+                        )
+                        print(
+                            f"{COLORS.OKGREEN}Round {round_number} Benign Avg | Acc={_b_avg['Acc']:.4f}, F1={_b_avg['F1']:.4f}, "
+                            f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}"
+                        )
 
     del eval_model, X_test, y_test, test_labels
     aggressive_memory_cleanup()

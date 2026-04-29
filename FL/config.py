@@ -38,6 +38,8 @@ class FDConfig:
     fresh_run: bool = False
     cache_test_set: bool = False
     mixed_models: bool = False
+    hamming_tau: float = 0.5
+    exp_rho: float = 0.05
 
     def to_algorithm_params(self) -> dict:
         return {

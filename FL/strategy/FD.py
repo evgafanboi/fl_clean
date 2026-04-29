@@ -11,7 +11,7 @@ if _use_tf():
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config
+from ..poison_utils import parse_poison_config, poisonedfl_unified_weights, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
@@ -418,6 +418,29 @@ class FederatedDistillation(DistillationStrategy):
                     "all_client_metrics": all_client_metrics,
                     "round_metrics": round_metrics,
                 })
+
+        # ---- PoisonedFL: unified weights post-loop, re-generate logits ----
+        _pfl = getattr(context, 'poisoned_fl_state', None)
+        if _pfl is not None and context.poisoned_clients:
+            pool = context.model_pool
+            byz_w = []
+            for st in context.client_states:
+                if st.client_id in context.poisoned_clients:
+                    m = pool.checkout(st.client_id)
+                    byz_w.append(m.get_weights())
+                    pool.release(m)
+            if byz_w:
+                poisoned_w = poisonedfl_unified_weights(byz_w, _pfl)
+                for st in context.client_states:
+                    if st.client_id not in context.poisoned_clients:
+                        continue
+                    m = pool.checkout(st.client_id)
+                    m.set_weights(poisoned_w)
+                    logits, counts = generate_per_class_logits(m, st.paths["train_X"], st.paths["train_y"], context.num_classes)
+                    all_client_logits[st.client_id] = logits
+                    all_client_counts_for_round[st.client_id] = counts
+                    pool.checkin(st.client_id, m)
+                context.logger.info("Round %s | PoisonedFL | FD byzantine clients unified logits applied", round_number)
 
         print(f"\n{COLORS.OKCYAN}[STEP 2/3] Aggregating logits per client{COLORS.ENDC}")
         new_global_logits: Dict[int, Dict[int, np.ndarray]] = {}

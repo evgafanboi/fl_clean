@@ -9,9 +9,6 @@ import numpy as np
 from ..backend import use_tf as _use_tf
 if _use_tf():
     import tensorflow as tf
-    from models.dense_discri import create_discriminator
-else:
-    from models.pt_dense_discri import create_discriminator
 
 from ..colors import COLORS
 from ..data_utils import create_client_dataset
@@ -22,7 +19,7 @@ from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
 
-SSFLIDS_CACHE_DIR = os.path.join("temp_weights", "ssflids_cache")
+FEDKDIDS_CACHE_DIR = os.path.join("temp_weights", "fedkdids_cache")
 
 
 def _softmax_np(x):
@@ -42,110 +39,77 @@ def _make_public_ds(X, y, batch_size):
 
 
 def _base_public_path() -> str:
-    return os.path.join(SSFLIDS_CACHE_DIR, "public_features.npy")
+    return os.path.join(FEDKDIDS_CACHE_DIR, "public_features.npy")
 
 
 def _round_public_path(round_number: int) -> str:
-    return os.path.join(SSFLIDS_CACHE_DIR, f"r{round_number}_public_X.npy")
+    return os.path.join(FEDKDIDS_CACHE_DIR, f"r{round_number}_public_X.npy")
 
 
 def _pred_path(client_id: int, round_number: int) -> str:
-    return os.path.join(SSFLIDS_CACHE_DIR, f"r{round_number}_c{client_id}_hard.npy")
+    return os.path.join(FEDKDIDS_CACHE_DIR, f"r{round_number}_c{client_id}_hard.npy")
 
 
-def train_discriminator(
-    classify_model,
-    discri_model,
-    open_feature: np.ndarray,
-    dis_rounds: int,
-    batch_size: int,
-    private_X_path: str,
-    dis_rng: np.random.RandomState,
-) -> bool:
-    logits_model = classify_model.get_logits_model() if hasattr(classify_model, "get_logits_model") else classify_model
-
-    chunk_size = 500_000
-    max_probs_list = []
-    for start in range(0, len(open_feature), chunk_size):
-        logits = logits_model.predict(open_feature[start:start + chunk_size], batch_size=batch_size, verbose=0)
-        probs = _softmax_np(logits)
-        max_probs_list.append(np.max(probs, axis=1))
-        del logits, probs
-    max_probs = np.concatenate(max_probs_list)
-    del max_probs_list
-
-    theta = float(np.median(max_probs))
-    sure_unknown_mask = max_probs < theta
-    sure_unknown_feature = open_feature[sure_unknown_mask]
-    del max_probs
-
-    if sure_unknown_feature.size == 0:
-        return False
-
-    X_mmap = np.load(private_X_path, mmap_mode="r")
-    sure_known_feature = np.array(X_mmap, dtype=np.float32)
-    del X_mmap
-
-    if len(sure_unknown_feature) > len(sure_known_feature):
-        idx = dis_rng.choice(len(sure_unknown_feature), len(sure_known_feature), replace=False)
-        sure_unknown_feature = sure_unknown_feature[idx]
-
-    dis_X = np.vstack([sure_known_feature, sure_unknown_feature])
-    dis_y = np.concatenate([
-        np.zeros(len(sure_known_feature), dtype=np.float32),
-        np.ones(len(sure_unknown_feature), dtype=np.float32),
-    ])
-    del sure_known_feature, sure_unknown_feature
-
-    indices = np.random.permutation(len(dis_X))
-    dis_X, dis_y = dis_X[indices], dis_y[indices]
-    del indices
-
-    if _use_tf():
-        dataset = (tf.data.Dataset.from_tensor_slices((dis_X, dis_y))
-                   .batch(batch_size).prefetch(tf.data.AUTOTUNE))
-        discriminator_net = discri_model.model if hasattr(discri_model, "model") else discri_model
-        for _ in range(dis_rounds):
-            discriminator_net.fit(dataset, epochs=1, verbose=0)
-    else:
-        import torch
-        from torch.utils.data import DataLoader, TensorDataset
-        ds = TensorDataset(torch.from_numpy(dis_X), torch.from_numpy(dis_y))
-        dataset = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                             pin_memory=False, num_workers=0)
-        for _ in range(dis_rounds):
-            discri_model.fit(dataset, epochs=1, verbose=0)
-
-    del dataset, dis_X, dis_y
-    return True
-
-
-def predict_with_discriminator(
-    classify_model,
-    discri_model,
+def _predict_hard_labels(
+    model,
     X_open: np.ndarray,
     num_classes: int,
     batch_size: int,
     output_path: str,
 ) -> None:
-    logits_model = classify_model.get_logits_model() if hasattr(classify_model, "get_logits_model") else classify_model
-    boundary = 1.0 / num_classes
-
+    logits_model = model.get_logits_model() if hasattr(model, "get_logits_model") else model
     logits = logits_model.predict(X_open, batch_size=batch_size, verbose=0)
-    probs = _softmax_np(logits)
+    hard = np.argmax(logits, axis=1).astype(np.int32)
     del logits
+    np.save(output_path, hard)
 
-    dis_pred = discri_model.predict(X_open, batch_size=batch_size, verbose=0).reshape(-1)
-    probs[dis_pred > 0.5] = 1.0 / num_classes
-    del dis_pred
 
-    max_p = np.max(probs, axis=1)
-    best = np.argmax(probs, axis=1).astype(np.int32)
-    hard_labels = np.where(max_p > boundary, best, np.int32(num_classes)).astype(np.int32)
-    del probs, max_p, best
+def _hamming_filter(pred_files: List[str], tau: float, logger=None, round_number=None) -> List[int]:
+    """
+    Compute per-client harmonic mean of pairwise Hamming distances.
+    Threshold = tau * mean(HM_i), range [0.5, 1.0].
+    Returns indices (into pred_files) that pass the filter (HM_i < threshold).
+    """
+    K = len(pred_files)
+    mmaps = [np.load(f, mmap_mode="r") for f in pred_files]
+    D = len(mmaps[0])
+    chunk = 50_000
 
-    np.save(output_path, hard_labels)
-    del hard_labels
+    hd = np.zeros((K, K), dtype=np.float64)
+    for s in range(0, D, chunk):
+        e = min(s + chunk, D)
+        block = np.stack([np.array(m[s:e], dtype=np.int32) for m in mmaps], axis=0)
+        for i in range(K):
+            diff = (block[i] != block).astype(np.float64).mean(axis=1)
+            hd[i] += diff * (e - s)
+    hd /= D
+    del mmaps
+
+    hm_scores = np.empty(K, dtype=np.float64)
+    for i in range(K):
+        dists = np.concatenate([hd[i, :i], hd[i, i + 1:]])
+        pos = dists[dists > 0]
+        hm_scores[i] = len(pos) / np.sum(1.0 / pos) if len(pos) > 0 else 0.0
+
+    threshold = tau * float(hm_scores.mean())
+
+    survivors = []
+    for i in range(K):
+        tag = "PASS" if hm_scores[i] < threshold else "REJECT"
+        if logger is not None:
+            logger.info("Round %s | HammingFilter | client_file_idx=%d | HM=%.4f | %s", round_number, i, hm_scores[i], tag)
+        if hm_scores[i] < threshold:
+            survivors.append(i)
+
+    if logger is not None:
+        logger.info("Round %s | HammingFilter | threshold=%.4f (tau=%.2f * mean_HM=%.4f)", round_number, threshold, tau, float(hm_scores.mean()))
+
+    if not survivors:
+        survivors = list(range(K))
+        if logger is not None:
+            logger.info("Round %s | HammingFilter | all rejected — falling back to full set", round_number)
+
+    return survivors
 
 
 def hard_label_vote(pred_files: List[str], num_classes: int, logger=None) -> np.ndarray:
@@ -179,16 +143,20 @@ def hard_label_vote(pred_files: List[str], num_classes: int, logger=None) -> np.
     return voted
 
 
-class SSFLIDS(DistillationStrategy):
-    name = "SSFL-IDS"
+class FedKDIDS(DistillationStrategy):
+    name = "FedKD-IDS"
     use_model_pool = False
 
     def extra_log_tokens(self) -> Dict[str, float]:
-        return {"dis_rounds": self.config.dis_rounds, "train_rounds": self.config.train_rounds, "dist_rounds": self.config.dist_rounds}
+        return {
+            "train_rounds": self.config.train_rounds,
+            "dist_rounds": self.config.dist_rounds,
+            "hamming_tau": getattr(self.config, "hamming_tau", 0.5),
+        }
 
     def setup(self, context: PipelineContext) -> None:
         config = context.config
-        os.makedirs(SSFLIDS_CACHE_DIR, exist_ok=True)
+        os.makedirs(FEDKDIDS_CACHE_DIR, exist_ok=True)
 
         public_dataset, total_public = load_public_dataset_from_clients(
             context.paths,
@@ -216,32 +184,21 @@ class SSFLIDS(DistillationStrategy):
         else:
             self._model = None
 
-        disc_pool = ModelPool(
-            pool_size=min(5, len(context.paths)),
-            factory_fn=lambda: create_discriminator(context.input_dim),
-        )
-        context.shared_state["disc_pool"] = disc_pool
-        context.shared_state["dis_rng"] = np.random.RandomState(42)
-
         for client_id, paths in enumerate(context.paths):
             st = context.add_client_state(client_id, None, paths)
             st.data["w"] = None
-            y_mmap = np.load(paths["train_y"], mmap_mode="r")
-            st.data["class_counts"] = np.bincount(y_mmap.astype(np.int32), minlength=context.num_classes)
-            del y_mmap
 
-        print(f"{COLORS.OKGREEN}SSFL-IDS initialized ({len(context.paths)} clients){COLORS.ENDC}")
+        print(f"{COLORS.OKGREEN}FedKD-IDS initialized ({len(context.paths)} clients){COLORS.ENDC}")
 
     def run_round(self, context: PipelineContext, round_number: int) -> Dict[int, Dict[str, float]]:
         round_start = time.time()
         config = context.config
         n_public = context.shared_state["public_sample_count"]
-        disc_pool = context.shared_state["disc_pool"]
-        dis_rng = context.shared_state["dis_rng"]
         _mixed = getattr(config, 'mixed_models', False)
         model = self._model
         _REFRESH_EVERY = getattr(config, "cleanup_interval", 25)
         attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
+        tau = getattr(config, "hamming_tau", 0.5)
 
         if round_number > 1 and not _mixed:
             del model
@@ -251,33 +208,33 @@ class SSFLIDS(DistillationStrategy):
             model = create_model(context.input_dim, context.num_classes,
                                  config.batch_size, model_type=config.model_type)
             self._model = model
-            disc_pool.refresh()
         elif round_number > 1:
             from ..memory import clear_session
             clear_session()
             aggressive_memory_cleanup()
-            disc_pool.refresh()
 
         base_mmap = np.load(_base_public_path(), mmap_mode="r")
         permutation = np.random.permutation(n_public)
         open_feature = np.array(base_mmap[permutation], dtype=np.float32)
         del base_mmap
 
-        os.makedirs(SSFLIDS_CACHE_DIR, exist_ok=True)
+        os.makedirs(FEDKDIDS_CACHE_DIR, exist_ok=True)
         pub_X_path = _round_public_path(round_number)
 
-        print(f"\n{COLORS.HEADER}Round {round_number} Stage I{COLORS.ENDC}")
+        print(f"\n{COLORS.HEADER}Round {round_number} Stage I (Verifier){COLORS.ENDC}")
         pred_files: List[str] = []
+        pred_client_ids: List[int] = []
 
         _ckpt = getattr(config, "checkpoint", 0)
         first_s1 = 0
         first_s2 = 0
         skip_stage2_init = False
         if _ckpt:
-            mid = load_mid_round(context, "ssflids", round_number)
+            mid = load_mid_round(context, "fedkdids", round_number)
             if mid is not None:
                 stage = mid.get("stage", 1)
                 pred_files = mid.get("pred_files", [])
+                pred_client_ids = mid.get("pred_client_ids", [])
                 for st in context.client_states:
                     w = mid.get("client_weights", {}).get(st.client_id)
                     if w is not None:
@@ -302,7 +259,6 @@ class SSFLIDS(DistillationStrategy):
                     from ..memory import clear_session
                     clear_session()
                     aggressive_memory_cleanup()
-                    disc_pool.refresh()
                 from models.mixed_models import get_model_type_for_client
                 arch = get_model_type_for_client(state.client_id, context.n_clients)
                 model = create_model(context.input_dim, context.num_classes,
@@ -318,7 +274,6 @@ class SSFLIDS(DistillationStrategy):
                     model = create_model(context.input_dim, context.num_classes,
                                          config.batch_size, model_type=config.model_type)
                     self._model = model
-                    disc_pool.refresh()
                 model.set_weights(state.data["w"] or context.shared_state["init_w"])
 
             cid = state.client_id
@@ -339,64 +294,28 @@ class SSFLIDS(DistillationStrategy):
                 context.input_dim, context.num_classes, config.batch_size,
                 poison_loader=_s1_poison_loader,
             )
-            old_w = model.get_weights()
             model.fit(ds, epochs=config.train_rounds, verbose=0)
             del ds
             new_w = model.get_weights()
 
-            if np.sum(state.data["class_counts"] > 0) <= 1:
-                print("  Skipping discriminator (insufficient classes)")
-                if cid in context.poisoned_clients:
-                    context.logger.info("Round %s | Client %s [POISONED] SKIPPED (insufficient classes) — excluded from vote", round_number, cid)
-                state.data["w"] = new_w
-                if _mixed:
-                    del model
-                aggressive_memory_cleanup()
-                continue
-
-            disc = disc_pool.checkout(cid)
-            trained = train_discriminator(
-                model, disc, open_feature,
-                config.dis_rounds, config.batch_size,
-                state.paths["train_X"], dis_rng,
-            )
-            if not trained:
-                print("  Discriminator training skipped (no uncertain samples)")
-                if cid in context.poisoned_clients:
-                    context.logger.info("Round %s | Client %s [POISONED] SKIPPED (discriminator not trained) — excluded from vote", round_number, cid)
-                disc_pool.checkin(cid, disc)
-                state.data["w"] = new_w
-                if _mixed:
-                    del model
-                aggressive_memory_cleanup()
-                continue
-
             poisoned_w = None
-            if cid in context.poisoned_clients and attack_type == "gradient_scale":
+            if _poisoned and attack_type == "gradient_scale":
                 poisoned_w = apply_gradient_scale_poison(new_w, poison_value)
                 model.set_weights(poisoned_w)
                 print(f"{COLORS.WARNING}  [POISON] Client {cid}: gradient_scale applied (×{poison_value}){COLORS.ENDC}")
-                context.logger.info("Round %s | Client %s [POISON] gradient_scale ×%s applied — WILL vote", round_number, cid, poison_value)
+                context.logger.info("Round %s | Client %s [POISON] gradient_scale ×%s applied", round_number, cid, poison_value)
 
             pred_path = _pred_path(cid, round_number)
-            predict_with_discriminator(
-                model, disc, open_feature,
-                context.num_classes, config.batch_size, pred_path,
-            )
-            disc_pool.checkin(cid, disc)
+            _predict_hard_labels(model, open_feature, context.num_classes, config.batch_size, pred_path)
             pred_files.append(pred_path)
+            pred_client_ids.append(cid)
 
             _preds = np.load(pred_path, mmap_mode="r")
-            _known_mask = _preds < context.num_classes
-            _known = int(_known_mask.sum())
-            _top = ""
-            if _known > 0:
-                _counts = np.bincount(_preds[_known_mask].astype(np.int32), minlength=context.num_classes)
-                _top3 = np.argsort(_counts)[::-1][:3]
-                _top = " | ".join(f"cls{c}:{100*_counts[c]/max(_known,1):.1f}%" for c in _top3 if _counts[c] > 0)
-            _poison_tag = " [POISONED]" if cid in context.poisoned_clients else ""
-            context.logger.info("Round %s | Client %s%s | known=%d/%d (%.1f%%) | top3: %s",
-                round_number, cid, _poison_tag, _known, len(_preds), 100*_known/max(len(_preds),1), _top)
+            _counts = np.bincount(np.array(_preds, dtype=np.int32), minlength=context.num_classes)
+            _top3 = np.argsort(_counts)[::-1][:3]
+            _top = " | ".join(f"cls{c}:{100*_counts[c]/max(len(_preds),1):.1f}%" for c in _top3 if _counts[c] > 0)
+            _poison_tag = " [POISONED]" if _poisoned else ""
+            context.logger.info("Round %s | Client %s%s | top3: %s", round_number, cid, _poison_tag, _top)
             del _preds
 
             state.data["w"] = poisoned_w if poisoned_w is not None else new_w
@@ -405,11 +324,12 @@ class SSFLIDS(DistillationStrategy):
                 client_idx == len(context.client_states) - 1
                 or (client_idx + 1) % _ckpt == 0
             ):
-                save_mid_round(context, "ssflids", {
+                save_mid_round(context, "fedkdids", {
                     "round": round_number,
                     "stage": 1,
                     "last_client_idx": client_idx,
                     "pred_files": pred_files,
+                    "pred_client_ids": pred_client_ids,
                     "client_weights": {
                         st.client_id: st.data["w"]
                         for st in context.client_states
@@ -423,10 +343,34 @@ class SSFLIDS(DistillationStrategy):
         del open_feature
         aggressive_memory_cleanup()
 
+        # ---- Hamming filter (Verifier) ----
+        print(f"\n{COLORS.HEADER}Round {round_number} Verifier (Hamming filter, tau={tau}){COLORS.ENDC}")
+        if not skip_stage2_init and pred_files:
+            survivor_local_idx = _hamming_filter(pred_files, tau, logger=context.logger, round_number=round_number)
+            filtered_pred_files = [pred_files[i] for i in survivor_local_idx]
+            filtered_cids = [pred_client_ids[i] for i in survivor_local_idx]
+            rejected_cids = [pred_client_ids[i] for i in range(len(pred_files)) if i not in set(survivor_local_idx)]
+            if rejected_cids:
+                context.logger.info("Round %s | HammingFilter | rejected client_ids: %s", round_number, rejected_cids)
+            if context.poisoned_clients:
+                poisoned_set = set(context.poisoned_clients)
+                TP = len(set(rejected_cids) & poisoned_set)
+                FP = len(set(rejected_cids) - poisoned_set)
+                FN = len(poisoned_set - set(rejected_cids))
+                TN = len(pred_client_ids) - TP - FP - FN
+                context.logger.info(
+                    "Round %s | HammingFilterMetrics | TP=%d FP=%d TN=%d FN=%d",
+                    round_number, TP, FP, TN, FN,
+                )
+        else:
+            filtered_pred_files = pred_files
+            filtered_cids = pred_client_ids
+
         print(f"\n{COLORS.HEADER}Round {round_number} Stage II{COLORS.ENDC}")
-        pseudo_y_path = os.path.join(SSFLIDS_CACHE_DIR, f"r{round_number}_pseudo_y.npy")
+        pseudo_y_path = os.path.join(FEDKDIDS_CACHE_DIR, f"r{round_number}_pseudo_y.npy")
         if not skip_stage2_init and not os.path.exists(pseudo_y_path):
-            global_labels_np = hard_label_vote(pred_files, context.num_classes, logger=context.logger)
+            active_files = filtered_pred_files if filtered_pred_files else pred_files
+            global_labels_np = hard_label_vote(active_files, context.num_classes, logger=context.logger)
             np.save(pseudo_y_path, global_labels_np)
             del global_labels_np
         aggressive_memory_cleanup()
@@ -487,11 +431,12 @@ class SSFLIDS(DistillationStrategy):
                 s2_idx == len(context.client_states) - 1
                 or (s2_idx + 1) % _ckpt == 0
             ):
-                save_mid_round(context, "ssflids", {
+                save_mid_round(context, "fedkdids", {
                     "round": round_number,
                     "stage": 2,
                     "last_client_idx": s2_idx,
                     "pred_files": [],
+                    "pred_client_ids": [],
                     "client_weights": {
                         st.client_id: st.data["w"]
                         for st in context.client_states
@@ -509,6 +454,7 @@ class SSFLIDS(DistillationStrategy):
                                  config.batch_size, model_type=config.model_type)
             if context.shared_state.get("poisonedfl_ghost_w") is not None:
                 ghost.set_weights(context.shared_state["poisonedfl_ghost_w"])
+            print(f"{COLORS.WARNING}  [PoisonedFL] Ghost model generating logits for {len(context.poisoned_clients)} byzantine clients{COLORS.ENDC}")
             ghost.fit(public_ds, epochs=config.dist_rounds, verbose=0)
             ghost_w = ghost.get_weights()
             del ghost
@@ -517,7 +463,11 @@ class SSFLIDS(DistillationStrategy):
             for st in context.client_states:
                 if st.client_id in context.poisoned_clients:
                     st.data["w"] = poisoned_w
-            context.logger.info("Round %s | PoisonedFL | Ghost trained on public_ds, injected into %d byzantine clients", round_number, len(context.poisoned_clients))
+            _mal_norm = float(np.linalg.norm(_pfl.cached_update)) if _pfl.cached_update is not None else 0.0
+            context.logger.info(
+                "Round %s | PoisonedFL | c=%.4f mal_norm=%.4e | Ghost trained on public_ds, injected into %d byzantine clients",
+                round_number, _pfl.scaling_factor, _mal_norm, len(context.poisoned_clients),
+            )
             del ghost_w, poisoned_w
             aggressive_memory_cleanup()
 
@@ -565,9 +515,9 @@ class SSFLIDS(DistillationStrategy):
                                  config.batch_size, model_type=config.model_type)
             self._model = model
 
-        for name in os.listdir(SSFLIDS_CACHE_DIR):
+        for name in os.listdir(FEDKDIDS_CACHE_DIR):
             if name.startswith(f"r{round_number}_"):
-                os.remove(os.path.join(SSFLIDS_CACHE_DIR, name))
+                os.remove(os.path.join(FEDKDIDS_CACHE_DIR, name))
         aggressive_memory_cleanup()
 
         round_time = time.time() - round_start
@@ -576,13 +526,13 @@ class SSFLIDS(DistillationStrategy):
         print(f"{COLORS.OKCYAN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
 
         if _ckpt:
-            clear_mid_round(context, "ssflids")
+            clear_mid_round(context, "fedkdids")
 
         return {}
 
     def finalize(self, context: PipelineContext) -> None:
         from ..memory import clear_session
         clear_session()
-        if os.path.isdir(SSFLIDS_CACHE_DIR):
-            for name in os.listdir(SSFLIDS_CACHE_DIR):
-                os.remove(os.path.join(SSFLIDS_CACHE_DIR, name))
+        if os.path.isdir(FEDKDIDS_CACHE_DIR):
+            for name in os.listdir(FEDKDIDS_CACHE_DIR):
+                os.remove(os.path.join(FEDKDIDS_CACHE_DIR, name))
