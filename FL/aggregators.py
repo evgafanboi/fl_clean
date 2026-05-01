@@ -12,6 +12,7 @@ from .strategy.FedMLB import FedMLB
 from .strategy.NoneStrategy import NoneStrategy
 from .strategy.SecureAggregation import SecureAggregation
 from .strategy.FedSSDexp import FedSSDexp
+from .strategy.FLAME import FLAME
 
 
 @dataclass
@@ -132,6 +133,15 @@ def _fedssdexp_client_factory(aggregator: FedSSDexp, _: Dict[str, Any]) -> FedSS
     return aggregator
 
 
+def _flame_factory(params: Dict[str, Any]) -> FLAME:
+    lambda_dp = params.get('flame_lambda', 0.001)
+    return FLAME(lambda_dp=lambda_dp)
+
+
+def _flame_client_factory(_: Any, __: Dict[str, Any]) -> FedAvg:
+    return FedAvg()
+
+
 STRATEGY_REGISTRY: Dict[str, StrategyConfig] = {
     'FedAvg': StrategyConfig(
         aggregator_factory=_fedavg_aggregator_factory,
@@ -173,6 +183,10 @@ STRATEGY_REGISTRY: Dict[str, StrategyConfig] = {
     'FedSSDexp': StrategyConfig(
         aggregator_factory=_fedssdexp_factory,
         client_factory=_fedssdexp_client_factory
+    ),
+    'FLAME': StrategyConfig(
+        aggregator_factory=_flame_factory,
+        client_factory=_flame_client_factory
     ),
     'None': StrategyConfig(
         aggregator_factory=_none_factory,

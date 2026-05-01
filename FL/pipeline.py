@@ -128,6 +128,7 @@ class FLConfig:
     skip_eval: bool = False
     fresh_run: bool = False
     cache_test_set: bool = False
+    flame_lambda: float = 0.001
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -148,6 +149,7 @@ class FLConfig:
             'm_max': self.m_max,
             'support': self.support,
             'threshold': self.threshold,
+            'flame_lambda': self.flame_lambda,
         }
 
 
@@ -802,7 +804,7 @@ class FederatedLearningPipeline:
 
         return result_data, sample_size, loss
 
-    _NEEDS_ALL_WEIGHTS = frozenset({'feddyn', 'fltrust', 'fedcomed', 'robustfilter'})
+    _NEEDS_ALL_WEIGHTS = frozenset({'feddyn', 'fltrust', 'fedcomed', 'robustfilter', 'flame'})
 
     def _can_stream_aggregate(self) -> bool:
         """Check if strategy supports incremental (streaming) aggregation."""
@@ -815,12 +817,14 @@ class FederatedLearningPipeline:
             return False
         return True
 
-    def _aggregate(self, weights_list, sample_sizes, participating_clients, global_update=None, models=None):
+    def _aggregate(self, weights_list, sample_sizes, participating_clients, global_update=None, models=None, prev_global=None):
         aggregator = self.strategy_runtime.aggregator
         
         # FLTrust requires global_update parameter
         if self.config.strategy == "FLTrust":
             return aggregator.aggregate(weights_list, sample_sizes, global_update=global_update)
+        elif self.config.strategy == "FLAME":
+            return aggregator.aggregate(weights_list, sample_sizes, prev_global=prev_global)
         elif self.strategy_runtime.requires_participant_ids:
             return aggregator.aggregate(weights_list, sample_sizes, participating_clients)
         else:
@@ -1365,7 +1369,7 @@ class FederatedLearningPipeline:
                 
                 print(f"\n{COLORS.OKBLUE}Aggregating updates ({self.config.strategy}){COLORS.ENDC}")
                 
-                aggregated_result = self._aggregate(weights_list, sample_sizes, participating_clients, global_update, models_list)
+                aggregated_result = self._aggregate(weights_list, sample_sizes, participating_clients, global_update, models_list, prev_global=latest_weights)
                 
                 # For FLTrust, apply update to get new weights
                 if self.config.strategy == "FLTrust":

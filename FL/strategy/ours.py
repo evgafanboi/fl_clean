@@ -23,40 +23,10 @@ from .common import (
     create_private_dataset,
     load_public_dataset_from_clients,
     numpy_from_dataset,
+    cpa_logits as _cpa_logits,
 )
 
 LOGITS_CACHE_DIR = os.path.join("temp_weights", "ours_cache")
-
-
-def _hips_cpa_logits(stale: np.ndarray, boost: float) -> np.ndarray:
-    """
-    Stale CPA+HIPS attack on raw logits.
-
-    CPA class selection: uses class-class covariance computed from softmax(stale) as a
-    proxy for the precomputed cpa_tensor in the reference. For each sample:
-        cpa_target[i] = argmin(cov_matrix[argmax(stale[i]), :])
-    i.e. the class LEAST correlated to the honest argmax in logit-probability space.
-    This differs from CELMAX (argmin of logit values) — CPA is correlation-based.
-
-    HIPS modifier (stale oracle approximation): instead of one-hot on cpa_target, we
-    copy stale logits and shift cpa_target to (max + boost*(max-min)), keeping the
-    adversarial vector near the stale distribution shape (honest convex hull proxy).
-    With individual per-client logits we would pick the vertex with min inner product
-    with the cpa row; here the stale mean is the only available honest vector.
-    boost=0.0 → CPA class is barely above max; boost=1.0 → clear gap.
-    """
-    probs = np.exp(stale - stale.max(axis=1, keepdims=True))
-    probs /= probs.sum(axis=1, keepdims=True)           # [N, C] softmax
-    cov_matrix = (probs.T @ probs) / len(probs)         # [C, C] class covariance
-    honest_max = np.argmax(stale, axis=1)               # [N]
-    cpa_target = np.argmin(cov_matrix[honest_max], axis=1)  # [N]
-
-    adv = stale.copy()
-    row = np.arange(len(stale))
-    max_val = stale.max(axis=1)
-    min_val = stale.min(axis=1)
-    adv[row, cpa_target] = max_val + boost * (max_val - min_val + 1e-3)
-    return adv.astype(np.float32)
 
 
 # ── Logit generation (chunked to disk) ──────────────────────────────────────
@@ -495,26 +465,35 @@ class Ours(DistillationStrategy):
             del _gm, _lm, _garr
             aggressive_memory_cleanup()
 
+        _cpa_adv_bytes = None
+        _cpa_adv_shape = None
+        _cpa_adv_log = None
+        if attack_type == "cpa" and context.poisoned_clients:
+            stale = context.shared_state.get("cpa_stale_consensus")
+            if stale is not None:
+                _adv = _cpa_logits(stale)
+                _cpa_adv_bytes = _adv.astype(np.float32).tobytes()
+                _cpa_adv_shape = _adv.shape
+                _hcounts = np.bincount(np.argmax(_adv, axis=1), minlength=context.num_classes)
+                _htop3 = np.argsort(_hcounts)[::-1][:3]
+                _cpa_adv_log = " | ".join(f"cls{c}:{100*_hcounts[c]/max(len(_adv),1):.1f}%" for c in _htop3 if _hcounts[c] > 0)
+                del _adv, _hcounts
+
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_client:
                 continue
             fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{state.client_id}.bin")
-            if attack_type == "hips_cpa" and state.client_id in context.poisoned_clients:
-                stale = context.shared_state.get("hips_cpa_stale_consensus")
-                if stale is not None:
-                    adv = _hips_cpa_logits(stale, poison_value)
+            if attack_type == "cpa" and state.client_id in context.poisoned_clients:
+                if _cpa_adv_bytes is not None:
                     with open(fpath, "wb") as _hf:
-                        _hf.write(adv.astype(np.float32).tobytes())
+                        _hf.write(_cpa_adv_bytes)
                     logit_files.append(fpath)
                     if logit_shape is None:
-                        logit_shape = adv.shape
-                    _hcounts = np.bincount(np.argmax(adv, axis=1), minlength=context.num_classes)
-                    _htop3 = np.argsort(_hcounts)[::-1][:3]
-                    _htop = " | ".join(f"cls{c}:{100*_hcounts[c]/max(len(adv),1):.1f}%" for c in _htop3 if _hcounts[c] > 0)
-                    context.logger.info("Round %s | Client %s [HIPS+CPA] | top3 adv-argmax: %s", self._cur_round, state.client_id, _htop)
-                    del adv, _hcounts
+                        logit_shape = _cpa_adv_shape
+                    context.logger.info("Round %s | Client %s [CPA] | top3 adv-argmax: %s", self._cur_round, state.client_id, _cpa_adv_log)
                     continue
-                # Round 1: no stale yet — fall through to normal logit generation
+                # Round 1: no stale yet — skip entirely
+                continue
             if _pfl_gen is not None and state.client_id in context.poisoned_clients:
                 if _ghost_bytes is not None:
                     with open(fpath, 'wb') as _gf:
@@ -587,7 +566,7 @@ class Ours(DistillationStrategy):
         n_clients = len(context.client_states)
         _pfl_m = getattr(context, 'poisoned_fl_state', None)
         attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
-        _hips = attack_type == "hips_cpa"
+        _cpa = attack_type == "cpa"
         accumulator = None
         n_benign = 0
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), n_clients)
@@ -595,7 +574,7 @@ class Ours(DistillationStrategy):
         for client_idx, state in enumerate(context.client_states):
             if _pfl_m is not None and state.client_id in context.poisoned_clients:
                 continue
-            if _hips and state.client_id in context.poisoned_clients:
+            if _cpa and state.client_id in context.poisoned_clients:
                 continue
             model = pool.checkout(state.client_id)
             logits_model = model.get_logits_model() if hasattr(model, "get_logits_model") else model
@@ -623,11 +602,11 @@ class Ours(DistillationStrategy):
                 accumulator += _gl * n_byz
             n_benign += n_byz
             del _gm, _lm, _gl
-        if _hips and context.poisoned_clients:
-            stale = context.shared_state.get("hips_cpa_stale_consensus")
+        if _cpa and context.poisoned_clients:
+            stale = context.shared_state.get("cpa_stale_consensus")
             if stale is not None:
                 n_byz = len(context.poisoned_clients)
-                adv = _hips_cpa_logits(stale, poison_value)
+                adv = _cpa_logits(stale)
                 if accumulator is None:
                     accumulator = adv.astype(np.float64) * n_byz
                 else:
@@ -681,14 +660,16 @@ class Ours(DistillationStrategy):
         config = context.config
         pool = context.model_pool
         _pfl_ce = getattr(context, 'poisoned_fl_state', None)
+        attack_type, _, _ = parse_poison_config(getattr(config, "poison", None))
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_client:
                 continue
             print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 1 (CE){COLORS.ENDC}")
             _poisoned = state.client_id in context.poisoned_clients
-            if _poisoned and _pfl_ce is not None:
-                context.logger.info("Round %s | Client %s [PoisonedFL] all stages skipped", self._cur_round, state.client_id)
+            if _poisoned and (_pfl_ce is not None or attack_type == "cpa"):
+                _tag = "PoisonedFL" if _pfl_ce is not None else "CPA"
+                context.logger.info("Round %s | Client %s [%s] CE skipped", self._cur_round, state.client_id, _tag)
                 continue
             model = pool.checkout(state.client_id)
             poison_loader = context.per_client_loaders.get(state.client_id, context.poison_loader) if _poisoned else None
@@ -771,7 +752,7 @@ class Ours(DistillationStrategy):
                 print(f"\n{COLORS.OKCYAN}Regenerating mean consensus for KD resume{COLORS.ENDC}")
                 consensus_logits = self._generate_logits_mean(context, public_features)
 
-            context.shared_state["hips_cpa_stale_consensus"] = consensus_logits.copy()
+            context.shared_state["cpa_stale_consensus"] = consensus_logits.copy()
 
             # Stage 2 — KD distillation
             self._run_kd_stage(context, consensus_logits, public_features, first_client=first_kd)
@@ -853,7 +834,7 @@ class Ours(DistillationStrategy):
                             round_number, eig_s, ratio_s, top_removed,
                         )
                     np.save(consensus_path, consensus_logits)
-                    context.shared_state["hips_cpa_stale_consensus"] = consensus_logits.copy()
+                    context.shared_state["cpa_stale_consensus"] = consensus_logits.copy()
 
                 for fpath in logit_files:
                     if os.path.exists(fpath):

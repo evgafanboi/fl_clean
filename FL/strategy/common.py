@@ -22,6 +22,18 @@ else:
     dense = gru = dcblstm = None  # type: ignore
 
 
+def cpa_logits(stale: np.ndarray) -> np.ndarray:
+    """CPA: one-hot at the class least correlated with the honest argmax."""
+    probs = np.exp(stale - stale.max(axis=1, keepdims=True))
+    probs /= probs.sum(axis=1, keepdims=True)
+    cov_matrix = (probs.T @ probs) / len(probs)
+    honest_max = np.argmax(probs, axis=1)
+    cpa_target = np.argmin(cov_matrix[honest_max], axis=1)
+    adv = np.zeros_like(probs)
+    adv[np.arange(len(probs)), cpa_target] = 1.0
+    return adv.astype(np.float32)
+
+
 def create_model(input_dim: int, num_classes: int, batch_size: int, model_type: str = "dense"):
     from ..backend import use_tf
     if not use_tf():
@@ -248,8 +260,6 @@ def _load_public_dataloader_from_clients(
             y_oh = np.zeros((len(y_raw), num_classes), dtype=np.float32)
             y_oh[np.arange(len(y_raw)), y_raw] = 1.0
             y_parts.append(y_oh)
-    if not X_parts:
-        raise ValueError("No public data found in client partitions")
     X_all = np.concatenate(X_parts, axis=0)
     if shuffle:
         idx = np.random.permutation(len(X_all))

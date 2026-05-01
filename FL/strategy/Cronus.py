@@ -350,8 +350,9 @@ class Cronus(DistillationStrategy):
             poisoned = cid in context.poisoned_clients
             p_loader = context.per_client_loaders.get(cid, context.poison_loader) if poisoned else None
 
-            if poisoned and attack_type == "poisonedfl":
-                context.logger.info("Round %s | Client %s [PoisonedFL] all stages skipped", round_number, cid)
+            if poisoned and attack_type in ("poisonedfl", "cpa"):
+                _tag = "PoisonedFL" if attack_type == "poisonedfl" else "CPA"
+                context.logger.info("Round %s | Client %s [%s] all stages skipped", round_number, cid, _tag)
                 if _mixed:
                     del model
                 aggressive_memory_cleanup()

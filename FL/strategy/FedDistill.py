@@ -16,7 +16,7 @@ from ..context import PipelineContext
 from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
-from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
+from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset, cpa_logits as _cpa_logits, cpa_logits as _cpa_logits
 
 FEDEXPGUARD_CACHE_DIR = os.path.join("temp_weights", "fedexpguard_cache")
 
@@ -30,19 +30,21 @@ def _round_public_path(round_number):
 
 
 def _soft_path(cid, round_number):
-    return os.path.join(FEDEXPGUARD_CACHE_DIR, f"r{round_number}_c{cid}_soft.npy")
+    return os.path.join(FEDEXPGUARD_CACHE_DIR, f"r{round_number}_c{cid}_soft.bin")
 
 
 def _predict_soft_labels(model, X, batch_size, output_path):
-    logits = model.predict(X, batch_size=batch_size, verbose=0)
+    src = model.get_logits_model() if hasattr(model, "get_logits_model") else model
+    logits = src.predict(X, batch_size=batch_size, verbose=0)
     e = np.exp(logits - logits.max(axis=1, keepdims=True))
     soft = (e / e.sum(axis=1, keepdims=True)).astype(np.float32)
-    np.save(output_path, soft)
+    with open(output_path, "wb") as _f:
+        _f.write(soft.tobytes())
 
 
 def _top_eigenvector(cov, n_iter=100, eps=1e-10):
     """Power iteration for leading eigenvector. cov: [N, C, C] -> [N, C, 1]"""
-    v = np.ones((cov.shape[0], cov.shape[1], 1), dtype=np.float64)
+    v = np.ones((cov.shape[0], cov.shape[1], 1), dtype=cov.dtype)
     for _ in range(n_iter):
         m = cov @ v
         nrm = np.linalg.norm(m, axis=1, keepdims=True).clip(min=eps)
@@ -56,15 +58,15 @@ def _filter_outlier_scores(preds):
     p = preds.transpose(1, 2, 0)  # [N, C, K]
     mean_p = p.mean(axis=2, keepdims=True)  # [N, C, 1]
     centered = (p - mean_p).transpose(0, 2, 1)  # [N, K, C]
-    cov = np.einsum('nkc,nkd->ncd', centered, centered) / max(K - 1, 1)  # [N, C, C]
-    ev = _top_eigenvector(cov)  # [N, C, 1]
+    cov = np.einsum('nkc,nkd->ncd', centered.astype(np.float64), centered.astype(np.float64)) / max(K - 1, 1)  # [N, C, C]
+    ev = _top_eigenvector(cov).astype(preds.dtype)  # [N, C, 1]
     return centered @ ev  # [N, K, 1]
 
 
 def _filtered_mean(preds, scores, threshold):
     """preds: [K, N, C], scores: [N, K, 1], threshold: [N]. Returns [N, C]."""
     p = preds.transpose(1, 2, 0)  # [N, C, K]
-    mask = (np.abs(scores.squeeze(2)) <= threshold[:, None]).astype(np.float64)  # [N, K]
+    mask = (np.abs(scores.squeeze(2)) <= threshold[:, None]).astype(preds.dtype)  # [N, K]
     n_kept = mask.sum(axis=1, keepdims=True).clip(min=1)  # [N, 1]
     filt = (p * mask[:, None, :]).sum(axis=2) / n_kept  # [N, C]
     all_zero = (mask.sum(axis=1) == 0)
@@ -73,35 +75,7 @@ def _filtered_mean(preds, scores, threshold):
     return filt  # [N, C]
 
 
-def _cronus_filtered_mean(preds):
-    """
-    Two-round Cronus spectral filter.
-    preds: [K, N, C]. Returns (filtered_mean [N, C], mean_outlier_scores [K]).
-    """
-    K = preds.shape[0]
-    max_byz = (K // 2 - 1) if K % 2 == 0 else (K // 2)
-    max_byz = max(max_byz, 0)
-    quantile = 1.0 - max_byz / (2.0 * K)
-
-    # Round 1: keep k smallest-scoring clients
-    scores1 = _filter_outlier_scores(preds)  # [N, K, 1]
-    k = max(int(quantile * K), 1)
-    abs_scores1 = np.abs(scores1.squeeze(2))  # [N, K]
-    rank = np.argsort(abs_scores1, axis=1)  # [N, K] ascending
-    keep_idx = rank[:, :k]  # [N, k]
-    # Build reduced_pred [k, N, C]
-    reduced = np.stack([preds[keep_idx[n], n, :] for n in range(preds.shape[1])], axis=1)  # [k, N, C]
-
-    # Round 2: threshold filter on reduced set
-    scores2 = _filter_outlier_scores(reduced)  # [N, k, 1]
-    abs_scores2 = np.abs(scores2.squeeze(2))  # [N, k]
-    threshold = np.quantile(abs_scores2, quantile, axis=1)  # [N]
-    consensus = _filtered_mean(reduced, scores2, threshold)  # [N, C]
-
-    # Outlier scores for ExpGuard: mean L2 to consensus over all original K clients
-    mean_rho = np.mean(np.linalg.norm(
-        preds - consensus[None], axis=2), axis=1)  # [K]
-    return consensus, mean_rho
+_EXPGUARD_CHUNK = 10_000
 
 
 def _expguard_aggregate(
@@ -109,30 +83,76 @@ def _expguard_aggregate(
     client_ids: List[int],
     exp_w: np.ndarray,
     rho: float,
+    N_pub: int,
+    n_classes: int,
     logger=None,
     round_number=None,
 ):
-    """
-    Base rule: Cronus two-round spectral filter.
-    Outlier score: per-client mean L2 distance to the Cronus-filtered consensus.
-    Update: w_i <- w_i * exp(-rho * rho_i).
-    Returns (weighted_consensus [N_pub, C], updated exp_w).
-    """
-    preds = np.stack([np.load(f) for f in soft_files], axis=0).astype(np.float64)  # [K, N_pub, C]
-    _, rho_i = _cronus_filtered_mean(preds)  # [K]
+    K = len(soft_files)
+    max_byz = (K // 2 - 1) if K % 2 == 0 else K // 2
+    quantile = 1.0 - max(max_byz, 0) / (2.0 * K)
+    k_keep = max(int(quantile * K), 1)
+    row_bytes = n_classes * 4
 
+    # ── Pass 1: streaming Cronus filter → Cronus consensus + per-client rho ──
+    rho_sum = np.zeros(K, dtype=np.float64)
+    handles = [open(f, "rb") for f in soft_files]
+    for off in range(0, N_pub, _EXPGUARD_CHUNK):
+        rows = min(_EXPGUARD_CHUNK, N_pub - off)
+        chunks = np.stack([
+            np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes)
+            for h in handles
+        ], axis=0)  # [K, rows, C]
+
+        scores1 = _filter_outlier_scores(chunks)         # [rows, K, 1]
+        abs_s1 = np.abs(scores1.squeeze(2))              # [rows, K]
+        rank = np.argsort(abs_s1, axis=1)
+        keep_idx = rank[:, :k_keep]                      # [rows, k_keep]
+        del scores1, abs_s1, rank
+
+        nkc = chunks.transpose(1, 0, 2)                 # [rows, K, C] view
+        reduced = nkc[np.arange(rows)[:, None], keep_idx, :].transpose(1, 0, 2)  # [k_keep, rows, C]
+        del nkc, keep_idx
+
+        scores2 = _filter_outlier_scores(reduced)        # [rows, k_keep, 1]
+        abs_s2 = np.abs(scores2.squeeze(2))              # [rows, k_keep]
+        threshold = np.quantile(abs_s2, quantile, axis=1)
+        con = _filtered_mean(reduced, scores2, threshold)  # [rows, C]
+        del reduced, scores2, abs_s2, threshold
+
+        rho_sum += np.linalg.norm(chunks - con[None], axis=2).sum(axis=1).astype(np.float64)
+        del chunks, con
+    for h in handles:
+        h.close()
+
+    mean_rho = rho_sum / N_pub  # [K]
+
+    # ── Update exponential weights ────────────────────────────────────────────
     new_w = exp_w.copy()
     for i, cid in enumerate(client_ids):
-        new_w[cid] = exp_w[cid] * np.exp(-rho * rho_i[i])
+        new_w[cid] = exp_w[cid] * np.exp(-rho * mean_rho[i])
         if logger is not None:
             logger.info(
                 "Round %s | ExpGuard | client=%d | outlier=%.4f | w %.4e -> %.4e",
-                round_number, cid, rho_i[i], float(exp_w[cid]), float(new_w[cid]),
+                round_number, cid, mean_rho[i], float(exp_w[cid]), float(new_w[cid]),
             )
 
-    w_sub = np.array([new_w[cid] for cid in client_ids], dtype=np.float64)
-    w_norm = w_sub / w_sub.sum()
-    consensus = np.einsum("kpc,k->pc", preds, w_norm).astype(np.float32)
+    # ── Pass 2: streaming weighted aggregation ────────────────────────────────
+    w_sub = np.array([new_w[cid] for cid in client_ids], dtype=np.float32)
+    w_norm = w_sub / w_sub.sum()  # [K]
+    consensus = np.zeros((N_pub, n_classes), dtype=np.float32)
+    handles = [open(f, "rb") for f in soft_files]
+    for off in range(0, N_pub, _EXPGUARD_CHUNK):
+        rows = min(_EXPGUARD_CHUNK, N_pub - off)
+        chunks = np.stack([
+            np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes)
+            for h in handles
+        ], axis=0)  # [K, rows, C]
+        consensus[off:off + rows] = np.einsum("krc,k->rc", chunks, w_norm)
+        del chunks
+    for h in handles:
+        h.close()
+
     return consensus, new_w
 
 
@@ -269,6 +289,10 @@ class FedDistillExpGuard(DistillationStrategy):
 
             client_model.set_weights(global_w)
 
+            if _poisoned and attack_type == "cpa":
+                context.logger.info("Round %s | Client %s [CPA] CE skipped", round_number, cid)
+                continue
+
             _poison_loader = context.per_client_loaders.get(cid, context.poison_loader) if _poisoned else None
             ds = create_client_dataset(
                 state.paths["train_X"], state.paths["train_y"],
@@ -303,6 +327,27 @@ class FedDistillExpGuard(DistillationStrategy):
                     "soft_client_ids": soft_client_ids,
                 })
 
+        # ---- CPA: ghost soft labels (compute once, copy to all byzantine clients) ----
+        if attack_type == "cpa" and context.poisoned_clients:
+            stale = context.shared_state.get("cpa_stale_consensus")
+            if stale is not None:
+                _cpa_adv = _cpa_logits(stale)
+                _cpa_bytes = _cpa_adv.astype(np.float32).tobytes()
+                for st in context.client_states:
+                    if st.client_id not in context.poisoned_clients:
+                        continue
+                    sp = _soft_path(st.client_id, round_number)
+                    with open(sp, "wb") as _cf:
+                        _cf.write(_cpa_bytes)
+                    if st.client_id not in soft_client_ids:
+                        soft_files.append(sp)
+                        soft_client_ids.append(st.client_id)
+                context.logger.info(
+                    "Round %s | CPA | Byzantine soft labels generated for %d clients",
+                    round_number, len(context.poisoned_clients),
+                )
+                del _cpa_adv, _cpa_bytes
+
         # ---- PoisonedFL: override byzantine weights, re-generate soft preds ----
         _pfl = getattr(context, "poisoned_fl_state", None)
         if _pfl is not None and context.poisoned_clients:
@@ -335,10 +380,11 @@ class FedDistillExpGuard(DistillationStrategy):
         # ---- ExpGuard aggregation ----
         print(f"\n{COLORS.HEADER}Round {round_number} ExpGuard (rho={rho}){COLORS.ENDC}")
         consensus, new_exp_w = _expguard_aggregate(
-            soft_files, soft_client_ids, exp_w, rho,
+            soft_files, soft_client_ids, exp_w, rho, n_public, context.num_classes,
             logger=context.logger, round_number=round_number,
         )
         context.shared_state["exp_weights"] = new_exp_w
+        context.shared_state["cpa_stale_consensus"] = consensus.copy()
 
         if context.poisoned_clients:
             poisoned_set = set(context.poisoned_clients)

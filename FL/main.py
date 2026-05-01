@@ -8,7 +8,7 @@ os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 warnings.filterwarnings('ignore')
 
 
-WEIGHT_AGGREGATION_STRATEGIES = {"FedAvg", "FedProx", "FedDyn", "FedCoMed", "RobustFilter", "DeepFed", "FLTrust", "SecureAggregation", "FedSSD1", "FedSSDexp", "FedSSD2", "None"}
+WEIGHT_AGGREGATION_STRATEGIES = {"FedAvg", "FedProx", "FedDyn", "FedCoMed", "RobustFilter", "DeepFed", "FLTrust", "SecureAggregation", "FedSSD1", "FedSSDexp", "FedSSD2", "None", "FLAME"}
 DISTILLATION_STRATEGIES = {"FD", "FedDistill", "FedDKD", "FedProto", "FedMD", "FedSSD", "SSFL-IDS", "FedKD-IDS", "Exp1", "Ours", "Cronus"}
 ALL_STRATEGIES = sorted(WEIGHT_AGGREGATION_STRATEGIES | DISTILLATION_STRATEGIES)
 
@@ -48,6 +48,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--threshold", type=float, default=0.5, help="Voting threshold for FedSSD2 (0-1, votes/clients must exceed this), value should decrease along label skewness")
     # fltrust
     parser.add_argument("--root_iterations", type=int, default=1, help="Server training iterations on root dataset (for FLTrust)")
+    # flame
+    parser.add_argument("--flame_lambda", type=float, default=0.001, help="FLAME DP noise coefficient (sigma = lambda * S_t)")
     # fedmlb
     parser.add_argument("--lambda1", type=float, default=1.0, help="Weight for hybrid CE loss (for FedMLB)")
     parser.add_argument("--lambda2", type=float, default=1.0, help="Weight for KL divergence loss (for FedMLB)")
@@ -86,11 +88,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # poisoning
     parser.add_argument(
         "--poison",
-        nargs=3,
-        metavar=("attack", "value", "ratio"),
+        nargs="+",
+        metavar="TOKEN",
         default=None,
-        help="Poison config: <attack> <value> <ratio>, e.g., gradient_scale 10 0.5",
+        help="Poison config tokens: <attack> [value] <ratio>, e.g., gradient_scale 10 0.5 or label_flip 0.2 or cpa 0.2",
     )
+    # label_flip, ratio = fraction of clients to poison, e.g. "label_flip 0.2"
+    # gradient_scale, value = multiplicative factor for weight updates (e.g. 10x), ratio = fraction of clients to poison, e.g. "gradient_scale 10 0.2"
+    # targeted_flip, value = target label index (0 to num_classes-1), ratio = fraction of clients to poison, e.g. "targeted_flip 0 0.2"
+    # poisonedfl, value (default 8) = c0 value, ratio = fraction of clients to poison, e.g. "poisonedfl 8 0.2"
+    # cpa, ratio = fraction of clients to poison, e.g. "cpa 0.2"
 
     # decentralized
     parser.add_argument("--decentralized", type=str, default=None, help="Decentralized topology simulation (e.g. braintorrent)")
@@ -214,6 +221,7 @@ def main(argv=None):
             skip_eval=args.skip_eval,
             fresh_run=args.fresh_run,
             cache_test_set=args.cache_test_set,
+            flame_lambda=args.flame_lambda,
         )
         run_pipeline(config)
 

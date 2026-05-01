@@ -281,8 +281,9 @@ class FedKDIDS(DistillationStrategy):
             _poisoned = cid in context.poisoned_clients
 
             _pfl = getattr(context, 'poisoned_fl_state', None)
-            if _poisoned and _pfl is not None:
-                context.logger.info("Round %s | Client %s [PoisonedFL] Stage I skipped", round_number, cid)
+            if _poisoned and (_pfl is not None or attack_type == "cpa"):
+                _tag = "PoisonedFL" if _pfl is not None else "CPA"
+                context.logger.info("Round %s | Client %s [%s] Stage I skipped", round_number, cid, _tag)
                 if _mixed:
                     del model
                 aggressive_memory_cleanup()
