@@ -270,6 +270,7 @@ class SSFLIDS(DistillationStrategy):
 
         print(f"\n{COLORS.HEADER}Round {round_number} Stage I{COLORS.ENDC}")
         pred_files: List[str] = []
+        pred_client_ids: List[int] = []
 
         _ckpt = getattr(config, "checkpoint", 0)
         first_s1 = 0
@@ -280,6 +281,7 @@ class SSFLIDS(DistillationStrategy):
             if mid is not None:
                 stage = mid.get("stage", 1)
                 pred_files = mid.get("pred_files", [])
+                pred_client_ids = mid.get("pred_client_ids", [])
                 for st in context.client_states:
                     w = mid.get("client_weights", {}).get(st.client_id)
                     if w is not None:
@@ -387,6 +389,7 @@ class SSFLIDS(DistillationStrategy):
             )
             disc_pool.checkin(cid, disc)
             pred_files.append(pred_path)
+            pred_client_ids.append(cid)
 
             _preds = np.load(pred_path, mmap_mode="r")
             _known_mask = _preds < context.num_classes
@@ -412,6 +415,7 @@ class SSFLIDS(DistillationStrategy):
                     "stage": 1,
                     "last_client_idx": client_idx,
                     "pred_files": pred_files,
+                    "pred_client_ids": pred_client_ids,
                     "client_weights": {
                         st.client_id: st.data["w"]
                         for st in context.client_states
@@ -432,8 +436,9 @@ class SSFLIDS(DistillationStrategy):
                 for cid in context.poisoned_clients:
                     pred_path = _pred_path(cid, round_number)
                     np.save(pred_path, lma_hard)
-                    if pred_path not in pred_files:
+                    if cid not in pred_client_ids:
                         pred_files.append(pred_path)
+                        pred_client_ids.append(cid)
                     context.logger.info("Round %s | Client %s [LMA] | top3 pred-argmax: %s", round_number, cid, lma_top)
                 del lma_hard, lma_counts
 
@@ -452,9 +457,13 @@ class SSFLIDS(DistillationStrategy):
             for cid in context.poisoned_clients:
                 pred_path = _pred_path(cid, round_number)
                 np.save(pred_path, ghost_hard)
-                pred_files.append(pred_path)
+                if cid not in pred_client_ids:
+                    pred_files.append(pred_path)
+                    pred_client_ids.append(cid)
                 context.logger.info("Round %s | Client %s [POISONED] | top3 pred-argmax: %s", round_number, cid, ghost_top)
             del ghost_hard, ghost_counts
+
+        context.logger.info("Round %s | StageI | prediction files=%d clients=%d", round_number, len(pred_files), len(pred_client_ids))
 
         del open_feature
         aggressive_memory_cleanup()
