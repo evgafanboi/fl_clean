@@ -12,7 +12,7 @@ if _use_tf():
 from ..colors import COLORS
 from ..context import PipelineContext
 from ..memory import aggressive_memory_cleanup
-from ..poison_utils import parse_poison_config, poisonedfl_unified_weights
+from ..poison_utils import PoisonedFLState, parse_poison_config, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
@@ -248,9 +248,12 @@ class FedProto(DistillationStrategy):
         config = context.config
         round_start = time.time()
         pool = context.model_pool
-        attack_type, _, _ = parse_poison_config(getattr(config, "poison", None))
+        attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
 
         global_prototypes: Dict[int, np.ndarray] = context.shared_state.get("global_prototypes", {})
+        fedproto_pfl_states = None
+        if attack_type == "poisonedfl":
+            fedproto_pfl_states = context.shared_state.setdefault("fedproto_poisonedfl_states", {})
 
         print(f"\n{COLORS.OKCYAN}[STEP 1/2] Local training + prototype extraction{COLORS.ENDC}")
 
@@ -299,6 +302,22 @@ class FedProto(DistillationStrategy):
             del dataset
             gc.collect()
 
+            if attack_type == "poisonedfl" and state.client_id in context.poisoned_clients:
+                client_pfl = fedproto_pfl_states.get(state.client_id)
+                if client_pfl is None:
+                    client_pfl = PoisonedFLState(c0=poison_value)
+                    fedproto_pfl_states[state.client_id] = client_pfl
+                poisoned_w = poisonedfl_unified_weights([model.get_weights()], client_pfl)
+                model.set_weights(poisoned_w)
+                prototypes, supports = extract_class_prototypes(
+                    model, state.paths["train_X"], state.paths["train_y"], context.num_classes,
+                )
+                mal_norm = float(np.linalg.norm(client_pfl.cached_update)) if client_pfl.cached_update is not None else 0.0
+                context.logger.info(
+                    "Round %s | Client %s [POISONEDFL] c=%.4f mal_norm=%.4e | independent poisoned prototypes extracted",
+                    round_number, state.client_id, client_pfl.scaling_factor, mal_norm,
+                )
+
             proto_dict: Dict[int, Dict[str, np.ndarray | int]] = {}
             for class_id, proto in prototypes.items():
                 proto_dict[class_id] = {"prototype": proto, "support": supports[class_id]}
@@ -320,28 +339,6 @@ class FedProto(DistillationStrategy):
                     "all_client_metrics": all_client_metrics,
                     "round_metrics": round_metrics,
                 })
-
-        # ---- PoisonedFL: unified weights post-loop, re-extract prototypes ----
-        _pfl = getattr(context, 'poisoned_fl_state', None)
-        if _pfl is not None and context.poisoned_clients:
-            pool = context.model_pool
-            byz_w = []
-            for st in context.client_states:
-                if st.client_id in context.poisoned_clients:
-                    m = pool.checkout(st.client_id)
-                    byz_w.append(m.get_weights())
-                    pool.release(m)
-            if byz_w:
-                poisoned_w = poisonedfl_unified_weights(byz_w, _pfl)
-                for st in context.client_states:
-                    if st.client_id not in context.poisoned_clients:
-                        continue
-                    m = pool.checkout(st.client_id)
-                    m.set_weights(poisoned_w)
-                    prototypes, supports = extract_class_prototypes(m, st.paths["train_X"], st.paths["train_y"], context.num_classes)
-                    all_client_prototypes[st.client_id] = {cls: {"prototype": p, "support": supports[cls]} for cls, p in prototypes.items()}
-                    pool.checkin(st.client_id, m)
-                context.logger.info("Round %s | PoisonedFL | FedProto byzantine clients unified prototypes applied", round_number)
 
         print(f"\n{COLORS.OKCYAN}[STEP 2/2] Aggregating prototypes & summary{COLORS.ENDC}")
 

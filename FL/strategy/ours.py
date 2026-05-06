@@ -17,16 +17,23 @@ from ..context import PipelineContext
 from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
-from .robust_filter import AdaptiveRobustFilter
+from .robust_filter import AdaptiveRobustFilter, IterativeRobustFilter
 from .common import (
     create_model,
     create_private_dataset,
     load_public_dataset_from_clients,
     numpy_from_dataset,
+    poisonedfl_ghost_model_type,
     cpa_logits as _cpa_logits,
 )
 
 LOGITS_CACHE_DIR = os.path.join("temp_weights", "ours_cache")
+LOGIT_ABS_CAP = 1e6
+EKD_LOGIT_CLIP = 30.0
+
+
+def _sanitize_logits(logits: np.ndarray, cap: float = LOGIT_ABS_CAP) -> np.ndarray:
+    return np.nan_to_num(logits, nan=0.0, posinf=cap, neginf=-cap).astype(np.float32, copy=False)
 
 
 # ── Logit generation (chunked to disk) ──────────────────────────────────────
@@ -39,10 +46,10 @@ def generate_logits_to_file(model_wrapper, public_features: np.ndarray, batch_si
     with open(output_path, "wb") as fp:
         for start in range(0, len(public_features), chunk_size):
             chunk = public_features[start : start + chunk_size]
-            logits = logits_model.predict(chunk, batch_size=batch_size, verbose=0)
+            logits = _sanitize_logits(logits_model.predict(chunk, batch_size=batch_size, verbose=0))
             if num_classes is None:
                 num_classes = logits.shape[1]
-            fp.write(logits.astype(np.float32).tobytes())
+            fp.write(logits.tobytes())
             total_rows += logits.shape[0]
             del logits, chunk
     return output_path, (total_rows, num_classes)
@@ -88,7 +95,7 @@ def compute_robust_consensus_from_files(
     for offset in range(0, n_samples, chunk_rows):
         rows = min(chunk_rows, n_samples - offset)
         client_chunks = [
-            np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes)
+            _sanitize_logits(np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes))
             for h in handles
         ]
         S_batch = np.stack(client_chunks, axis=1)  # (rows, n_clients, n_classes)
@@ -146,7 +153,8 @@ def ekd_stage(
         @tf.function
         def train_step(batch_X, teacher_logits):
             with tf.GradientTape() as tape:
-                student_logits = logits_model(batch_X, training=True)
+                student_logits = tf.clip_by_value(logits_model(batch_X, training=True), -EKD_LOGIT_CLIP, EKD_LOGIT_CLIP)
+                teacher_logits = tf.clip_by_value(teacher_logits, -EKD_LOGIT_CLIP, EKD_LOGIT_CLIP)
 
                 alpha_T = tf.exp(teacher_logits) + 1.0
                 alpha_S = tf.exp(student_logits) + 1.0
@@ -215,8 +223,8 @@ def _ekd_stage_pt(
         for start in range(0, n_samples, batch_size):
             idx = perm[start : start + batch_size]
             bX = feat_t[idx]
-            bT = logits_t[idx]
-            s_logits = net(bX, return_logits=True)
+            bT = torch.clamp(logits_t[idx], -EKD_LOGIT_CLIP, EKD_LOGIT_CLIP)
+            s_logits = torch.clamp(net(bX, return_logits=True), -EKD_LOGIT_CLIP, EKD_LOGIT_CLIP)
             alpha_T = torch.exp(bT) + 1.0
             alpha_S = torch.exp(s_logits) + 1.0
             a0_T = alpha_T.sum(-1, keepdim=True)
@@ -400,13 +408,18 @@ class Ours(DistillationStrategy):
         super().__init__(config)
         self.kd_epochs = getattr(config, "kd_epochs", 1)
         self.ce_epochs = config.epochs
-        self.robust_filter = AdaptiveRobustFilter(
+        filter_cls = IterativeRobustFilter if getattr(config, "robust_filter_v2", False) else AdaptiveRobustFilter
+        self.robust_filter = filter_cls(
             budget=getattr(config, "robust_rm_budget", None) or 0,
+            tail_threshold=getattr(config, "robust_threshold", 0.75),
+            workers=getattr(config, "robust_workers", 8),
         )
 
     def extra_log_tokens(self) -> Dict[str, float]:
         budget = getattr(self.config, "robust_rm_budget", 0)
         tokens = {"kd": self.config.ours_kd, "ekd_lambda": self.config.ours_ekd_lambda, "budget": budget}
+        if getattr(self.config, "robust_filter_v2", False):
+            tokens["robust_filter"] = "v2"
         if self.config.ours_kd == "abkd":
             tokens.update({"ab_alpha": self.config.ab_alpha, "ab_beta": self.config.ab_beta, "temperature": self.config.ours_temperature})
         return tokens
@@ -456,11 +469,11 @@ class Ours(DistillationStrategy):
         _ghost_shape = None
         if _pfl_gen is not None and context.poisoned_clients and context.shared_state.get("poisonedfl_ghost_w") is not None:
             print(f"{COLORS.WARNING}  [PoisonedFL] Ghost model generating logits for {len(context.poisoned_clients)} byzantine clients{COLORS.ENDC}")
-            _gm = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=config.model_type)
+            _gm = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
             _gm.set_weights(context.shared_state["poisonedfl_ghost_w"])
             _lm = _gm.get_logits_model() if hasattr(_gm, "get_logits_model") else _gm
-            _garr = _lm.predict(public_features, batch_size=config.batch_size, verbose=0)
-            _ghost_bytes = _garr.astype(np.float32).tobytes()
+            _garr = _sanitize_logits(_lm.predict(public_features, batch_size=config.batch_size, verbose=0))
+            _ghost_bytes = _garr.tobytes()
             _ghost_shape = _garr.shape
             del _gm, _lm, _garr
             aggressive_memory_cleanup()
@@ -578,7 +591,7 @@ class Ours(DistillationStrategy):
                 continue
             model = pool.checkout(state.client_id)
             logits_model = model.get_logits_model() if hasattr(model, "get_logits_model") else model
-            logits = logits_model.predict(public_features, batch_size=config.batch_size, verbose=0)
+            logits = _sanitize_logits(logits_model.predict(public_features, batch_size=config.batch_size, verbose=0))
             if accumulator is None:
                 accumulator = logits.astype(np.float64)
             else:
@@ -591,10 +604,10 @@ class Ours(DistillationStrategy):
                 aggressive_memory_cleanup()
 
         if _pfl_m is not None and context.poisoned_clients and context.shared_state.get("poisonedfl_ghost_w") is not None:
-            _gm = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=config.model_type)
+            _gm = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
             _gm.set_weights(context.shared_state["poisonedfl_ghost_w"])
             _lm = _gm.get_logits_model() if hasattr(_gm, "get_logits_model") else _gm
-            _gl = _lm.predict(public_features, batch_size=config.batch_size, verbose=0).astype(np.float64)
+            _gl = _sanitize_logits(_lm.predict(public_features, batch_size=config.batch_size, verbose=0)).astype(np.float64)
             n_byz = len(context.poisoned_clients)
             if accumulator is None:
                 accumulator = _gl * n_byz
@@ -758,7 +771,7 @@ class Ours(DistillationStrategy):
             self._run_kd_stage(context, consensus_logits, public_features, first_client=first_kd)
             if _pfl is not None and context.poisoned_clients:
                 _kd_m = getattr(config, "ours_kd", "ekd")
-                ghost = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=config.model_type)
+                ghost = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
                 if context.shared_state.get("poisonedfl_ghost_w") is not None:
                     ghost.set_weights(context.shared_state["poisonedfl_ghost_w"])
                 if _kd_m == "abkd":
@@ -773,12 +786,13 @@ class Ours(DistillationStrategy):
                 context.shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
                 _mal_norm = float(np.linalg.norm(_pfl.cached_update)) if _pfl.cached_update is not None else 0.0
                 context.logger.info("Round %s | PoisonedFL | c=%.4f mal_norm=%.4e | Ghost KD'd, injected into %d byzantine clients", round_number, _pfl.scaling_factor, _mal_norm, len(context.poisoned_clients))
-                _pool_g = context.model_pool
-                for st in context.client_states:
-                    if st.client_id in context.poisoned_clients:
-                        m = _pool_g.checkout(st.client_id)
-                        m.set_weights(poisoned_w)
-                        _pool_g.checkin(st.client_id, m)
+                if not getattr(config, "mixed_models", False):
+                    _pool_g = context.model_pool
+                    for st in context.client_states:
+                        if st.client_id in context.poisoned_clients:
+                            m = _pool_g.checkout(st.client_id)
+                            m.set_weights(poisoned_w)
+                            _pool_g.checkin(st.client_id, m)
                 del ghost_w, poisoned_w
                 aggressive_memory_cleanup()
             del consensus_logits
@@ -843,7 +857,7 @@ class Ours(DistillationStrategy):
                 self._run_kd_stage(context, consensus_logits, public_features, first_client=first_kd)
                 if _pfl is not None and context.poisoned_clients:
                     _kd_m = getattr(config, "ours_kd", "ekd")
-                    ghost = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=config.model_type)
+                    ghost = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
                     if context.shared_state.get("poisonedfl_ghost_w") is not None:
                         ghost.set_weights(context.shared_state["poisonedfl_ghost_w"])
                     if _kd_m == "abkd":
@@ -858,12 +872,13 @@ class Ours(DistillationStrategy):
                     context.shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
                     _mal_norm = float(np.linalg.norm(_pfl.cached_update)) if _pfl.cached_update is not None else 0.0
                     context.logger.info("Round %s | PoisonedFL | c=%.4f mal_norm=%.4e | Ghost KD'd, injected into %d byzantine clients", round_number, _pfl.scaling_factor, _mal_norm, len(context.poisoned_clients))
-                    _pool_g = context.model_pool
-                    for st in context.client_states:
-                        if st.client_id in context.poisoned_clients:
-                            m = _pool_g.checkout(st.client_id)
-                            m.set_weights(poisoned_w)
-                            _pool_g.checkin(st.client_id, m)
+                    if not getattr(config, "mixed_models", False):
+                        _pool_g = context.model_pool
+                        for st in context.client_states:
+                            if st.client_id in context.poisoned_clients:
+                                m = _pool_g.checkout(st.client_id)
+                                m.set_weights(poisoned_w)
+                                _pool_g.checkin(st.client_id, m)
                     del ghost_w, poisoned_w
                     aggressive_memory_cleanup()
 

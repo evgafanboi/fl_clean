@@ -1,5 +1,57 @@
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from typing import List, Tuple, Optional
+
+
+FINITE_CAP = 1e6
+
+
+def _finite_block(values: np.ndarray) -> np.ndarray:
+    return np.nan_to_num(values.astype(np.float64, copy=False), nan=0.0, posinf=FINITE_CAP, neginf=-FINITE_CAP)
+
+
+def _adaptive_tail_block(S_block: np.ndarray, ref_hn: np.ndarray) -> Tuple[np.ndarray, float]:
+    S_block = _finite_block(S_block)
+    rows, K_act, _ = S_block.shape
+    mu_S = S_block.mean(axis=1)
+    centered = S_block - mu_S[:, np.newaxis, :]
+    Sigma = np.einsum('nkd,nke->nde', centered, centered) / (K_act - 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
+    max_eig = float(eigenvalues[:, -1].max())
+    v_star = eigenvectors[:, :, -1]
+    projections = np.einsum('nkd,nd->nk', centered, v_star)
+    med_p = np.median(projections, axis=1, keepdims=True)
+    sigma_r = np.maximum(
+        np.median(np.abs(projections - med_p), axis=1, keepdims=True) * 1.4826,
+        1e-10,
+    )
+    abs_z = np.abs(projections - med_p) / sigma_r
+    sort_idx = np.argsort(abs_z, axis=1)
+    sorted_z = np.take_along_axis(abs_z, sort_idx, axis=1)
+    in_tail = sorted_z > ref_hn[np.newaxis, :]
+    cum_and = np.flip(
+        np.cumprod(np.flip(in_tail.astype(np.int8), axis=1), axis=1).astype(bool),
+        axis=1,
+    )
+    is_byzantine = np.zeros((rows, K_act), dtype=np.int64)
+    np.put_along_axis(is_byzantine, sort_idx, cum_and.astype(np.int64), axis=1)
+    return is_byzantine.sum(axis=0), max_eig
+
+
+def _cronus_block(S_block: np.ndarray, threshold: float) -> Tuple[np.ndarray, Optional[float]]:
+    S_block = _finite_block(S_block)
+    rows, K_act, _ = S_block.shape
+    mu_S = S_block.mean(axis=1)
+    centered = S_block - mu_S[:, np.newaxis, :]
+    Sigma = np.einsum('nkd,nke->nde', centered, centered) / (K_act - 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
+    max_eigs = eigenvalues[:, -1]
+    above = max_eigs > threshold
+    block_max = float(max_eigs[above].max()) if above.any() else None
+    v_star = eigenvectors[:, :, -1]
+    abs_proj = np.abs(np.einsum('nkd,nd->nk', centered, v_star))
+    abs_proj[~above] = 0.0
+    return abs_proj.sum(axis=0), block_max
 
 
 class RobustFilter:
@@ -148,6 +200,7 @@ class RobustFilter:
         with the highest total projection magnitude across triggered samples).
         Returns (means, max_eigenvalue, removal_counts, max_ratio).
         """
+        S_batch = _finite_block(S_batch)
         N, K, D = S_batch.shape
 
         if self.epsilon >= 0.5:
@@ -222,10 +275,13 @@ class CronusRobustFilter:
 
     THRESHOLD = 9.0
 
-    def __init__(self, budget: int = 0):
+    def __init__(self, budget: int = 0, workers: int = 8, row_block_size: int = 8192):
         self.budget = int(budget)
+        self.workers = max(1, int(workers))
+        self.row_block_size = max(1, int(row_block_size))
 
     def compute_robust_mean_batch(self, S_batch: np.ndarray) -> tuple:
+        S_batch = _finite_block(S_batch)
         N, K, D = S_batch.shape
         active = np.ones(K, dtype=bool)
         removal_counts = np.zeros(K, dtype=np.int64)
@@ -236,25 +292,30 @@ class CronusRobustFilter:
             if K_act <= 1:
                 break
             S_act = S_batch[:, active, :]
-            mu_S = S_act.mean(axis=1)
-            centered = S_act - mu_S[:, np.newaxis, :]
-            Sigma = np.einsum('nkd,nke->nde', centered, centered) / (K_act - 1)
-            eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
-            max_eigs = eigenvalues[:, -1]
+            if self.workers > 1 and N > self.row_block_size:
+                blocks = [(start, min(start + self.row_block_size, N)) for start in range(0, N, self.row_block_size)]
+                proj_sums = np.zeros(K_act, dtype=np.float64)
+                cur = None
+                with ThreadPoolExecutor(max_workers=min(self.workers, len(blocks))) as pool:
+                    futures = [
+                        pool.submit(_cronus_block, S_act[start:end], self.THRESHOLD)
+                        for start, end in blocks
+                    ]
+                    for future in futures:
+                        block_proj, block_max = future.result()
+                        proj_sums += block_proj
+                        if block_max is not None and (cur is None or block_max > cur):
+                            cur = block_max
+            else:
+                proj_sums, cur = _cronus_block(S_act, self.THRESHOLD)
 
-            above = max_eigs > self.THRESHOLD
-            if above.any():
-                cur = float(max_eigs[above].max())
-                if g_max_eig is None or cur > g_max_eig:
-                    g_max_eig = cur
+            if cur is not None and (g_max_eig is None or cur > g_max_eig):
+                g_max_eig = cur
 
-            if not above.any():
+            if cur is None:
                 break
 
-            v_star = eigenvectors[:, :, -1]
-            abs_proj = np.abs(np.einsum('nkd,nd->nk', centered, v_star))
-            abs_proj[~above] = 0.0
-            worst_active = int(np.argmax(abs_proj.sum(axis=0)))
+            worst_active = int(np.argmax(proj_sums))
             worst_global = int(np.where(active)[0][worst_active])
             active[worst_global] = False
             removal_counts[worst_global] = 1
@@ -275,16 +336,56 @@ class AdaptiveRobustFilter:
     tail_threshold : float
         Minimum fraction of samples (default 0.75) for which a client must
         appear in the contiguous outer tail to be flagged as Byzantine.
+    workers : int
+        Number of row-block worker threads.
     """
 
-    def __init__(self, budget: int = 0, tail_threshold: float = 0.75):
+    def __init__(self, budget: int = 0, tail_threshold: float = 0.75, workers: int = 8, row_block_size: int = 8192):
         self.budget = int(budget)
         self.tail_threshold = tail_threshold
+        self.workers = max(1, int(workers))
+        self.row_block_size = max(1, int(row_block_size))
 
-    def compute_robust_mean_batch(self, S_batch: np.ndarray) -> tuple:
+    def _iter_row_blocks(self, n_rows: int):
+        for start in range(0, n_rows, self.row_block_size):
+            yield start, min(start + self.row_block_size, n_rows)
+
+    def _score_active_set(self, S_act: np.ndarray) -> Tuple[np.ndarray, Optional[float]]:
         from scipy.special import ndtri
 
-        N, K, D = S_batch.shape
+        n_rows, K_act, _ = S_act.shape
+        k_vals = np.arange(1, K_act + 1, dtype=np.float64)
+        ref_hn = ndtri(0.5 + 0.5 * (k_vals - 0.375) / (K_act + 0.25))
+
+        if self.workers == 1 or n_rows <= self.row_block_size:
+            counts, max_eig = _adaptive_tail_block(S_act, ref_hn)
+            return counts.astype(np.float64) / n_rows, max_eig
+
+        counts = np.zeros(K_act, dtype=np.int64)
+        max_eig = None
+        blocks = list(self._iter_row_blocks(n_rows))
+        with ThreadPoolExecutor(max_workers=min(self.workers, len(blocks))) as pool:
+            futures = [
+                pool.submit(_adaptive_tail_block, S_act[start:end], ref_hn)
+                for start, end in blocks
+            ]
+            for future in futures:
+                block_counts, block_max_eig = future.result()
+                counts += block_counts
+                if max_eig is None or block_max_eig > max_eig:
+                    max_eig = block_max_eig
+        return counts.astype(np.float64) / n_rows, max_eig
+
+    def _select_flagged(self, scores: np.ndarray, budget_left: int) -> np.ndarray:
+        flagged = np.where(scores >= self.tail_threshold)[0]
+        if len(flagged) <= budget_left:
+            return flagged
+        order = np.argsort(scores[flagged])[::-1][:budget_left]
+        return flagged[order]
+
+    def compute_robust_mean_batch(self, S_batch: np.ndarray) -> tuple:
+        S_batch = _finite_block(S_batch)
+        _, K, _ = S_batch.shape
         active = np.ones(K, dtype=bool)
         removal_counts = np.zeros(K, dtype=np.int64)
         g_max_eig = None
@@ -296,58 +397,13 @@ class AdaptiveRobustFilter:
                 break
 
             S_act = S_batch[:, active, :]
-            mu_S = S_act.mean(axis=1)                         # (N, D)
-            centered = S_act - mu_S[:, np.newaxis, :]         # (N, K_act, D)
-            Sigma = np.einsum('nkd,nke->nde', centered, centered) / (K_act - 1)
-            eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
-            v_star = eigenvectors[:, :, -1]                   # (N, D)
-
-            cur_max = float(eigenvalues[:, -1].max())
+            scores, cur_max = self._score_active_set(S_act)
             if g_max_eig is None or cur_max > g_max_eig:
                 g_max_eig = cur_max
 
-            projections = np.einsum('nkd,nd->nk', centered, v_star)  # (N, K_act)
-
-            # MAD-based robust scale: resistant to < 50% corruption
-            med_p = np.median(projections, axis=1, keepdims=True)
-            sigma_r = np.maximum(
-                np.median(np.abs(projections - med_p), axis=1, keepdims=True) * 1.4826,
-                1e-10,
-            )                                                  # (N, 1)
-            abs_z = np.abs(projections - med_p) / sigma_r     # (N, K_act)
-
-            # Sort ascending per sample
-            sort_idx = np.argsort(abs_z, axis=1)              # (N, K_act)
-            sorted_z = abs_z[np.arange(N)[:, None], sort_idx]
-
-            # Blom expected order statistics of |N(0,1)|
-            k_vals = np.arange(1, K_act + 1, dtype=np.float64)
-            ref_hn = ndtri(0.5 + 0.5 * (k_vals - 0.375) / (K_act + 0.25))  # (K_act,)
-
-            # Contiguous outer tail (cum-AND from outermost inward):
-            # rank r is in the tail block iff sorted_z[r] > ref_hn[r] AND
-            # every rank beyond r also exceeds its reference.
-            in_tail = sorted_z > ref_hn[np.newaxis, :]        # (N, K_act)
-            cum_and = np.flip(
-                np.cumprod(np.flip(in_tail.astype(np.int8), axis=1), axis=1).astype(bool),
-                axis=1,
-            )
-
-            # Map rank-space tail membership back to client indices
-            is_byzantine = np.zeros((N, K_act), dtype=bool)
-            np.put_along_axis(is_byzantine, sort_idx, cum_and, axis=1)
-
-            # Byzantine score per active client: fraction of N samples flagging it
-            scores = is_byzantine.mean(axis=0)                 # (K_act,) ∈ [0, 1]
-
-            flagged = np.where(scores >= self.tail_threshold)[0]
+            flagged = self._select_flagged(scores, self.budget - removed_total)
             if len(flagged) == 0:
                 break
-
-            # Remove all flagged clients, capped by remaining budget
-            budget_left = self.budget - removed_total
-            if len(flagged) > budget_left:
-                flagged = flagged[np.argsort(scores[flagged])[::-1][:budget_left]]
 
             global_idx = np.where(active)[0][flagged]
             active[global_idx] = False
@@ -356,6 +412,15 @@ class AdaptiveRobustFilter:
 
         means = S_batch[:, active, :].mean(axis=1).astype(np.float32)
         return means, g_max_eig, removal_counts, None
+
+
+class IterativeRobustFilter(AdaptiveRobustFilter):
+    def _select_flagged(self, scores: np.ndarray, budget_left: int) -> np.ndarray:
+        flagged = np.where(scores >= self.tail_threshold)[0]
+        if len(flagged) == 0:
+            return flagged
+        best_local = int(flagged[np.argmax(scores[flagged])])
+        return np.array([best_local], dtype=np.int64)
 
 
 class RobustFilterWeights(RobustFilter):

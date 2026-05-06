@@ -4,7 +4,7 @@ import os
 from typing import Dict, Iterable, Iterator, Optional, Tuple
 
 import numpy as np
-from ..backend import use_tf as _use_tf
+from ..backend import get_torch_loader_kwargs as _torch_loader_kwargs, use_tf as _use_tf
 if _use_tf():
     import tensorflow as tf
     from models import dense
@@ -50,6 +50,13 @@ def create_model(input_dim: int, num_classes: int, batch_size: int, model_type: 
             raise ValueError("DCBLSTM model requested but models.dcblstm is unavailable")
         return dcblstm.create_dcblstm_model(input_dim, num_classes, batch_size)
     raise ValueError(f"Unknown model type: {model_type}")
+
+
+POISONEDFL_MIXED_GHOST_MODEL_TYPE = "gru"
+
+
+def poisonedfl_ghost_model_type(config) -> str:
+    return POISONEDFL_MIXED_GHOST_MODEL_TYPE if getattr(config, "mixed_models", False) else config.model_type
 
 
 def _create_pt_model(input_dim: int, num_classes: int, batch_size: int, model_type: str = "dense"):
@@ -117,7 +124,7 @@ def _create_private_dataloader(X_path, y_path, num_classes, batch_size, poison_l
     idx = np.random.permutation(len(X))
     ds = TensorDataset(torch.from_numpy(X[idx].copy()), torch.from_numpy(y_oh[idx]))
     return DataLoader(ds, batch_size=batch_size, shuffle=False,
-                      pin_memory=False, num_workers=0)
+                      **_torch_loader_kwargs())
 
 
 def load_public_dataset_from_clients(
@@ -272,5 +279,5 @@ def _load_public_dataloader_from_clients(
     else:
         ds = TensorDataset(torch.from_numpy(X_all))
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                        pin_memory=False, num_workers=0)
+                        **_torch_loader_kwargs())
     return loader, total_samples

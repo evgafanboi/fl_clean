@@ -23,6 +23,8 @@ class PoisonedFLState:
         self.cached_update = None
 
     def compute_update(self, current_flat: np.ndarray):
+        fmax = float(np.finfo(np.float32).max)
+        current_flat = np.nan_to_num(current_flat.astype(np.float64, copy=False), nan=0.0, posinf=fmax, neginf=-fmax)
         d = current_flat.size
         if self.fixed_rand is None:
             rng = np.random.default_rng(42)
@@ -30,14 +32,16 @@ class PoisonedFLState:
         if self.prev_global is None:
             self.prev_global = current_flat.copy()
             return None
-        last_grad = current_flat - self.prev_global
+        prev_global = np.nan_to_num(np.asarray(self.prev_global, dtype=np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
+        last_grad = current_flat - prev_global
         history_vec = self.last_poisoned if self.last_poisoned is not None else last_grad
+        history_vec = np.nan_to_num(np.asarray(history_vec, dtype=np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
         history = history_vec.reshape(d, 1)
         history_norm = float(np.linalg.norm(history))
         last_grad_norm = float(np.linalg.norm(last_grad))
         residual = history - last_grad.reshape(d, 1) * history_norm / (last_grad_norm + 1e-9)
-        scale = np.linalg.norm(residual, axis=1)
-        deviation = scale * self.fixed_rand / (float(np.linalg.norm(scale)) + 1e-9)
+        scale = np.nan_to_num(np.linalg.norm(residual, axis=1), nan=0.0, posinf=fmax, neginf=0.0)
+        deviation = np.nan_to_num(scale * self.fixed_rand / (float(np.linalg.norm(scale)) + 1e-9), nan=0.0, posinf=1.0, neginf=-1.0)
         total_update = np.where(last_grad == 0.0, current_flat, last_grad)
         aligned = int(np.sum(np.sign(total_update) == self.fixed_rand))
         k_99 = int(d / 2 + 2.326 * np.sqrt(d) / 2)
@@ -45,8 +49,8 @@ class PoisonedFLState:
         if aligned < k_99 and sf * 0.7 >= 0.5:
             sf *= 0.7
         self.scaling_factor = sf
-        _fmax = np.finfo(np.float32).max
-        mal_update = np.clip((sf * history_norm * deviation).astype(np.float32), -_fmax, _fmax)
+        mal_update = np.nan_to_num(sf * history_norm * deviation, nan=0.0, posinf=fmax, neginf=-fmax)
+        mal_update = np.clip(mal_update, -fmax, fmax).astype(np.float32)
         self.last_poisoned = mal_update.copy()
         self.prev_global = current_flat.copy()
         print(f"  [PoisonedFL] c={sf:.4f}, aligned={aligned}/{d} (k99={k_99}), mal_norm={float(np.linalg.norm(mal_update)):.4e}")
@@ -55,13 +59,14 @@ class PoisonedFLState:
 
 def poisonedfl_unified_weights(byz_weights_list, state: PoisonedFLState):
     consensus = [np.mean([w[i] for w in byz_weights_list], axis=0) for i in range(len(byz_weights_list[0]))]
-    current_flat = np.concatenate([w.ravel() for w in consensus]).astype(np.float32)
+    fmax = float(np.finfo(np.float32).max)
+    current_flat = np.nan_to_num(np.concatenate([w.ravel() for w in consensus]).astype(np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
     mal_update = state.compute_update(current_flat)
     state.cached_update = mal_update
     if mal_update is None:
         return consensus
-    _fmax = np.finfo(np.float32).max
-    poisoned_flat = np.clip(current_flat + mal_update, -_fmax, _fmax)
+    poisoned_flat = np.nan_to_num(current_flat + mal_update.astype(np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
+    poisoned_flat = np.clip(poisoned_flat, -fmax, fmax)
     offset, poisoned = 0, []
     for w in consensus:
         n = w.size

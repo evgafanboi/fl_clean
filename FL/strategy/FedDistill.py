@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 from typing import Dict, List
 
 import numpy as np
-from ..backend import use_tf as _use_tf
+from ..backend import get_torch_loader_kwargs as _torch_loader_kwargs, use_tf as _use_tf
 if _use_tf():
     import tensorflow as tf
 
@@ -29,16 +30,39 @@ def _round_public_path(round_number):
     return os.path.join(FEDEXPGUARD_CACHE_DIR, f"r{round_number}_public_X.npy")
 
 
-def _soft_path(cid, round_number):
-    return os.path.join(FEDEXPGUARD_CACHE_DIR, f"r{round_number}_c{cid}_soft.bin")
+def _soft_pack_path(round_number):
+    return os.path.join(FEDEXPGUARD_CACHE_DIR, f"r{round_number}_soft_pack.bin")
 
 
-def _predict_soft_labels(model, X, batch_size, output_path):
+def _soft_stride(n_public, n_classes):
+    return n_public * n_classes * 4
+
+
+def _init_soft_pack(path, n_clients, n_public, n_classes):
+    total_bytes = n_clients * _soft_stride(n_public, n_classes)
+    mode = "r+b" if os.path.exists(path) else "w+b"
+    with open(path, mode) as fp:
+        fp.truncate(total_bytes)
+
+
+def _read_soft_rows(fp, client_id, row_offset, rows, n_public, n_classes):
+    row_bytes = n_classes * 4
+    fp.seek(client_id * _soft_stride(n_public, n_classes) + row_offset * row_bytes)
+    raw = fp.read(rows * row_bytes)
+    return np.frombuffer(raw, dtype=np.float32).reshape(rows, n_classes)
+
+
+def _predict_soft_labels(model, X, batch_size, output_path, client_id=None, n_public=None):
     src = model.get_logits_model() if hasattr(model, "get_logits_model") else model
     logits = src.predict(X, batch_size=batch_size, verbose=0)
     e = np.exp(logits - logits.max(axis=1, keepdims=True))
     soft = (e / e.sum(axis=1, keepdims=True)).astype(np.float32)
-    with open(output_path, "wb") as _f:
+    if client_id is None:
+        with open(output_path, "wb") as _f:
+            _f.write(soft.tobytes())
+        return
+    with open(output_path, "r+b") as _f:
+        _f.seek(client_id * _soft_stride(n_public, soft.shape[1]))
         _f.write(soft.tobytes())
 
 
@@ -76,19 +100,39 @@ def _filtered_mean(preds, scores, threshold):
 
 
 _EXPGUARD_CHUNK = 10_000
+_EXPGUARD_ROW_BLOCK = 2_048
+
+
+def _expguard_pass1_block(chunks, quantile, k_keep):
+    scores1 = _filter_outlier_scores(chunks)
+    abs_s1 = np.abs(scores1.squeeze(2))
+    rank = np.argsort(abs_s1, axis=1)
+    keep_idx = rank[:, :k_keep]
+    nkc = chunks.transpose(1, 0, 2)
+    reduced = nkc[np.arange(chunks.shape[1])[:, None], keep_idx, :].transpose(1, 0, 2)
+    scores2 = _filter_outlier_scores(reduced)
+    abs_s2 = np.abs(scores2.squeeze(2))
+    threshold = np.quantile(abs_s2, quantile, axis=1)
+    con = _filtered_mean(reduced, scores2, threshold)
+    return np.linalg.norm(chunks - con[None], axis=2).sum(axis=1).astype(np.float64)
+
+
+def _expguard_pass2_block(chunks, w_norm):
+    return np.einsum("krc,k->rc", chunks, w_norm)
 
 
 def _expguard_aggregate(
-    soft_files: List[str],
+    soft_pack_path: str,
     client_ids: List[int],
     exp_w: np.ndarray,
     rho: float,
     N_pub: int,
     n_classes: int,
+    workers: int = 8,
     logger=None,
     round_number=None,
 ):
-    K = len(soft_files)
+    K = len(client_ids)
     max_byz = (K // 2 - 1) if K % 2 == 0 else K // 2
     quantile = 1.0 - max(max_byz, 0) / (2.0 * K)
     k_keep = max(int(quantile * K), 1)
@@ -96,34 +140,27 @@ def _expguard_aggregate(
 
     # ── Pass 1: streaming Cronus filter → Cronus consensus + per-client rho ──
     rho_sum = np.zeros(K, dtype=np.float64)
-    handles = [open(f, "rb") for f in soft_files]
+    fp = open(soft_pack_path, "rb")
     for off in range(0, N_pub, _EXPGUARD_CHUNK):
         rows = min(_EXPGUARD_CHUNK, N_pub - off)
         chunks = np.stack([
-            np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes)
-            for h in handles
+            _read_soft_rows(fp, cid, off, rows, N_pub, n_classes)
+            for cid in client_ids
         ], axis=0)  # [K, rows, C]
 
-        scores1 = _filter_outlier_scores(chunks)         # [rows, K, 1]
-        abs_s1 = np.abs(scores1.squeeze(2))              # [rows, K]
-        rank = np.argsort(abs_s1, axis=1)
-        keep_idx = rank[:, :k_keep]                      # [rows, k_keep]
-        del scores1, abs_s1, rank
-
-        nkc = chunks.transpose(1, 0, 2)                 # [rows, K, C] view
-        reduced = nkc[np.arange(rows)[:, None], keep_idx, :].transpose(1, 0, 2)  # [k_keep, rows, C]
-        del nkc, keep_idx
-
-        scores2 = _filter_outlier_scores(reduced)        # [rows, k_keep, 1]
-        abs_s2 = np.abs(scores2.squeeze(2))              # [rows, k_keep]
-        threshold = np.quantile(abs_s2, quantile, axis=1)
-        con = _filtered_mean(reduced, scores2, threshold)  # [rows, C]
-        del reduced, scores2, abs_s2, threshold
-
-        rho_sum += np.linalg.norm(chunks - con[None], axis=2).sum(axis=1).astype(np.float64)
-        del chunks, con
-    for h in handles:
-        h.close()
+        if workers > 1 and rows > _EXPGUARD_ROW_BLOCK:
+            blocks = [(start, min(start + _EXPGUARD_ROW_BLOCK, rows)) for start in range(0, rows, _EXPGUARD_ROW_BLOCK)]
+            with ThreadPoolExecutor(max_workers=min(workers, len(blocks))) as pool:
+                futures = [
+                    pool.submit(_expguard_pass1_block, chunks[:, start:end, :], quantile, k_keep)
+                    for start, end in blocks
+                ]
+                for future in futures:
+                    rho_sum += future.result()
+        else:
+            rho_sum += _expguard_pass1_block(chunks, quantile, k_keep)
+        del chunks
+    fp.close()
 
     mean_rho = rho_sum / N_pub  # [K]
 
@@ -141,17 +178,27 @@ def _expguard_aggregate(
     w_sub = np.array([new_w[cid] for cid in client_ids], dtype=np.float32)
     w_norm = w_sub / w_sub.sum()  # [K]
     consensus = np.zeros((N_pub, n_classes), dtype=np.float32)
-    handles = [open(f, "rb") for f in soft_files]
+    fp = open(soft_pack_path, "rb")
     for off in range(0, N_pub, _EXPGUARD_CHUNK):
         rows = min(_EXPGUARD_CHUNK, N_pub - off)
         chunks = np.stack([
-            np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes)
-            for h in handles
+            _read_soft_rows(fp, cid, off, rows, N_pub, n_classes)
+            for cid in client_ids
         ], axis=0)  # [K, rows, C]
-        consensus[off:off + rows] = np.einsum("krc,k->rc", chunks, w_norm)
+
+        if workers > 1 and rows > _EXPGUARD_ROW_BLOCK:
+            blocks = [(start, min(start + _EXPGUARD_ROW_BLOCK, rows)) for start in range(0, rows, _EXPGUARD_ROW_BLOCK)]
+            with ThreadPoolExecutor(max_workers=min(workers, len(blocks))) as pool:
+                futures = [
+                    (start, end, pool.submit(_expguard_pass2_block, chunks[:, start:end, :], w_norm))
+                    for start, end in blocks
+                ]
+                for start, end, future in futures:
+                    consensus[off + start:off + end] = future.result()
+        else:
+            consensus[off:off + rows] = _expguard_pass2_block(chunks, w_norm)
         del chunks
-    for h in handles:
-        h.close()
+    fp.close()
 
     return consensus, new_w
 
@@ -164,7 +211,7 @@ def _train_on_soft_labels_pt(model_wrapper, X, soft_y, batch_size, epochs):
     dev = get_torch_device()
     loader = DataLoader(
         TensorDataset(torch.from_numpy(X), torch.from_numpy(soft_y)),
-        batch_size=batch_size, shuffle=True, pin_memory=False, num_workers=0,
+        batch_size=batch_size, shuffle=True, **_torch_loader_kwargs(),
     )
     net = model_wrapper.nn
     opt = model_wrapper.optimizer
@@ -254,43 +301,47 @@ class FedDistillExpGuard(DistillationStrategy):
             np.save(pub_X_path, pub_X)
 
         # ---- checkpoint resume ----
-        soft_files: List[str] = []
+        soft_pack_path = _soft_pack_path(round_number)
         soft_client_ids: List[int] = []
         first_client = 0
+        resume_pack = False
         if _ckpt:
             mid = load_mid_round(context, "fedexpguard", round_number)
             if mid is not None:
-                first_client = mid["last_client_idx"] + 1
-                soft_files = mid.get("soft_files", [])
-                soft_client_ids = mid.get("soft_client_ids", [])
-                print(f"{COLORS.OKGREEN}Resuming round {round_number} from client {first_client}{COLORS.ENDC}")
+                candidate_path = mid.get("soft_pack_path", soft_pack_path)
+                if os.path.exists(candidate_path):
+                    first_client = mid["last_client_idx"] + 1
+                    soft_pack_path = candidate_path
+                    soft_client_ids = mid.get("soft_client_ids", [])
+                    resume_pack = True
+                    print(f"{COLORS.OKGREEN}Resuming round {round_number} from client {first_client}{COLORS.ENDC}")
+        if not resume_pack:
+            _init_soft_pack(soft_pack_path, context.n_clients, n_public, context.num_classes)
 
         print(f"\n{COLORS.HEADER}Round {round_number} Stage I (local training + soft labels){COLORS.ENDC}")
-
-        client_model = create_model(context.input_dim, context.num_classes,
-                                    config.batch_size, model_type=config.model_type)
 
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_client:
                 continue
 
             if client_idx > 0 and client_idx % _REFRESH_EVERY == 0:
-                del client_model
                 from ..memory import clear_session
                 clear_session()
                 aggressive_memory_cleanup()
-                client_model = create_model(context.input_dim, context.num_classes,
-                                            config.batch_size, model_type=config.model_type)
                 pub_X = np.array(np.load(pub_X_path, mmap_mode="r"), dtype=np.float32)
 
             cid = state.client_id
             _poisoned = cid in context.poisoned_clients
             print(f"\n{COLORS.BOLD}Client {cid}{COLORS.ENDC}")
 
+            client_model = create_model(context.input_dim, context.num_classes,
+                                        config.batch_size, model_type=config.model_type)
             client_model.set_weights(global_w)
 
-            if _poisoned and attack_type == "cpa":
-                context.logger.info("Round %s | Client %s [CPA] CE skipped", round_number, cid)
+            if _poisoned and attack_type in ("poisonedfl", "cpa"):
+                _tag = "PoisonedFL" if attack_type == "poisonedfl" else "CPA"
+                context.logger.info("Round %s | Client %s [%s] CE skipped", round_number, cid, _tag)
+                del client_model
                 continue
 
             _poison_loader = context.per_client_loaders.get(cid, context.poison_loader) if _poisoned else None
@@ -311,10 +362,10 @@ class FedDistillExpGuard(DistillationStrategy):
 
             state.data["w"] = new_w
 
-            sp = _soft_path(cid, round_number)
-            _predict_soft_labels(client_model, pub_X, config.batch_size, sp)
-            soft_files.append(sp)
-            soft_client_ids.append(cid)
+            _predict_soft_labels(client_model, pub_X, config.batch_size, soft_pack_path, client_id=cid, n_public=n_public)
+            del client_model
+            if cid not in soft_client_ids:
+                soft_client_ids.append(cid)
 
             if _ckpt and (
                 client_idx == len(context.client_states) - 1
@@ -323,7 +374,7 @@ class FedDistillExpGuard(DistillationStrategy):
                 save_mid_round(context, "fedexpguard", {
                     "round": round_number,
                     "last_client_idx": client_idx,
-                    "soft_files": soft_files,
+                    "soft_pack_path": soft_pack_path,
                     "soft_client_ids": soft_client_ids,
                 })
 
@@ -336,11 +387,10 @@ class FedDistillExpGuard(DistillationStrategy):
                 for st in context.client_states:
                     if st.client_id not in context.poisoned_clients:
                         continue
-                    sp = _soft_path(st.client_id, round_number)
-                    with open(sp, "wb") as _cf:
+                    with open(soft_pack_path, "r+b") as _cf:
+                        _cf.seek(st.client_id * _soft_stride(n_public, context.num_classes))
                         _cf.write(_cpa_bytes)
                     if st.client_id not in soft_client_ids:
-                        soft_files.append(sp)
                         soft_client_ids.append(st.client_id)
                 context.logger.info(
                     "Round %s | CPA | Byzantine soft labels generated for %d clients",
@@ -348,31 +398,27 @@ class FedDistillExpGuard(DistillationStrategy):
                 )
                 del _cpa_adv, _cpa_bytes
 
-        # ---- PoisonedFL: override byzantine weights, re-generate soft preds ----
+        # ---- PoisonedFL: poison the current global model once, then copy logits ----
         _pfl = getattr(context, "poisoned_fl_state", None)
         if _pfl is not None and context.poisoned_clients:
-            byz_w = [st.data["w"] for st in context.client_states
-                     if st.client_id in context.poisoned_clients and st.data["w"] is not None]
-            if not byz_w:
-                byz_w = [global_w]
-            poisoned_w = poisonedfl_unified_weights(byz_w, _pfl)
-            client_model.set_weights(poisoned_w)
+            poisoned_w = poisonedfl_unified_weights([global_w], _pfl)
+            context.shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
+            poison_model = create_model(context.input_dim, context.num_classes,
+                                        config.batch_size, model_type=config.model_type)
+            poison_model.set_weights(poisoned_w)
             for st in context.client_states:
                 if st.client_id not in context.poisoned_clients:
                     continue
-                sp = _soft_path(st.client_id, round_number)
-                _predict_soft_labels(client_model, pub_X, config.batch_size, sp)
+                _predict_soft_labels(poison_model, pub_X, config.batch_size, soft_pack_path, client_id=st.client_id, n_public=n_public)
                 if st.client_id not in soft_client_ids:
-                    soft_files.append(sp)
                     soft_client_ids.append(st.client_id)
-                st.data["w"] = poisoned_w
+            del poison_model
             _mal_norm = float(np.linalg.norm(_pfl.cached_update)) if _pfl.cached_update is not None else 0.0
             context.logger.info(
-                "Round %s | PoisonedFL | c=%.4f mal_norm=%.4e | Byzantine soft labels generated for %d clients",
+                "Round %s | PoisonedFL | c=%.4f mal_norm=%.4e | Ghost global model generated soft labels for %d clients",
                 round_number, _pfl.scaling_factor, _mal_norm, len(context.poisoned_clients),
             )
 
-        del client_model
         from ..memory import clear_session
         clear_session()
         aggressive_memory_cleanup()
@@ -380,7 +426,8 @@ class FedDistillExpGuard(DistillationStrategy):
         # ---- ExpGuard aggregation ----
         print(f"\n{COLORS.HEADER}Round {round_number} ExpGuard (rho={rho}){COLORS.ENDC}")
         consensus, new_exp_w = _expguard_aggregate(
-            soft_files, soft_client_ids, exp_w, rho, n_public, context.num_classes,
+            soft_pack_path, soft_client_ids, exp_w, rho, n_public, context.num_classes,
+            workers=getattr(config, "robust_workers", 8),
             logger=context.logger, round_number=round_number,
         )
         context.shared_state["exp_weights"] = new_exp_w

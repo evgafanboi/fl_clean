@@ -135,7 +135,8 @@ def _fedssdexp_client_factory(aggregator: FedSSDexp, _: Dict[str, Any]) -> FedSS
 
 def _flame_factory(params: Dict[str, Any]) -> FLAME:
     lambda_dp = params.get('flame_lambda', 0.001)
-    return FLAME(lambda_dp=lambda_dp)
+    passive_cluster = params.get('flame_passive_cluster', False)
+    return FLAME(lambda_dp=lambda_dp, passive_cluster=passive_cluster)
 
 
 def _flame_client_factory(_: Any, __: Dict[str, Any]) -> FedAvg:

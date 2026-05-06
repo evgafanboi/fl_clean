@@ -34,12 +34,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dist_rounds", type=int, default=2, help="Distillation rounds (SSFL-IDS & FedKD-IDS)")
     parser.add_argument("--train_rounds", type=int, default=3, help="Training rounds for SSFL-IDS stage 1 and FedKD-IDS stage 1")
     # fedkd-ids
-    parser.add_argument("--hamming_tau", type=float, default=0.5, help="FedKD-IDS: threshold = tau * mean(HM), range [0.5, 1.0]")
+    parser.add_argument("--hamming_tau", type=float, default=1.0, help="FedKD-IDS: threshold = tau * mean(HM), range [0.5, 1.0]")
     # feddistill
     parser.add_argument("--exp_rho", type=float, default=0.05, help="ExpGuard step size (FedDistill)")
     # robust filter
     parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (threshold sensitivity, not budget)")
     parser.add_argument("--robust_rm_budget", type=int, default=None, help="RobustFilter max removals (default: n_clients//2 - 1)")
+    parser.add_argument("--robust_threshold", type=float, default=0.75, help="AdaptiveRobustFilter tail score threshold")
+    parser.add_argument("--robust_workers", type=int, default=16, help="Ours robust filter row-block worker threads")
+    parser.add_argument("--robust_filter_v2", action="store_true", help="Ours: use one-removal-per-pass iterative robust filter")
     # cronus
     parser.add_argument("--remove_dis", action="store_true", help="Cronus: use plain softmax predictions")
     # fedssd
@@ -50,6 +53,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root_iterations", type=int, default=1, help="Server training iterations on root dataset (for FLTrust)")
     # flame
     parser.add_argument("--flame_lambda", type=float, default=0.001, help="FLAME DP noise coefficient (sigma = lambda * S_t)")
+    parser.add_argument("--passive_cluster", action="store_true", help="FLAME: use unconstrained HDBSCAN and admit the largest cluster (ignores min_cluster_size majority requirement)")
     # fedmlb
     parser.add_argument("--lambda1", type=float, default=1.0, help="Weight for hybrid CE loss (for FedMLB)")
     parser.add_argument("--lambda2", type=float, default=1.0, help="Weight for KL divergence loss (for FedMLB)")
@@ -176,6 +180,9 @@ def main(argv=None):
             ours_temperature=args.ours_temperature,
             robust_epsilon=args.robust_epsilon,
             robust_rm_budget=robust_rm_budget,
+            robust_threshold=args.robust_threshold,
+            robust_workers=args.robust_workers,
+            robust_filter_v2=args.robust_filter_v2,
             remove_dis=args.remove_dis,
             checkpoint=args.checkpoint,
             cleanup_interval=args.cleanup_interval,
@@ -222,6 +229,7 @@ def main(argv=None):
             fresh_run=args.fresh_run,
             cache_test_set=args.cache_test_set,
             flame_lambda=args.flame_lambda,
+            flame_passive_cluster=args.passive_cluster,
         )
         run_pipeline(config)
 

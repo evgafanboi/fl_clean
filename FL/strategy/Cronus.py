@@ -6,7 +6,7 @@ import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from ..backend import use_tf as _use_tf
+from ..backend import get_torch_loader_kwargs as _torch_loader_kwargs, use_tf as _use_tf
 if _use_tf():
     import tensorflow as tf
 
@@ -16,7 +16,7 @@ from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
 from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_unified_weights
 from .base import DistillationStrategy
-from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
+from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset, poisonedfl_ghost_model_type
 from .robust_filter import CronusRobustFilter
 from tqdm import tqdm
 
@@ -25,8 +25,26 @@ CACHE_DIR = os.path.join("temp_weights", "cronus_cache")
 
 # ── file-path helpers ──────────────────────────────────────────────────
 
-def _pred_path(cid: int, rnd: int) -> str:
-    return os.path.join(CACHE_DIR, f"r{rnd}_c{cid}.bin")
+def _pred_pack_path(rnd: int) -> str:
+    return os.path.join(CACHE_DIR, f"r{rnd}_pred_pack.bin")
+
+
+def _pred_stride(n_samples: int, num_classes: int) -> int:
+    return n_samples * num_classes * 4
+
+
+def _init_pred_pack(path: str, n_clients: int, n_samples: int, num_classes: int) -> None:
+    total_bytes = n_clients * _pred_stride(n_samples, num_classes)
+    mode = "r+b" if os.path.exists(path) else "w+b"
+    with open(path, mode) as fp:
+        fp.truncate(total_bytes)
+
+
+def _read_pred_rows(fp, client_id: int, row_offset: int, rows: int, n_samples: int, num_classes: int) -> np.ndarray:
+    row_bytes = num_classes * 4
+    fp.seek(client_id * _pred_stride(n_samples, num_classes) + row_offset * row_bytes)
+    raw = fp.read(rows * row_bytes)
+    return np.frombuffer(raw, dtype=np.float32).reshape(rows, num_classes)
 
 
 def _pub_path(rnd: int | None = None) -> str:
@@ -42,34 +60,43 @@ def _pseudo_path(rnd: int) -> str:
 # ── predict / filter ───────────────────────────────────────────────────
 
 def _predict_to_file(model, X: np.ndarray, num_classes: int,
-                     batch_size: int, path: str) -> None:
+                     batch_size: int, path: str, client_id: Optional[int] = None,
+                     n_samples: Optional[int] = None) -> np.ndarray:
     preds = model.predict(X, verbose=0, batch_size=batch_size)
+    preds = preds.astype(np.float32)
+    counts = np.bincount(np.argmax(preds, axis=1), minlength=num_classes)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as fp:
-        fp.write(preds.astype(np.float32).tobytes())
+    if client_id is None:
+        with open(path, "wb") as fp:
+            fp.write(preds.tobytes())
+        return counts
+    with open(path, "r+b") as fp:
+        fp.seek(client_id * _pred_stride(n_samples, num_classes))
+        fp.write(preds.tobytes())
+    return counts
 
 
-def _robust_filter(pred_files: List[str], n_samples: int,
+def _robust_filter(pred_pack_path: str, pred_cids: List[int], n_samples: int,
                    num_classes: int, budget: int,
+                   workers: int = 8,
                    ) -> Tuple[np.ndarray, Optional[float], Optional[float], Set[int]]:
-    rf = CronusRobustFilter(budget=budget)
+    rf = CronusRobustFilter(budget=budget, workers=workers)
     row_bytes = num_classes * 4
     CHUNK = 50_000
     pseudo = np.empty(n_samples, dtype=np.int32)
     max_eig: Optional[float] = None
     max_ratio: Optional[float] = None
-    removal_counts = np.zeros(len(pred_files), dtype=np.int64)
+    removal_counts = np.zeros(len(pred_cids), dtype=np.int64)
     removed: Set[int] = set()
-    handles = [open(f, "rb") for f in pred_files]
+    fp = open(pred_pack_path, "rb")
     boundary = 1.0 / num_classes
     off = 0
     pbar = tqdm(total=n_samples, desc="Robust filter", unit="sample")
     while off < n_samples:
         rows = min(CHUNK, n_samples - off)
         S_batch = np.stack([
-            np.frombuffer(h.read(rows * row_bytes), dtype=np.float32)
-              .reshape(rows, num_classes)
-            for h in handles
+            _read_pred_rows(fp, cid, off, rows, n_samples, num_classes)
+            for cid in pred_cids
         ], axis=1)
         means, batch_eig, batch_removals, batch_ratio = rf.compute_robust_mean_batch(S_batch)
         if batch_eig is not None and (max_eig is None or batch_eig > max_eig):
@@ -77,7 +104,7 @@ def _robust_filter(pred_files: List[str], n_samples: int,
         if batch_ratio is not None and (max_ratio is None or batch_ratio > max_ratio):
             max_ratio = batch_ratio
         removal_counts += batch_removals
-        for c in range(len(pred_files)):
+        for c in range(len(pred_cids)):
             if batch_removals[c] > 0:
                 removed.add(c)
         max_vals = means.max(axis=1)
@@ -88,8 +115,7 @@ def _robust_filter(pred_files: List[str], n_samples: int,
         off += rows
         del S_batch, means
     pbar.close()
-    for h in handles:
-        h.close()
+    fp.close()
     return pseudo, max_eig, max_ratio, removed
 
 
@@ -124,7 +150,7 @@ def _make_merged_dataset(priv_X_path, priv_y_path, pub_X_path, pseudo_y_path,
         from torch.utils.data import DataLoader, TensorDataset
         ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
         return DataLoader(ds, batch_size=batch_size, shuffle=False,
-                          pin_memory=False, num_workers=0)
+                          **_torch_loader_kwargs())
     return (tf.data.Dataset.from_tensor_slices((X, y))
               .batch(batch_size).prefetch(tf.data.AUTOTUNE))
 
@@ -146,7 +172,7 @@ def _make_public_only_dataset(pub_X_path, pseudo_y_path, input_dim, num_classes,
         import torch
         from torch.utils.data import DataLoader, TensorDataset
         ds = TensorDataset(torch.from_numpy(pub_X), torch.from_numpy(pub_y_oh))
-        return DataLoader(ds, batch_size=batch_size, shuffle=False, pin_memory=False, num_workers=0)
+        return DataLoader(ds, batch_size=batch_size, shuffle=False, **_torch_loader_kwargs())
     return (tf.data.Dataset.from_tensor_slices((pub_X, pub_y_oh))
               .batch(batch_size).prefetch(tf.data.AUTOTUNE))
 
@@ -159,14 +185,14 @@ def _ckpt_dir(context: PipelineContext) -> str:
 
 
 def _save_mid_round(context: PipelineContext, round_number: int,
-                    last_client_idx: int, pred_files: List[str],
+                    last_client_idx: int, pred_pack_path: str,
                     pred_cids: List[int], pub_X_file: str) -> None:
     d = _ckpt_dir(context)
     os.makedirs(d, exist_ok=True)
     payload = {
         "round": round_number,
         "last_client_idx": last_client_idx,
-        "pred_files": pred_files,
+        "pred_pack_path": pred_pack_path,
         "pred_cids": pred_cids,
         "pub_X_file": pub_X_file,
         "client_weights": {
@@ -301,19 +327,26 @@ class Cronus(DistillationStrategy):
         tag = "Init (private only)" if is_init else "Merged (private + public)"
         print(f"\n{COLORS.HEADER}Round {round_number} — {tag}{COLORS.ENDC}")
 
-        pred_files: List[str] = []
-        pred_cids:  List[int] = []
+        pred_pack_path = _pred_pack_path(round_number)
+        pred_cids: List[int] = []
         first_client = 0
+        resume_pack = False
 
         # ---- mid-round resume ----
         _ckpt_interval = getattr(cfg, "checkpoint", 0)
+        mid = None
         if _ckpt_interval:
             mid = _load_mid_round(context, round_number)
             if mid is not None:
-                first_client = mid["last_client_idx"] + 1
-                pred_files = mid["pred_files"]
-                pred_cids = mid["pred_cids"]
-                print(f"{COLORS.OKGREEN}Resuming round {round_number} from client {first_client}{COLORS.ENDC}")
+                candidate_path = mid.get("pred_pack_path", pred_pack_path)
+                if os.path.exists(candidate_path):
+                    first_client = mid["last_client_idx"] + 1
+                    pred_pack_path = candidate_path
+                    pred_cids = mid["pred_cids"]
+                    resume_pack = True
+                    print(f"{COLORS.OKGREEN}Resuming round {round_number} from client {first_client}{COLORS.ENDC}")
+        if not resume_pack:
+            _init_pred_pack(pred_pack_path, context.n_clients, n_pub, context.num_classes)
 
         # ---- per-client: reuse model → set_weights → train → predict ----
         for idx, st in enumerate(context.client_states):
@@ -382,23 +415,17 @@ class Cronus(DistillationStrategy):
             else:
                 st.data["w"] = new_w
 
-            pf = _pred_path(cid, round_number)
-            _predict_to_file(model, open_X, context.num_classes,
-                             cfg.batch_size, pf)
-            pred_files.append(pf)
-            pred_cids.append(cid)
+            _counts = _predict_to_file(
+                model, open_X, context.num_classes,
+                cfg.batch_size, pred_pack_path, client_id=cid, n_samples=n_pub)
+            if cid not in pred_cids:
+                pred_cids.append(cid)
 
-            _row_bytes = context.num_classes * 4
-            with open(pf, "rb") as _f:
-                _raw = _f.read()
-            _preds = np.frombuffer(_raw, dtype=np.float32).reshape(-1, context.num_classes)
-            _argmax = np.argmax(_preds, axis=1)
-            _counts = np.bincount(_argmax, minlength=context.num_classes)
             _top3 = np.argsort(_counts)[::-1][:3]
-            _top = " | ".join(f"cls{c}:{100*_counts[c]/max(len(_argmax),1):.1f}%" for c in _top3 if _counts[c] > 0)
+            _top = " | ".join(f"cls{c}:{100*_counts[c]/max(n_pub,1):.1f}%" for c in _top3 if _counts[c] > 0)
             _poison_tag = " [POISONED]" if poisoned else ""
             context.logger.info("Round %s | Client %s%s | top3 pred-argmax: %s", round_number, cid, _poison_tag, _top)
-            del _raw, _preds, _argmax, _counts
+            del _counts
 
             if _mixed:
                 del model
@@ -411,21 +438,27 @@ class Cronus(DistillationStrategy):
                 or (idx + 1) % _ckpt_interval == 0
             ):
                 _save_mid_round(context, round_number, idx,
-                                pred_files, pred_cids, pub_X_file)
+                                pred_pack_path, pred_cids, pub_X_file)
 
         # ---- PoisonedFL: ghost model ----
         if attack_type == "poisonedfl" and context.poisoned_clients and context.poisoned_fl_state is not None:
             _pfl = context.poisoned_fl_state
+            ghost_arch = poisonedfl_ghost_model_type(cfg)
             ghost_w = context.shared_state.get("poisonedfl_ghost_w")
             if ghost_w is None:
                 ghost_w = context.shared_state.get("init_w")
+            if ghost_w is None:
+                ghost_model = create_model(context.input_dim, context.num_classes,
+                                           cfg.batch_size, model_type=ghost_arch)
+                ghost_w = ghost_model.get_weights()
+                del ghost_model
             if not is_init and prev_pub is not None and prev_pseudo is not None:
                 if not _mixed:
                     from ..memory import clear_session
                     clear_session()
                     aggressive_memory_cleanup()
                 ghost_model = create_model(context.input_dim, context.num_classes,
-                                           cfg.batch_size, model_type=cfg.model_type)
+                                           cfg.batch_size, model_type=ghost_arch)
                 if ghost_w is not None:
                     ghost_model.set_weights(ghost_w)
                 ds_ghost = _make_public_only_dataset(
@@ -441,29 +474,29 @@ class Cronus(DistillationStrategy):
                 from ..memory import clear_session
                 clear_session()
                 aggressive_memory_cleanup()
-                self._model = create_model(context.input_dim, context.num_classes,
-                                           cfg.batch_size, model_type=cfg.model_type)
-                model = self._model
-            model.set_weights(poisoned_w)
+                poison_model = create_model(context.input_dim, context.num_classes,
+                                            cfg.batch_size, model_type=cfg.model_type)
+                self._model = poison_model
+            else:
+                poison_model = create_model(context.input_dim, context.num_classes,
+                                            cfg.batch_size, model_type=ghost_arch)
+            poison_model.set_weights(poisoned_w)
             for st in context.client_states:
                 if st.client_id not in context.poisoned_clients:
                     continue
-                st.data["w"] = poisoned_w
-                pf = _pred_path(st.client_id, round_number)
-                _predict_to_file(model, open_X, context.num_classes, cfg.batch_size, pf)
-                if pf not in pred_files:
-                    pred_files.append(pf)
+                if not _mixed:
+                    st.data["w"] = poisoned_w
+                _counts = _predict_to_file(
+                    poison_model, open_X, context.num_classes, cfg.batch_size,
+                    pred_pack_path, client_id=st.client_id, n_samples=n_pub)
+                if st.client_id not in pred_cids:
                     pred_cids.append(st.client_id)
-                _row_bytes = context.num_classes * 4
-                with open(pf, "rb") as _f:
-                    _raw = _f.read()
-                _preds = np.frombuffer(_raw, dtype=np.float32).reshape(-1, context.num_classes)
-                _argmax = np.argmax(_preds, axis=1)
-                _counts = np.bincount(_argmax, minlength=context.num_classes)
                 _top3 = np.argsort(_counts)[::-1][:3]
-                _top = " | ".join(f"cls{c}:{100*_counts[c]/max(len(_argmax),1):.1f}%" for c in _top3 if _counts[c] > 0)
+                _top = " | ".join(f"cls{c}:{100*_counts[c]/max(n_pub,1):.1f}%" for c in _top3 if _counts[c] > 0)
                 context.logger.info("Round %s | Client %s [POISONED] | top3 pred-argmax: %s", round_number, st.client_id, _top)
-                del _raw, _preds, _argmax, _counts
+                del _counts
+            if _mixed:
+                del poison_model
             context.logger.info("Round %s | PoisonedFL | Ghost model injected into %d byzantine clients", round_number, len(context.poisoned_clients))
             del poisoned_w
 
@@ -477,7 +510,8 @@ class Cronus(DistillationStrategy):
             pseudo_file = _pseudo_path(round_number)
             if not os.path.exists(pseudo_file):
                 pseudo, max_eig, max_ratio, removed_idx = _robust_filter(
-                    pred_files, n_pub, context.num_classes, budget)
+                    pred_pack_path, pred_cids, n_pub, context.num_classes, budget,
+                    workers=getattr(cfg, "robust_workers", 8))
 
                 removed_cids = sorted({pred_cids[i] for i in removed_idx})
                 eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
@@ -491,9 +525,8 @@ class Cronus(DistillationStrategy):
                 np.save(pseudo_file, pseudo)
                 del pseudo
 
-                for f in pred_files:
-                    if os.path.exists(f):
-                        os.remove(f)
+                if os.path.exists(pred_pack_path):
+                    os.remove(pred_pack_path)
             else:
                 print(f"  Pseudo labels already exist, skipping robust filter")
             if round_number > 1:

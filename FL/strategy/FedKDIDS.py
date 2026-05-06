@@ -6,7 +6,7 @@ import time
 from typing import Dict, List
 
 import numpy as np
-from ..backend import use_tf as _use_tf
+from ..backend import get_torch_loader_kwargs as _torch_loader_kwargs, use_tf as _use_tf
 if _use_tf():
     import tensorflow as tf
 
@@ -17,7 +17,7 @@ from ..context import PipelineContext, ModelPool
 from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
-from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset
+from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset, poisonedfl_ghost_model_type
 
 FEDKDIDS_CACHE_DIR = os.path.join("temp_weights", "fedkdids_cache")
 
@@ -35,7 +35,7 @@ def _make_public_ds(X, y, batch_size):
     from torch.utils.data import DataLoader, TensorDataset
     ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
     return DataLoader(ds, batch_size=batch_size, shuffle=False,
-                      pin_memory=False, num_workers=0)
+                      **_torch_loader_kwargs())
 
 
 def _base_public_path() -> str:
@@ -199,6 +199,7 @@ class FedKDIDS(DistillationStrategy):
         _REFRESH_EVERY = getattr(config, "cleanup_interval", 25)
         attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
         tau = getattr(config, "hamming_tau", 0.5)
+        _pfl_stage1 = getattr(context, 'poisoned_fl_state', None)
 
         if round_number > 1 and not _mixed:
             del model
@@ -280,9 +281,8 @@ class FedKDIDS(DistillationStrategy):
             print(f"\n{COLORS.BOLD}Client {cid} Stage I{COLORS.ENDC}")
             _poisoned = cid in context.poisoned_clients
 
-            _pfl = getattr(context, 'poisoned_fl_state', None)
-            if _poisoned and (_pfl is not None or attack_type == "cpa"):
-                _tag = "PoisonedFL" if _pfl is not None else "CPA"
+            if _poisoned and (_pfl_stage1 is not None or attack_type == "cpa"):
+                _tag = "PoisonedFL" if _pfl_stage1 is not None else "CPA"
                 context.logger.info("Round %s | Client %s [%s] Stage I skipped", round_number, cid, _tag)
                 if _mixed:
                     del model
@@ -340,6 +340,26 @@ class FedKDIDS(DistillationStrategy):
 
             if _mixed:
                 del model
+
+        if _pfl_stage1 is not None and context.poisoned_clients and context.shared_state.get("poisonedfl_ghost_w") is not None:
+            ghost = create_model(context.input_dim, context.num_classes,
+                                 config.batch_size, model_type=poisonedfl_ghost_model_type(config))
+            ghost.set_weights(context.shared_state["poisonedfl_ghost_w"])
+            logits_model = ghost.get_logits_model() if hasattr(ghost, "get_logits_model") else ghost
+            ghost_logits = logits_model.predict(open_feature, batch_size=config.batch_size, verbose=0)
+            ghost_hard = np.argmax(ghost_logits, axis=1).astype(np.int32)
+            del ghost, logits_model, ghost_logits
+            ghost_counts = np.bincount(ghost_hard, minlength=context.num_classes)
+            ghost_top3 = np.argsort(ghost_counts)[::-1][:3]
+            ghost_top = " | ".join(f"cls{c}:{100*ghost_counts[c]/max(len(ghost_hard),1):.1f}%" for c in ghost_top3 if ghost_counts[c] > 0)
+            for cid in context.poisoned_clients:
+                pred_path = _pred_path(cid, round_number)
+                np.save(pred_path, ghost_hard)
+                if cid not in pred_client_ids:
+                    pred_files.append(pred_path)
+                    pred_client_ids.append(cid)
+                context.logger.info("Round %s | Client %s [POISONED] | top3 pred-argmax: %s", round_number, cid, ghost_top)
+            del ghost_hard, ghost_counts
 
         del open_feature
         aggressive_memory_cleanup()
@@ -450,9 +470,9 @@ class FedKDIDS(DistillationStrategy):
 
         # ---- PoisonedFL: ghost model trained on public_ds ----
         _pfl = getattr(context, 'poisoned_fl_state', None)
-        if _pfl is not None and context.poisoned_clients and not _mixed:
+        if _pfl is not None and context.poisoned_clients:
             ghost = create_model(context.input_dim, context.num_classes,
-                                 config.batch_size, model_type=config.model_type)
+                                 config.batch_size, model_type=poisonedfl_ghost_model_type(config))
             if context.shared_state.get("poisonedfl_ghost_w") is not None:
                 ghost.set_weights(context.shared_state["poisonedfl_ghost_w"])
             print(f"{COLORS.WARNING}  [PoisonedFL] Ghost model generating logits for {len(context.poisoned_clients)} byzantine clients{COLORS.ENDC}")
@@ -461,9 +481,10 @@ class FedKDIDS(DistillationStrategy):
             del ghost
             poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
             context.shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
-            for st in context.client_states:
-                if st.client_id in context.poisoned_clients:
-                    st.data["w"] = poisoned_w
+            if not _mixed:
+                for st in context.client_states:
+                    if st.client_id in context.poisoned_clients:
+                        st.data["w"] = poisoned_w
             _mal_norm = float(np.linalg.norm(_pfl.cached_update)) if _pfl.cached_update is not None else 0.0
             context.logger.info(
                 "Round %s | PoisonedFL | c=%.4f mal_norm=%.4e | Ghost trained on public_ds, injected into %d byzantine clients",

@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score, precision_score, recall_score
 
-from .backend import use_tf as _use_tf
+from .backend import get_torch_loader_kwargs as _torch_loader_kwargs, use_tf as _use_tf
 if _use_tf():
     import tensorflow as tf
 
@@ -129,6 +129,7 @@ class FLConfig:
     fresh_run: bool = False
     cache_test_set: bool = False
     flame_lambda: float = 0.001
+    flame_passive_cluster: bool = False
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -150,6 +151,7 @@ class FLConfig:
             'support': self.support,
             'threshold': self.threshold,
             'flame_lambda': self.flame_lambda,
+            'flame_passive_cluster': self.flame_passive_cluster,
         }
 
 
@@ -811,6 +813,8 @@ class FederatedLearningPipeline:
         strategy_name = getattr(self.strategy_runtime.client_strategy, 'name', '').lower()
         if strategy_name in self._NEEDS_ALL_WEIGHTS:
             return False
+        if self.config.strategy.lower() in self._NEEDS_ALL_WEIGHTS:
+            return False
         if self.config.peer_trust:
             return False
         if self.config.decentralized == "ModelSimilarity":
@@ -824,7 +828,7 @@ class FederatedLearningPipeline:
         if self.config.strategy == "FLTrust":
             return aggregator.aggregate(weights_list, sample_sizes, global_update=global_update)
         elif self.config.strategy == "FLAME":
-            return aggregator.aggregate(weights_list, sample_sizes, prev_global=prev_global)
+            return aggregator.aggregate(weights_list, sample_sizes, prev_global=prev_global, logger=self.logger, passive_cluster=self.config.flame_passive_cluster)
         elif self.strategy_runtime.requires_participant_ids:
             return aggregator.aggregate(weights_list, sample_sizes, participating_clients)
         else:
@@ -872,7 +876,7 @@ class FederatedLearningPipeline:
             from torch.utils.data import DataLoader, TensorDataset
             ds = TensorDataset(torch.from_numpy(combined_X), torch.from_numpy(combined_y))
             root_dataset = DataLoader(ds, batch_size=self.config.batch_size, shuffle=False,
-                                      pin_memory=False, num_workers=0)
+                                      **_torch_loader_kwargs())
         
         print(f"  [SERVER] Training on root dataset ({len(combined_X)} samples) for {self.config.root_iterations} iterations")
         
@@ -1100,7 +1104,8 @@ class FederatedLearningPipeline:
             _ckpt_base = self._checkpoint_dir()
             if os.path.isdir(_ckpt_base):
                 shutil.rmtree(_ckpt_base)
-            print(f"{COLORS.OKCYAN}fresh_run: cleared weight records and checkpoint{COLORS.ENDC}")
+            _clear_eval_artifacts(self.log_filename.replace('.log', '.xlsx'))
+            print(f"{COLORS.OKCYAN}fresh_run: cleared weight records, checkpoint, and eval artifacts{COLORS.ENDC}")
 
         if self.config.checkpoint:
             ckpt = self._load_checkpoint()
@@ -1444,10 +1449,20 @@ class FederatedLearningPipeline:
     def _run_eval_from_records(self, input_dim, num_classes, class_names, partition_label, excel_filename, record_base):
         log_timestamp(self.logger, "=== EVALUATION ===")
         print(f"\n{COLORS.HEADER}[EVALUATION]{COLORS.ENDC}")
+        progress_path = _eval_progress_path(excel_filename)
 
         # Resume: load any previously completed rounds
         evaluated_rounds: set = set()
-        if os.path.exists(excel_filename):
+        if self.config.fresh_run:
+            self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
+        elif os.path.exists(progress_path):
+            try:
+                self.results_df = pd.read_pickle(progress_path)
+                evaluated_rounds = set(self.results_df['Round'].astype(int).tolist())
+                print(f"{COLORS.OKCYAN}Resuming eval — {len(evaluated_rounds)} rounds already done{COLORS.ENDC}")
+            except Exception:
+                self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
+        elif os.path.exists(excel_filename):
             try:
                 try:
                     existing_df = pd.read_excel(excel_filename, sheet_name='Overall_Metrics')
@@ -1530,8 +1545,7 @@ class FederatedLearningPipeline:
                 final_per_class_metrics = per_class_metrics
                 final_confusion_mat = confusion_mat
 
-            # Incremental save for resume capability
-            self.results_df.to_excel(excel_filename, index=False)
+            self.results_df.to_pickle(progress_path)
 
         if not self.results_df.empty:
             if final_per_class_metrics is not None:
@@ -1541,6 +1555,8 @@ class FederatedLearningPipeline:
                 )
             else:
                 self.results_df.to_excel(excel_filename, index=False)
+        if os.path.exists(progress_path):
+            os.remove(progress_path)
 
         del eval_model, test_dataset, y_true_cache
         aggressive_memory_cleanup()
@@ -1552,6 +1568,18 @@ class FederatedLearningPipeline:
 def run_pipeline(config: FLConfig) -> None:
     pipeline = FederatedLearningPipeline(config)
     pipeline.run()
+
+
+def _eval_progress_path(excel_filename: str) -> str:
+    return os.path.splitext(excel_filename)[0] + '.progress.pkl'
+
+
+def _clear_eval_artifacts(excel_filename: str) -> None:
+    progress_path = _eval_progress_path(excel_filename)
+    if os.path.exists(excel_filename):
+        os.remove(excel_filename)
+    if os.path.exists(progress_path):
+        os.remove(progress_path)
 
 
 def run_distillation_pipeline(config, strategy) -> None:
@@ -1685,7 +1713,8 @@ def run_distillation_pipeline(config, strategy) -> None:
             shutil.rmtree(_wr_base)
         if os.path.isdir(ckpt_dir):
             shutil.rmtree(ckpt_dir)
-        print(f"{COLORS.OKCYAN}fresh_run: cleared weight records and checkpoint{COLORS.ENDC}")
+        _clear_eval_artifacts(excel_filename)
+        print(f"{COLORS.OKCYAN}fresh_run: cleared weight records, checkpoint, and eval artifacts{COLORS.ENDC}")
     if config.checkpoint:
         ckpt_info_path = os.path.join(ckpt_dir, "info.txt")
         if os.path.exists(ckpt_info_path):
@@ -1855,9 +1884,17 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
 
     log_timestamp(logger, "=== EVALUATION ===")
     print(f"\n{COLORS.HEADER}[EVALUATION]{COLORS.ENDC}")
+    progress_path = _eval_progress_path(excel_filename)
 
     evaluated_rounds: set = set()
-    if os.path.exists(excel_filename):
+    if getattr(config, 'fresh_run', False):
+        context.results = {}
+    elif os.path.exists(progress_path):
+        try:
+            context.results = pd.read_pickle(progress_path)
+        except Exception:
+            context.results = {}
+    elif os.path.exists(excel_filename):
         try:
             existing = pd.read_excel(excel_filename, sheet_name=0)
             if context.results is None:
@@ -2051,6 +2088,10 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         )
 
     del eval_model, X_test, y_test, test_labels
+    if context.results:
+        pd.DataFrame(context.results).T.to_excel(excel_filename)
+    if os.path.exists(progress_path):
+        os.remove(progress_path)
     aggressive_memory_cleanup()
     log_timestamp(logger, "=== SIMULATION COMPLETED ===")
     print(f"{COLORS.OKCYAN}Results saved to {excel_filename}{COLORS.ENDC}")
@@ -2073,6 +2114,5 @@ def _record_metrics(context: PipelineContext, round_number: int, round_metrics: 
         for key, value in metrics.items():
             metric_key = f"Round_{round_number}_{key}"
             context.results.setdefault(client_id, {})[metric_key] = value
-    
-    results_df = pd.DataFrame(context.results).T
-    results_df.to_excel(excel_filename)
+
+    pd.to_pickle(context.results, _eval_progress_path(excel_filename))

@@ -3,7 +3,7 @@ from typing import Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from .backend import use_tf as _use_tf
+from .backend import get_torch_loader_kwargs as _torch_loader_kwargs, use_tf as _use_tf
 if _use_tf():
     import tensorflow as tf
 from sklearn.metrics import (
@@ -56,7 +56,7 @@ def evaluate_model_streaming(
             from torch.utils.data import DataLoader, TensorDataset
             chunk_dataset = DataLoader(
                 TensorDataset(torch.from_numpy(X_chunk), torch.from_numpy(y_chunk_cat)),
-                batch_size=batch_size, shuffle=False)
+                batch_size=batch_size, shuffle=False, **_torch_loader_kwargs())
         chunk_loss = model.evaluate(chunk_dataset, verbose=0)[0]
         total_loss += chunk_loss * (chunk_end - chunk_start)
         total_observations += (chunk_end - chunk_start)
