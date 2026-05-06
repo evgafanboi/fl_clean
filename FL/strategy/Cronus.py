@@ -14,7 +14,7 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_unified_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
 from .base import DistillationStrategy
 from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset, poisonedfl_ghost_model_type
 from .robust_filter import CronusRobustFilter
@@ -443,9 +443,8 @@ class Cronus(DistillationStrategy):
         if attack_type == "poisonedfl" and context.poisoned_clients and context.poisoned_fl_state is not None:
             _pfl = context.poisoned_fl_state
             ghost_arch = poisonedfl_ghost_model_type(cfg)
-            ghost_w = context.shared_state.get("poisonedfl_ghost_w")
-            if ghost_w is None:
-                ghost_w = context.shared_state.get("init_w")
+            retry_proxy = context.shared_state.get("poisonedfl_proxy_w")
+            ghost_w = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
             if ghost_w is None:
                 ghost_model = create_model(context.input_dim, context.num_classes,
                                            cfg.batch_size, model_type=ghost_arch)
@@ -468,7 +467,31 @@ class Cronus(DistillationStrategy):
                 ghost_w = ghost_model.get_weights()
                 del ghost_model
             poisoned_w = poisonedfl_unified_weights([ghost_w] if ghost_w is not None else [context.shared_state["init_w"]], _pfl)
-            context.shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
+            if (
+                _pfl.last_hypothesis_success is False
+                and _pfl.last_poisoned is not None
+                and retry_proxy is not None
+                and not is_init
+                and prev_pub is not None
+                and prev_pseudo is not None
+            ):
+                context.logger.info("Round %s | PoisonedFL | H0 -> retry ghost public-only fit from previous unpoisoned proxy", round_number)
+                if not _mixed:
+                    from ..memory import clear_session
+                    clear_session()
+                    aggressive_memory_cleanup()
+                ghost_model = create_model(context.input_dim, context.num_classes,
+                                           cfg.batch_size, model_type=ghost_arch)
+                ghost_model.set_weights([w.copy() for w in retry_proxy])
+                ds_ghost = _make_public_only_dataset(
+                    prev_pub, prev_pseudo,
+                    context.input_dim, context.num_classes, cfg.batch_size)
+                ghost_model.fit(ds_ghost, epochs=cfg.epochs)
+                del ds_ghost
+                ghost_w = ghost_model.get_weights()
+                del ghost_model
+                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True)
+            poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
             if not _mixed:
                 from ..memory import clear_session
                 clear_session()

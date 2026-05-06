@@ -21,8 +21,9 @@ class PoisonedFLState:
         self.prev_global = None
         self.last_poisoned = None
         self.cached_update = None
+        self.last_hypothesis_success = None
 
-    def compute_update(self, current_flat: np.ndarray):
+    def compute_update(self, current_flat: np.ndarray, allow_decay: bool = True):
         fmax = float(np.finfo(np.float32).max)
         current_flat = np.nan_to_num(current_flat.astype(np.float64, copy=False), nan=0.0, posinf=fmax, neginf=-fmax)
         d = current_flat.size
@@ -42,26 +43,28 @@ class PoisonedFLState:
         residual = history - last_grad.reshape(d, 1) * history_norm / (last_grad_norm + 1e-9)
         scale = np.nan_to_num(np.linalg.norm(residual, axis=1), nan=0.0, posinf=fmax, neginf=0.0)
         deviation = np.nan_to_num(scale * self.fixed_rand / (float(np.linalg.norm(scale)) + 1e-9), nan=0.0, posinf=1.0, neginf=-1.0)
-        total_update = np.where(last_grad == 0.0, current_flat, last_grad)
-        aligned = int(np.sum(np.sign(total_update) == self.fixed_rand))
+        aligned = int(np.sum(np.sign(last_grad) == self.fixed_rand))
         k_99 = int(d / 2 + 2.326 * np.sqrt(d) / 2)
+        hypothesis_success = aligned >= k_99
         sf = self.scaling_factor
-        if aligned < k_99 and sf * 0.7 >= 0.5:
+        if allow_decay and not hypothesis_success and sf * 0.7 >= 0.5:
             sf *= 0.7
         self.scaling_factor = sf
+        self.last_hypothesis_success = hypothesis_success
         mal_update = np.nan_to_num(sf * history_norm * deviation, nan=0.0, posinf=fmax, neginf=-fmax)
         mal_update = np.clip(mal_update, -fmax, fmax).astype(np.float32)
         self.last_poisoned = mal_update.copy()
         self.prev_global = current_flat.copy()
-        print(f"  [PoisonedFL] c={sf:.4f}, aligned={aligned}/{d} (k99={k_99}), mal_norm={float(np.linalg.norm(mal_update)):.4e}")
+        hypothesis = "H1" if hypothesis_success else "H0"
+        print(f"  [PoisonedFL] {hypothesis} c={sf:.4f}, aligned={aligned}/{d} (k99={k_99}), mal_norm={float(np.linalg.norm(mal_update)):.4e}")
         return mal_update
 
 
-def poisonedfl_unified_weights(byz_weights_list, state: PoisonedFLState):
+def poisonedfl_unified_weights(byz_weights_list, state: PoisonedFLState, allow_decay: bool = True):
     consensus = [np.mean([w[i] for w in byz_weights_list], axis=0) for i in range(len(byz_weights_list[0]))]
     fmax = float(np.finfo(np.float32).max)
     current_flat = np.nan_to_num(np.concatenate([w.ravel() for w in consensus]).astype(np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
-    mal_update = state.compute_update(current_flat)
+    mal_update = state.compute_update(current_flat, allow_decay=allow_decay)
     state.cached_update = mal_update
     if mal_update is None:
         return consensus
@@ -69,6 +72,40 @@ def poisonedfl_unified_weights(byz_weights_list, state: PoisonedFLState):
     poisoned_flat = np.clip(poisoned_flat, -fmax, fmax)
     offset, poisoned = 0, []
     for w in consensus:
+        n = w.size
+        poisoned.append(poisoned_flat[offset:offset + n].reshape(w.shape).astype(w.dtype))
+        offset += n
+    return poisoned
+
+
+def poisonedfl_warmstart_weights(shared_state, state: PoisonedFLState, fallback=None):
+    proxy_w = shared_state.get("poisonedfl_proxy_w")
+    poisoned_w = shared_state.get("poisonedfl_ghost_w")
+    selected = poisoned_w or proxy_w or fallback
+    if selected is None:
+        return None
+    return [w.copy() for w in selected]
+
+
+def poisonedfl_store_round_weights(shared_state, proxy_w, poisoned_w):
+    shared_state["poisonedfl_proxy_w"] = [w.copy() for w in proxy_w]
+    shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
+
+
+def poisonedfl_apply_cached_weights(base_weights, state: PoisonedFLState, track_as_prev: bool = False):
+    if base_weights is None:
+        return None
+    fmax = float(np.finfo(np.float32).max)
+    base_flat = np.nan_to_num(np.concatenate([w.ravel() for w in base_weights]).astype(np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
+    if track_as_prev:
+        state.prev_global = base_flat.copy()
+    mal_update = state.cached_update if state.cached_update is not None else state.last_poisoned
+    if mal_update is None:
+        return [w.copy() for w in base_weights]
+    poisoned_flat = np.nan_to_num(base_flat + np.asarray(mal_update, dtype=np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
+    poisoned_flat = np.clip(poisoned_flat, -fmax, fmax)
+    offset, poisoned = 0, []
+    for w in base_weights:
         n = w.size
         poisoned.append(poisoned_flat[offset:offset + n].reshape(w.shape).astype(w.dtype))
         offset += n

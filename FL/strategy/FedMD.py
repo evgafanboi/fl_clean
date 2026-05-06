@@ -13,7 +13,7 @@ from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
 from .base import DistillationStrategy
-from ..poison_utils import poisonedfl_unified_weights, parse_poison_config
+from ..poison_utils import poisonedfl_apply_cached_weights, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights, parse_poison_config
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import (
     create_model,
@@ -343,15 +343,30 @@ class FedMD(DistillationStrategy):
         # ---- PoisonedFL: ghost model (digest only, no private data) ----
         _pfl = getattr(context, 'poisoned_fl_state', None)
         if _pfl is not None and context.poisoned_clients:
+            retry_proxy = context.shared_state.get("poisonedfl_proxy_w")
             ghost = create_model(context.input_dim, context.num_classes,
                                  config.batch_size, model_type=config.model_type)
-            if context.shared_state.get("poisonedfl_ghost_w") is not None:
-                ghost.set_weights(context.shared_state["poisonedfl_ghost_w"])
+            ghost_start = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
+            if ghost_start is not None:
+                ghost.set_weights(ghost_start)
             digest_phase(ghost, consensus_logits, public_features, config.batch_size, self.digest_epochs)
             ghost_w = ghost.get_weights()
             del ghost
             poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
-            context.shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
+            if (
+                _pfl.last_hypothesis_success is False
+                and _pfl.last_poisoned is not None
+                and retry_proxy is not None
+            ):
+                context.logger.info("Round %s | PoisonedFL | H0 -> retry digest from previous unpoisoned proxy", round_number)
+                ghost = create_model(context.input_dim, context.num_classes,
+                                     config.batch_size, model_type=config.model_type)
+                ghost.set_weights([w.copy() for w in retry_proxy])
+                digest_phase(ghost, consensus_logits, public_features, config.batch_size, self.digest_epochs)
+                ghost_w = ghost.get_weights()
+                del ghost
+                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True)
+            poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
             for st in context.client_states:
                 if st.client_id in context.poisoned_clients:
                     m = pool.checkout(st.client_id)

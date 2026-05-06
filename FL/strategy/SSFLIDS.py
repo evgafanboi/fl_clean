@@ -17,7 +17,7 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, ModelPool
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_unified_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, load_public_dataset_from_clients, lma_targets, numpy_from_dataset, poisonedfl_ghost_model_type
@@ -437,10 +437,11 @@ class SSFLIDS(DistillationStrategy):
                     context.logger.info("Round %s | Client %s [LMA] | top3 pred-argmax: %s", round_number, cid, lma_top)
                 del lma_hard, lma_counts
 
-        if _pfl_stage1 is not None and context.poisoned_clients and context.shared_state.get("poisonedfl_ghost_w") is not None:
+        _ghost_stage1_w = poisonedfl_warmstart_weights(context.shared_state, _pfl_stage1, fallback=context.shared_state.get("init_w")) if _pfl_stage1 is not None else None
+        if _pfl_stage1 is not None and context.poisoned_clients and _ghost_stage1_w is not None:
             ghost = create_model(context.input_dim, context.num_classes,
                                  config.batch_size, model_type=poisonedfl_ghost_model_type(config))
-            ghost.set_weights(context.shared_state["poisonedfl_ghost_w"])
+            ghost.set_weights(_ghost_stage1_w)
             logits_model = ghost.get_logits_model() if hasattr(ghost, "get_logits_model") else ghost
             ghost_logits = logits_model.predict(open_feature, batch_size=config.batch_size, verbose=0)
             ghost_hard = np.argmax(ghost_logits, axis=1).astype(np.int32)
@@ -541,15 +542,30 @@ class SSFLIDS(DistillationStrategy):
         # ---- PoisonedFL: ghost model trained on public_ds ----
         _pfl = getattr(context, 'poisoned_fl_state', None)
         if _pfl is not None and context.poisoned_clients:
+            retry_proxy = context.shared_state.get("poisonedfl_proxy_w")
             ghost = create_model(context.input_dim, context.num_classes,
                                  config.batch_size, model_type=poisonedfl_ghost_model_type(config))
-            if context.shared_state.get("poisonedfl_ghost_w") is not None:
-                ghost.set_weights(context.shared_state["poisonedfl_ghost_w"])
+            ghost_start = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
+            if ghost_start is not None:
+                ghost.set_weights(ghost_start)
             ghost.fit(public_ds, epochs=config.dist_rounds, verbose=0)
             ghost_w = ghost.get_weights()
             del ghost
             poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
-            context.shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
+            if (
+                _pfl.last_hypothesis_success is False
+                and _pfl.last_poisoned is not None
+                and retry_proxy is not None
+            ):
+                context.logger.info("Round %s | PoisonedFL | H0 -> retry ghost public fit from previous unpoisoned proxy", round_number)
+                ghost = create_model(context.input_dim, context.num_classes,
+                                     config.batch_size, model_type=poisonedfl_ghost_model_type(config))
+                ghost.set_weights([w.copy() for w in retry_proxy])
+                ghost.fit(public_ds, epochs=config.dist_rounds, verbose=0)
+                ghost_w = ghost.get_weights()
+                del ghost
+                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True)
+            poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
             if not _mixed:
                 for st in context.client_states:
                     if st.client_id in context.poisoned_clients:
