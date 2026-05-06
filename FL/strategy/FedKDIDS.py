@@ -17,7 +17,7 @@ from ..context import PipelineContext, ModelPool
 from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
-from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset, poisonedfl_ghost_model_type
+from .common import create_model, lma_targets, load_public_dataset_from_clients, numpy_from_dataset, poisonedfl_ghost_model_type
 
 FEDKDIDS_CACHE_DIR = os.path.join("temp_weights", "fedkdids_cache")
 
@@ -200,6 +200,7 @@ class FedKDIDS(DistillationStrategy):
         attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
         tau = getattr(config, "hamming_tau", 0.5)
         _pfl_stage1 = getattr(context, 'poisoned_fl_state', None)
+        _lma_stage1 = attack_type == "lma"
 
         if round_number > 1 and not _mixed:
             del model
@@ -281,8 +282,8 @@ class FedKDIDS(DistillationStrategy):
             print(f"\n{COLORS.BOLD}Client {cid} Stage I{COLORS.ENDC}")
             _poisoned = cid in context.poisoned_clients
 
-            if _poisoned and (_pfl_stage1 is not None or attack_type == "cpa"):
-                _tag = "PoisonedFL" if _pfl_stage1 is not None else "CPA"
+            if _poisoned and (_pfl_stage1 is not None or _lma_stage1):
+                _tag = "PoisonedFL" if _pfl_stage1 is not None else "LMA"
                 context.logger.info("Round %s | Client %s [%s] Stage I skipped", round_number, cid, _tag)
                 if _mixed:
                     del model
@@ -341,6 +342,22 @@ class FedKDIDS(DistillationStrategy):
             if _mixed:
                 del model
 
+        if _lma_stage1 and context.poisoned_clients:
+            stale = context.shared_state.get("lma_stale_consensus")
+            if stale is not None:
+                lma_hard = lma_targets(stale, context.num_classes)
+                lma_counts = np.bincount(lma_hard, minlength=context.num_classes)
+                lma_top3 = np.argsort(lma_counts)[::-1][:3]
+                lma_top = " | ".join(f"cls{c}:{100*lma_counts[c]/max(len(lma_hard),1):.1f}%" for c in lma_top3 if lma_counts[c] > 0)
+                for cid in context.poisoned_clients:
+                    pred_path = _pred_path(cid, round_number)
+                    np.save(pred_path, lma_hard)
+                    if cid not in pred_client_ids:
+                        pred_files.append(pred_path)
+                        pred_client_ids.append(cid)
+                    context.logger.info("Round %s | Client %s [LMA] | top3 pred-argmax: %s", round_number, cid, lma_top)
+                del lma_hard, lma_counts
+
         if _pfl_stage1 is not None and context.poisoned_clients and context.shared_state.get("poisonedfl_ghost_w") is not None:
             ghost = create_model(context.input_dim, context.num_classes,
                                  config.batch_size, model_type=poisonedfl_ghost_model_type(config))
@@ -398,6 +415,7 @@ class FedKDIDS(DistillationStrategy):
 
         pub_X = np.array(np.load(pub_X_path, mmap_mode="r"), dtype=np.float32)
         pseudo_y = np.array(np.load(pseudo_y_path, mmap_mode="r"), dtype=np.int32)
+        context.shared_state["lma_stale_consensus"] = np.array(pseudo_y, copy=True)
         valid_mask = pseudo_y >= 0
         pub_X = pub_X[valid_mask]
         pseudo_y = pseudo_y[valid_mask]

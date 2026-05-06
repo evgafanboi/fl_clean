@@ -71,9 +71,11 @@ python -m FL --n_clients <> --partition_type <> --strategy <> --rounds <>
 - `RobustFilter`[7]: Byzantine-robust aggregation (`--robust_epsilon` controls the spectral filtering threshold $\epsilon$. Set it higher than the Byzantine ratio)
 - `FedCoMed`[9]: Coordinate-wise Median for Byzantine-robust FL
 - `DeepFed`[10]: FedAvg using Paillier Homomorphic Encryption (expect extremely long runtime)
+- `FLTrust`[17]: Byzantine-robust FL with labeled public dataset (root dataset). `--root_iterations`, default `1`, controls how many iterations the server trains on the root dataset.
+- `FLAME`: Byzantine-robust aggregation with HDBSCAN clustering on client update cosine distances, median-norm clipping, and Gaussian noise. `--flame_lambda` controls the DP noise coefficient as $\sigma = \lambda S_t$. `--passive_cluster` disables the majority-cluster requirement and admits the largest non-noise cluster instead.
 
 **Federated distillation**:
-- `Ours`: `--kd ekd|abkd`: chooses either `EKD` (**Evidential Knowledge Distillation**[24]) or `ABKD` (**$\alpha-\beta$ Knowledge Distillation**[23]). `--ekd_lambda`: controls `EKD`'s $\lambda$, as in $\mathcal{L}_{EKD} = \mathcal{L}_{1st} + \lambda \mathcal{L}_{2nd}$ (not the weight $\lambda$ used to compute $\alpha$ from $exp(z)$, that value is hard-coded). `--ab_alpha` and `--ab_beta` controls `ABKD`'s $\alpha$ and $\beta$, as in the $\alpha$-$\beta$ divergence. `--kd_epochs` controls the first stage's knowledge distillation epochs, default `2`. Stage 2 infers from the global argument `--epochs` (default `5`). `--ours_temperature` controls `ABKD` distillation temperature, default `4`.
+- `Ours`: `--kd ekd|abkd`: chooses either `EKD` (**Evidential Knowledge Distillation**[24]) or `ABKD` (**$\alpha-\beta$ Knowledge Distillation**[23]). `--ours_ekd_lambda`: controls `EKD`'s $\lambda$, as in $\mathcal{L}_{EKD} = \mathcal{L}_{1st} + \lambda \mathcal{L}_{2nd}$ (not the weight $\lambda$ used to compute $\alpha$ from $exp(z)$, that value is hard-coded). `--ab_alpha` and `--ab_beta` controls `ABKD`'s $\alpha$ and $\beta$, as in the $\alpha$-$\beta$ divergence. `--kd_epochs` controls the first stage's knowledge distillation epochs, default `2`. Stage 2 infers from the global argument `--epochs` (default `5`). `--ours_temperature` controls `ABKD` distillation temperature, default `4`.
 - `Cronus`[8]: Byzantine-robust semi supervised federated distillation, `--robust_epsilon` with value equal or higher than byzantine ratio.
 - `FedDKD`[11]: Federated Decentralized Knowledge Distillation (deprecated)
 - `FedProto`[12]: FedProto `--gamma`, default `1.0`, controls the $\lambda$ in its loss function $\mathcal{L}=\mathcal{L}_S + \lambda\mathcal{L}_R$, where $\mathcal{L}_S$ is defined as the standard supervised loss (cross-entropy in our context) and $\mathcal{L}_R$ is the prototype-distance loss, the distance function is not specific and our code implement L1 distance.
@@ -81,7 +83,7 @@ python -m FL --n_clients <> --partition_type <> --strategy <> --rounds <>
 - `SSFL-IDS`[14]: Semi-supervised Federated Learning. `--dis_rounds` controls how many epochs the discriminator is trained, default `3`. `--dist_rounds` controls how many epochs the clients learn the voted public dataset, default `2`.
 - `FedMD`[15]: Public dataset distillation.
 - `FD`[16]: FederatedDistillation, use `--gamma` to control distillation weight.
-- `FLTrust`[17]: Byzantine-robust FL with labeled public dataset (root dataset). `--root_iterations`, default `1`, controls how many iterations the server trains on the root dataset.
+- `FedDistill`: FedDistill with ExpGuard and a global model. `--exp_rho` controls the ExpGuard step size used to update client weights during robust soft-label aggregation. `--robust_workers` controls the row-block worker count used by the ExpGuard passes. Client CE training and global retraining still use the global `--epochs` and `--batch_size` arguments.
 
 > **Note**: Strategies including `FedProto`, `Cronus`, `FD` or `FedMD` does not have a global model, so they perform per-client evaluation on the same test set. To skip evaluating intermediate rounds, add `--skip_eval` which only evaluates the final round's weight records.
 
@@ -111,11 +113,29 @@ python3 -m FL --n_clients 10 --partition_type iid-500 --strategy FedSSD
 
 ### Poisoning
 
-- To run **label flipping** poisoning, add `--poison label_flip-<ratio>` to the simulation, with `ratio` being `0.1` to `1.0` determining the ratio of clients to be poisoned. 
+All poisoning modes use the tokenized CLI form below:
 
-- To run **gradient scaling**, add `--poison gradient_scale <alpha> <ratio>`, where `alpha` is $\alpha$ such that $w_{poisoned} = w_{global} + \alpha \odot w_{local}$. A suggested value for `alpha` is $\alpha = N_{client}$.
+```bash
+--poison <attack> [value] <ratio>
+```
 
-- Client selection for poisoning are randomized in the first run and the chosen IDs are stored under `results/poison_history` and reused for reproducibility. For example, all poisoning runs that use the partition setting `label_skew_0.1`, `10 clients` share the same randomized poisoned client selection.
+- `label_flip <ratio>`: flips every label with `y -> num_classes - y - 1` for the poisoned clients.
+- `targeted_flip <target_label> <ratio>`: for each poisoned client, finds that client's dominant private class and relabels only that dominant class to `target_label`.
+- `gradient_scale <alpha> <ratio>`: corrupts the poisoned clients' returned model with strength `alpha` after local training. In most FL/FD strategies this is applied as random-sign multiplicative weight corruption; `FD` uses a direct scaled local-update variant.
+- `poisonedfl <c0> <ratio>`: adaptive weight-space Byzantine attack. `c0` is the initial scaling factor used by `PoisonedFLState`.
+- `lma <ratio>`: stale-consensus attack that reuses the previous round public consensus. It is supported only by `Ours`, `FedDistill`, `SSFL-IDS`, and `FedKD-IDS`.
+
+Examples:
+
+```bash
+python -m FL --strategy FedAvg --poison label_flip 0.2
+python -m FL --strategy FedAvg --poison targeted_flip 0 0.2
+python -m FL --strategy RobustFilter --poison gradient_scale 10 0.2
+python -m FL --strategy FedDistill --poison poisonedfl 8 0.2
+python -m FL --strategy Ours --poison lma 0.2
+```
+
+Client selection for poisoning is randomized on the first run and then stored under `results/poison_history` for reuse. For example, all poisoning runs that use the partition setting `label_skew_0.1`, `10 clients` share the same stored poisoned client selection.
 
 ### Checkpointing
 

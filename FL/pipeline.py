@@ -1052,6 +1052,8 @@ class FederatedLearningPipeline:
         self.poison_attack = attack_type
         self.poison_value = poison_value
         self.poison_ratio = poison_ratio
+        if attack_type == "lma":
+            raise ValueError("LMA is only supported for Ours, FedDistill, SSFL-IDS, and FedKD-IDS")
         if attack_type:
             self.poisoned_clients = get_or_create_poisoned_clients(
                 partition_label, attack_type, poison_value, poison_ratio, n_clients
@@ -1650,6 +1652,8 @@ def run_distillation_pipeline(config, strategy) -> None:
     poison_loader = None
     per_client_loaders = {}
     attack_type, poison_value, poison_ratio = parse_poison_config(config.poison)
+    if attack_type == "lma" and strategy.name not in {"Ours", "FedDistill", "SSFL-IDS", "FedKD-IDS"}:
+        raise ValueError("LMA is only supported for Ours, FedDistill, SSFL-IDS, and FedKD-IDS")
     if attack_type:
         poisoned_clients = get_or_create_poisoned_clients(
             partition_label, attack_type, poison_value, poison_ratio, n_clients

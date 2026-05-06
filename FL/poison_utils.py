@@ -7,8 +7,8 @@ def parse_poison_config(poison_arg):
         return None, None, None
     parts = poison_arg.split()
     attack_type = parts[0]
-    assert attack_type in ("gradient_scale", "label_flip", "targeted_flip", "poisonedfl", "cpa"), f"Unknown attack: {attack_type}"
-    no_value = attack_type in ("label_flip", "cpa")
+    assert attack_type in ("gradient_scale", "label_flip", "targeted_flip", "poisonedfl", "lma"), f"Unknown attack: {attack_type}"
+    no_value = attack_type in ("label_flip", "lma")
     value = None if no_value else float(parts[1])
     ratio = float(parts[-1])
     return attack_type, value, ratio

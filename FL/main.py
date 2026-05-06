@@ -95,13 +95,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="TOKEN",
         default=None,
-        help="Poison config tokens: <attack> [value] <ratio>, e.g., gradient_scale 10 0.5 or label_flip 0.2 or cpa 0.2",
+        help="Poison config tokens: <attack> [value] <ratio>, e.g., gradient_scale 10 0.5 or label_flip 0.2 or lma 0.2",
     )
     # label_flip, ratio = fraction of clients to poison, e.g. "label_flip 0.2"
     # gradient_scale, value = multiplicative factor for weight updates (e.g. 10x), ratio = fraction of clients to poison, e.g. "gradient_scale 10 0.2"
     # targeted_flip, value = target label index (0 to num_classes-1), ratio = fraction of clients to poison, e.g. "targeted_flip 0 0.2"
     # poisonedfl, value (default 8) = c0 value, ratio = fraction of clients to poison, e.g. "poisonedfl 8 0.2"
-    # cpa, ratio = fraction of clients to poison, e.g. "cpa 0.2"
+    # lma, ratio = fraction of clients to poison, e.g. "lma 0.2"
 
     # decentralized
     parser.add_argument("--decentralized", type=str, default=None, help="Decentralized topology simulation (e.g. braintorrent)")

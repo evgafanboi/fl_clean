@@ -22,16 +22,31 @@ else:
     dense = gru = dcblstm = None  # type: ignore
 
 
-def cpa_logits(stale: np.ndarray) -> np.ndarray:
-    """CPA: one-hot at the class least correlated with the honest argmax."""
-    probs = np.exp(stale - stale.max(axis=1, keepdims=True))
-    probs /= probs.sum(axis=1, keepdims=True)
-    cov_matrix = (probs.T @ probs) / len(probs)
-    honest_max = np.argmax(probs, axis=1)
-    cpa_target = np.argmin(cov_matrix[honest_max], axis=1)
-    adv = np.zeros_like(probs)
-    adv[np.arange(len(probs)), cpa_target] = 1.0
-    return adv.astype(np.float32)
+def lma_targets(stale: np.ndarray, num_classes: Optional[int] = None) -> np.ndarray:
+    stale_arr = np.asarray(stale)
+    if stale_arr.ndim == 1:
+        labels = stale_arr.astype(np.int32, copy=False)
+        n_classes = int(num_classes or 0)
+        if n_classes <= 1:
+            return np.zeros(len(labels), dtype=np.int32)
+        return ((labels + 1) % n_classes).astype(np.int32)
+    return np.argmin(stale_arr, axis=1).astype(np.int32)
+
+
+def lma_logits(stale: np.ndarray, *, raw: bool = False, num_classes: Optional[int] = None) -> np.ndarray:
+    stale_arr = np.asarray(stale)
+    n_classes = stale_arr.shape[1] if stale_arr.ndim == 2 else int(num_classes or 0)
+    targets = lma_targets(stale_arr, n_classes)
+    adv = np.zeros((len(targets), n_classes), dtype=np.float32)
+    if raw and stale_arr.ndim == 2:
+        row_min = stale_arr.min(axis=1, keepdims=True).astype(np.float32, copy=False)
+        row_max = stale_arr.max(axis=1, keepdims=True).astype(np.float32, copy=False)
+        boost = np.maximum(row_max - row_min, 1.0)
+        adv[:] = row_min
+        adv[np.arange(len(targets)), targets] = (row_max[:, 0] + boost[:, 0]).astype(np.float32, copy=False)
+        return adv
+    adv[np.arange(len(targets)), targets] = 1.0
+    return adv
 
 
 def create_model(input_dim: int, num_classes: int, batch_size: int, model_type: str = "dense"):

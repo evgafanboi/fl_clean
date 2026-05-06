@@ -17,7 +17,7 @@ from ..context import PipelineContext
 from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
-from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset, cpa_logits as _cpa_logits, cpa_logits as _cpa_logits
+from .common import create_model, load_public_dataset_from_clients, lma_logits as _lma_logits, numpy_from_dataset
 
 FEDEXPGUARD_CACHE_DIR = os.path.join("temp_weights", "fedexpguard_cache")
 
@@ -338,8 +338,8 @@ class FedDistillExpGuard(DistillationStrategy):
                                         config.batch_size, model_type=config.model_type)
             client_model.set_weights(global_w)
 
-            if _poisoned and attack_type in ("poisonedfl", "cpa"):
-                _tag = "PoisonedFL" if attack_type == "poisonedfl" else "CPA"
+            if _poisoned and attack_type in ("poisonedfl", "lma"):
+                _tag = "PoisonedFL" if attack_type == "poisonedfl" else "LMA"
                 context.logger.info("Round %s | Client %s [%s] CE skipped", round_number, cid, _tag)
                 del client_model
                 continue
@@ -378,25 +378,25 @@ class FedDistillExpGuard(DistillationStrategy):
                     "soft_client_ids": soft_client_ids,
                 })
 
-        # ---- CPA: ghost soft labels (compute once, copy to all byzantine clients) ----
-        if attack_type == "cpa" and context.poisoned_clients:
-            stale = context.shared_state.get("cpa_stale_consensus")
+        # ---- LMA: ghost soft labels (compute once, copy to all byzantine clients) ----
+        if attack_type == "lma" and context.poisoned_clients:
+            stale = context.shared_state.get("lma_stale_consensus")
             if stale is not None:
-                _cpa_adv = _cpa_logits(stale)
-                _cpa_bytes = _cpa_adv.astype(np.float32).tobytes()
+                _lma_adv = _lma_logits(stale)
+                _lma_bytes = _lma_adv.astype(np.float32).tobytes()
                 for st in context.client_states:
                     if st.client_id not in context.poisoned_clients:
                         continue
                     with open(soft_pack_path, "r+b") as _cf:
                         _cf.seek(st.client_id * _soft_stride(n_public, context.num_classes))
-                        _cf.write(_cpa_bytes)
+                        _cf.write(_lma_bytes)
                     if st.client_id not in soft_client_ids:
                         soft_client_ids.append(st.client_id)
                 context.logger.info(
-                    "Round %s | CPA | Byzantine soft labels generated for %d clients",
+                    "Round %s | LMA | Byzantine soft labels generated for %d clients",
                     round_number, len(context.poisoned_clients),
                 )
-                del _cpa_adv, _cpa_bytes
+                del _lma_adv, _lma_bytes
 
         # ---- PoisonedFL: poison the current global model once, then copy logits ----
         _pfl = getattr(context, "poisoned_fl_state", None)
@@ -431,7 +431,7 @@ class FedDistillExpGuard(DistillationStrategy):
             logger=context.logger, round_number=round_number,
         )
         context.shared_state["exp_weights"] = new_exp_w
-        context.shared_state["cpa_stale_consensus"] = consensus.copy()
+        context.shared_state["lma_stale_consensus"] = consensus.copy()
 
         if context.poisoned_clients:
             poisoned_set = set(context.poisoned_clients)
