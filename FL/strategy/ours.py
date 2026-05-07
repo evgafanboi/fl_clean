@@ -14,7 +14,7 @@ from tqdm import tqdm
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .robust_filter import AdaptiveRobustFilter, IterativeRobustFilter
@@ -138,7 +138,7 @@ def compute_robust_consensus_from_files(
 def ekd_stage(
     model_wrapper, consensus_logits: np.ndarray, public_features: np.ndarray,
     batch_size: int, epochs: int, ekd_lambda: float,
-) -> None:
+) -> float | None:
     from ..backend import use_tf
     if not use_tf():
         return _ekd_stage_pt(model_wrapper, consensus_logits, public_features, batch_size, epochs, ekd_lambda)
@@ -186,6 +186,7 @@ def ekd_stage(
     train_step = model_wrapper._ekd_train_step
 
     n_samples = len(public_features)
+    final_loss = None
     for epoch in range(epochs):
         perm = np.random.permutation(n_samples)
         epoch_loss = 0.0
@@ -197,13 +198,15 @@ def ekd_stage(
             epoch_loss += float(loss)
             batches += 1
         if batches > 0:
-            print(f"    EKD epoch {epoch + 1}/{epochs} — loss {epoch_loss / batches:.4f}")
+            final_loss = epoch_loss / batches
+            print(f"    EKD epoch {epoch + 1}/{epochs} — loss {final_loss:.4f}")
+    return final_loss
 
 
 def _ekd_stage_pt(
     model_wrapper, consensus_logits: np.ndarray, public_features: np.ndarray,
     batch_size: int, epochs: int, ekd_lambda: float,
-) -> None:
+) -> float | None:
     import torch
     from ..backend import get_torch_device
     dev = get_torch_device()
@@ -216,6 +219,7 @@ def _ekd_stage_pt(
     n_samples = len(public_features)
     feat_t = torch.from_numpy(public_features).to(dev)
     logits_t = torch.from_numpy(consensus_logits).to(dev)
+    final_loss = None
     for epoch in range(epochs):
         perm = np.random.permutation(n_samples)
         epoch_loss = 0.0
@@ -241,13 +245,15 @@ def _ekd_stage_pt(
             epoch_loss += loss.item()
             batches += 1
         if batches > 0:
-            print(f"    EKD epoch {epoch + 1}/{epochs} — loss {epoch_loss / batches:.4f}")
+            final_loss = epoch_loss / batches
+            print(f"    EKD epoch {epoch + 1}/{epochs} — loss {final_loss:.4f}")
+    return final_loss
 
 
 def abkd_stage(
     model_wrapper, consensus_logits: np.ndarray, public_features: np.ndarray,
     batch_size: int, epochs: int, alpha: float, beta: float, temperature: float,
-) -> None:
+) -> float | None:
     from ..backend import use_tf
     if not use_tf():
         return _abkd_stage_pt(model_wrapper, consensus_logits, public_features,
@@ -314,6 +320,7 @@ def abkd_stage(
     train_step = model_wrapper._abkd_train_step
 
     n_samples = len(public_features)
+    final_loss = None
     for epoch in range(epochs):
         perm = np.random.permutation(n_samples)
         epoch_loss = 0.0
@@ -325,13 +332,15 @@ def abkd_stage(
             epoch_loss += float(loss)
             batches += 1
         if batches > 0:
-            print(f"    ABKD epoch {epoch + 1}/{epochs} — loss {epoch_loss / batches:.4f}")
+            final_loss = epoch_loss / batches
+            print(f"    ABKD epoch {epoch + 1}/{epochs} — loss {final_loss:.4f}")
+    return final_loss
 
 
 def _abkd_stage_pt(
     model_wrapper, consensus_logits: np.ndarray, public_features: np.ndarray,
     batch_size: int, epochs: int, alpha: float, beta: float, temperature: float,
-) -> None:
+) -> float | None:
     import torch
     from ..backend import get_torch_device
     dev = get_torch_device()
@@ -347,6 +356,7 @@ def _abkd_stage_pt(
     n_samples = len(public_features)
     feat_t = torch.from_numpy(public_features).to(dev)
     teacher_t = torch.from_numpy(consensus_logits).to(dev)
+    final_loss = None
     for epoch in range(epochs):
         perm = np.random.permutation(n_samples)
         epoch_loss = 0.0
@@ -387,7 +397,9 @@ def _abkd_stage_pt(
             epoch_loss += loss.item()
             batches += 1
         if batches > 0:
-            print(f"    ABKD epoch {epoch + 1}/{epochs} — loss {epoch_loss / batches:.4f}")
+            final_loss = epoch_loss / batches
+            print(f"    ABKD epoch {epoch + 1}/{epochs} — loss {final_loss:.4f}")
+    return final_loss
 
 
 # ── Stage 1: CE training on private data ─────────────────────────────────────
@@ -779,11 +791,11 @@ class Ours(DistillationStrategy):
                 if ghost_start is not None:
                     ghost.set_weights(ghost_start)
                 if _kd_m == "abkd":
-                    abkd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
-                               config.ab_alpha, config.ab_beta, config.ours_temperature)
+                    ghost_distill_loss = abkd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
+                                                    config.ab_alpha, config.ab_beta, config.ours_temperature)
                 else:
-                    ekd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
-                              getattr(config, "ours_ekd_lambda", 1.0))
+                    ghost_distill_loss = ekd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
+                                                   getattr(config, "ours_ekd_lambda", 1.0))
                 ghost_w = ghost.get_weights()
                 del ghost
                 poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
@@ -803,10 +815,10 @@ class Ours(DistillationStrategy):
                                   getattr(config, "ours_ekd_lambda", 1.0))
                     ghost_w = ghost.get_weights()
                     del ghost
-                    poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True)
+                    poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
                 poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
-                _mal_norm = float(np.linalg.norm(_pfl.cached_update)) if _pfl.cached_update is not None else 0.0
-                context.logger.info("Round %s | PoisonedFL | c=%.4f mal_norm=%.4e | Ghost KD'd, injected into %d byzantine clients", round_number, _pfl.scaling_factor, _mal_norm, len(context.poisoned_clients))
+                _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
+                context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost KD'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
                 if not getattr(config, "mixed_models", False):
                     _pool_g = context.model_pool
                     for st in context.client_states:
@@ -884,11 +896,11 @@ class Ours(DistillationStrategy):
                     if ghost_start is not None:
                         ghost.set_weights(ghost_start)
                     if _kd_m == "abkd":
-                        abkd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
-                                   config.ab_alpha, config.ab_beta, config.ours_temperature)
+                        ghost_distill_loss = abkd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
+                                                        config.ab_alpha, config.ab_beta, config.ours_temperature)
                     else:
-                        ekd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
-                                  getattr(config, "ours_ekd_lambda", 1.0))
+                        ghost_distill_loss = ekd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
+                                                       getattr(config, "ours_ekd_lambda", 1.0))
                     ghost_w = ghost.get_weights()
                     del ghost
                     poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
@@ -908,10 +920,10 @@ class Ours(DistillationStrategy):
                                       getattr(config, "ours_ekd_lambda", 1.0))
                         ghost_w = ghost.get_weights()
                         del ghost
-                        poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True)
+                        poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
                     poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
-                    _mal_norm = float(np.linalg.norm(_pfl.cached_update)) if _pfl.cached_update is not None else 0.0
-                    context.logger.info("Round %s | PoisonedFL | c=%.4f mal_norm=%.4e | Ghost KD'd, injected into %d byzantine clients", round_number, _pfl.scaling_factor, _mal_norm, len(context.poisoned_clients))
+                    _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
+                    context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost KD'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
                     if not getattr(config, "mixed_models", False):
                         _pool_g = context.model_pool
                         for st in context.client_states:

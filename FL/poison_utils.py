@@ -16,12 +16,16 @@ def parse_poison_config(poison_arg):
 
 class PoisonedFLState:
     def __init__(self, c0: float):
+        self.initial_scaling_factor = c0
         self.fixed_rand = None
         self.scaling_factor = c0
         self.prev_global = None
+        self.last_grad = None
         self.last_poisoned = None
         self.cached_update = None
         self.last_hypothesis_success = None
+        self.last_aligned = None
+        self.last_dimension = None
 
     def compute_update(self, current_flat: np.ndarray, allow_decay: bool = True):
         fmax = float(np.finfo(np.float32).max)
@@ -31,11 +35,13 @@ class PoisonedFLState:
             rng = np.random.default_rng(42)
             self.fixed_rand = np.where(rng.random(d) < 0.5, 1.0, -1.0).astype(np.float32)
         if self.prev_global is None:
+            self.last_aligned = None
+            self.last_dimension = None
             self.prev_global = current_flat.copy()
             return None
         prev_global = np.nan_to_num(np.asarray(self.prev_global, dtype=np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
         last_grad = current_flat - prev_global
-        history_vec = self.last_poisoned if self.last_poisoned is not None else last_grad
+        history_vec = self.last_grad if self.last_grad is not None else last_grad
         history_vec = np.nan_to_num(np.asarray(history_vec, dtype=np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
         history = history_vec.reshape(d, 1)
         history_norm = float(np.linalg.norm(history))
@@ -51,8 +57,11 @@ class PoisonedFLState:
             sf *= 0.7
         self.scaling_factor = sf
         self.last_hypothesis_success = hypothesis_success
+        self.last_aligned = aligned
+        self.last_dimension = d
         mal_update = np.nan_to_num(sf * history_norm * deviation, nan=0.0, posinf=fmax, neginf=-fmax)
         mal_update = np.clip(mal_update, -fmax, fmax).astype(np.float32)
+        self.last_grad = np.clip(last_grad, -fmax, fmax).astype(np.float32)
         self.last_poisoned = mal_update.copy()
         self.prev_global = current_flat.copy()
         hypothesis = "H1" if hypothesis_success else "H0"
@@ -92,12 +101,15 @@ def poisonedfl_store_round_weights(shared_state, proxy_w, poisoned_w):
     shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
 
 
-def poisonedfl_apply_cached_weights(base_weights, state: PoisonedFLState, track_as_prev: bool = False):
+def poisonedfl_apply_cached_weights(base_weights, state: PoisonedFLState, track_as_prev: bool = False, previous_proxy=None):
     if base_weights is None:
         return None
     fmax = float(np.finfo(np.float32).max)
     base_flat = np.nan_to_num(np.concatenate([w.ravel() for w in base_weights]).astype(np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
     if track_as_prev:
+        if previous_proxy is not None:
+            prev_flat = np.nan_to_num(np.concatenate([w.ravel() for w in previous_proxy]).astype(np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
+            state.last_grad = np.clip(base_flat - prev_flat, -fmax, fmax).astype(np.float32)
         state.prev_global = base_flat.copy()
     mal_update = state.cached_update if state.cached_update is not None else state.last_poisoned
     if mal_update is None:
@@ -110,6 +122,23 @@ def poisonedfl_apply_cached_weights(base_weights, state: PoisonedFLState, track_
         poisoned.append(poisoned_flat[offset:offset + n].reshape(w.shape).astype(w.dtype))
         offset += n
     return poisoned
+
+
+def poisonedfl_log_values(state: PoisonedFLState, distill_loss=None):
+    loss_value = None
+    if distill_loss is not None:
+        if hasattr(distill_loss, "history"):
+            loss_hist = distill_loss.history.get("loss") if isinstance(distill_loss.history, dict) else None
+            if loss_hist:
+                loss_value = float(loss_hist[-1])
+        else:
+            loss_value = float(distill_loss)
+    distill_text = "n/a" if loss_value is None else f"{loss_value:.4f}"
+    alignment_text = "n/a"
+    if state.last_aligned is not None and state.last_dimension is not None:
+        alignment_text = f"{state.last_aligned}/{state.last_dimension}"
+    mal_norm = float(np.linalg.norm(state.cached_update)) if state.cached_update is not None else 0.0
+    return distill_text, float(state.initial_scaling_factor), float(state.scaling_factor), mal_norm, alignment_text
 
 
 def get_or_create_poisoned_clients(partition_type, attack_type, value, ratio, n_clients, seed=42):

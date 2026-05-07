@@ -11,7 +11,7 @@ if _use_tf():
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, poisonedfl_unified_weights, poisonedfl_unified_weights
+from ..poison_utils import parse_poison_config, poisonedfl_log_values, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
@@ -440,7 +440,8 @@ class FederatedDistillation(DistillationStrategy):
                     all_client_logits[st.client_id] = logits
                     all_client_counts_for_round[st.client_id] = counts
                     pool.checkin(st.client_id, m)
-                context.logger.info("Round %s | PoisonedFL | FD byzantine clients unified logits applied", round_number)
+                _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl)
+                context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | FD byzantine clients unified logits applied", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment)
 
         print(f"\n{COLORS.OKCYAN}[STEP 2/3] Aggregating logits per client{COLORS.ENDC}")
         new_global_logits: Dict[int, Dict[int, np.ndarray]] = {}

@@ -12,7 +12,7 @@ if _use_tf():
 from ..colors import COLORS
 from ..context import PipelineContext
 from ..memory import aggressive_memory_cleanup
-from ..poison_utils import PoisonedFLState, parse_poison_config, poisonedfl_unified_weights
+from ..poison_utils import PoisonedFLState, parse_poison_config, poisonedfl_log_values, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
@@ -312,10 +312,10 @@ class FedProto(DistillationStrategy):
                 prototypes, supports = extract_class_prototypes(
                     model, state.paths["train_X"], state.paths["train_y"], context.num_classes,
                 )
-                mal_norm = float(np.linalg.norm(client_pfl.cached_update)) if client_pfl.cached_update is not None else 0.0
+                _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(client_pfl)
                 context.logger.info(
-                    "Round %s | Client %s [POISONEDFL] c=%.4f mal_norm=%.4e | independent poisoned prototypes extracted",
-                    round_number, state.client_id, client_pfl.scaling_factor, mal_norm,
+                    "Round %s | Client %s [POISONEDFL] distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | independent poisoned prototypes extracted",
+                    round_number, state.client_id, _distill_loss, _c0, _c, _mal_norm, _alignment,
                 )
 
             proto_dict: Dict[int, Dict[str, np.ndarray | int]] = {}

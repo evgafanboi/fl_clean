@@ -14,7 +14,7 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
 from .base import DistillationStrategy
 from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset, poisonedfl_ghost_model_type
 from .robust_filter import CronusRobustFilter
@@ -445,6 +445,7 @@ class Cronus(DistillationStrategy):
             ghost_arch = poisonedfl_ghost_model_type(cfg)
             retry_proxy = context.shared_state.get("poisonedfl_proxy_w")
             ghost_w = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
+            ghost_distill_loss = None
             if ghost_w is None:
                 ghost_model = create_model(context.input_dim, context.num_classes,
                                            cfg.batch_size, model_type=ghost_arch)
@@ -462,7 +463,7 @@ class Cronus(DistillationStrategy):
                 ds_ghost = _make_public_only_dataset(
                     prev_pub, prev_pseudo,
                     context.input_dim, context.num_classes, cfg.batch_size)
-                ghost_model.fit(ds_ghost, epochs=cfg.epochs)
+                ghost_distill_loss = ghost_model.fit(ds_ghost, epochs=cfg.epochs)
                 del ds_ghost
                 ghost_w = ghost_model.get_weights()
                 del ghost_model
@@ -490,7 +491,7 @@ class Cronus(DistillationStrategy):
                 del ds_ghost
                 ghost_w = ghost_model.get_weights()
                 del ghost_model
-                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True)
+                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
             poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
             if not _mixed:
                 from ..memory import clear_session
@@ -519,7 +520,8 @@ class Cronus(DistillationStrategy):
                 del _counts
             if _mixed:
                 del poison_model
-            context.logger.info("Round %s | PoisonedFL | Ghost model injected into %d byzantine clients", round_number, len(context.poisoned_clients))
+            _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
+            context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost model injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
             del poisoned_w
 
         del open_X

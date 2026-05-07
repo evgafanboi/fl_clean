@@ -17,7 +17,7 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, ModelPool
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, load_public_dataset_from_clients, lma_targets, numpy_from_dataset, poisonedfl_ghost_model_type
@@ -557,7 +557,7 @@ class SSFLIDS(DistillationStrategy):
             ghost_start = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
             if ghost_start is not None:
                 ghost.set_weights(ghost_start)
-            ghost.fit(public_ds, epochs=config.dist_rounds, verbose=0)
+            ghost_distill_loss = ghost.fit(public_ds, epochs=config.dist_rounds, verbose=0)
             ghost_w = ghost.get_weights()
             del ghost
             poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
@@ -573,13 +573,14 @@ class SSFLIDS(DistillationStrategy):
                 ghost.fit(public_ds, epochs=config.dist_rounds, verbose=0)
                 ghost_w = ghost.get_weights()
                 del ghost
-                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True)
+                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
             poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
             if not _mixed:
                 for st in context.client_states:
                     if st.client_id in context.poisoned_clients:
                         st.data["w"] = poisoned_w
-            context.logger.info("Round %s | PoisonedFL | Ghost trained on public_ds, injected into %d byzantine clients", round_number, len(context.poisoned_clients))
+            _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
+            context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost trained on public_ds, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
             del ghost_w, poisoned_w
             aggressive_memory_cleanup()
 

@@ -13,7 +13,7 @@ from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
 from .base import DistillationStrategy
-from ..poison_utils import poisonedfl_apply_cached_weights, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights, parse_poison_config
+from ..poison_utils import poisonedfl_apply_cached_weights, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights, parse_poison_config
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import (
     create_model,
@@ -80,6 +80,7 @@ def _digest_phase_pt(model_wrapper, consensus_logits, public_features, batch_siz
     n_samples = len(public_features)
     X_t = torch.from_numpy(public_features.astype(np.float32))
     C_t = torch.from_numpy(consensus_logits.astype(np.float32))
+    final_loss = None
     for epoch in range(epochs):
         perm = torch.randperm(n_samples)
         epoch_loss, batches = 0.0, 0
@@ -94,7 +95,9 @@ def _digest_phase_pt(model_wrapper, consensus_logits, public_features, batch_siz
             opt.step()
             epoch_loss += loss.item()
             batches += 1
-        print(f"    DIGEST epoch {epoch + 1}/{epochs} - MSE {epoch_loss / max(batches, 1):.4f}")
+        final_loss = epoch_loss / max(batches, 1)
+        print(f"    DIGEST epoch {epoch + 1}/{epochs} - MSE {final_loss:.4f}")
+    return final_loss
 
 
 def digest_phase(
@@ -103,7 +106,7 @@ def digest_phase(
     public_features: np.ndarray,
     batch_size: int,
     epochs: int,
-) -> None:
+) -> float | None:
     if not _use_tf():
         return _digest_phase_pt(model_wrapper, consensus_logits, public_features, batch_size, epochs)
     keras_model = model_wrapper.model if hasattr(model_wrapper, "model") else model_wrapper
@@ -129,6 +132,7 @@ def digest_phase(
     train_step = model_wrapper._fedmd_train_step
 
     n_samples = len(public_features)
+    final_loss = None
     for epoch in range(epochs):
         perm = np.random.permutation(n_samples)
         epoch_loss = 0.0
@@ -141,7 +145,9 @@ def digest_phase(
             batches += 1
 
         if batches > 0:
-            print(f"    DIGEST epoch {epoch + 1}/{epochs} - MSE {epoch_loss / batches:.4f}")
+            final_loss = epoch_loss / batches
+            print(f"    DIGEST epoch {epoch + 1}/{epochs} - MSE {final_loss:.4f}")
+    return final_loss
 
 
 def revisit_phase(model_wrapper, private_dataset: tf.data.Dataset, epochs: int) -> None:
@@ -349,7 +355,7 @@ class FedMD(DistillationStrategy):
             ghost_start = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
             if ghost_start is not None:
                 ghost.set_weights(ghost_start)
-            digest_phase(ghost, consensus_logits, public_features, config.batch_size, self.digest_epochs)
+            ghost_distill_loss = digest_phase(ghost, consensus_logits, public_features, config.batch_size, self.digest_epochs)
             ghost_w = ghost.get_weights()
             del ghost
             poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
@@ -365,14 +371,15 @@ class FedMD(DistillationStrategy):
                 digest_phase(ghost, consensus_logits, public_features, config.batch_size, self.digest_epochs)
                 ghost_w = ghost.get_weights()
                 del ghost
-                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True)
+                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
             poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
+            _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
             for st in context.client_states:
                 if st.client_id in context.poisoned_clients:
                     m = pool.checkout(st.client_id)
                     m.set_weights(poisoned_w)
                     pool.checkin(st.client_id, m)
-            context.logger.info("Round %s | PoisonedFL | Ghost digest'd, injected into %d byzantine clients", round_number, len(context.poisoned_clients))
+            context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost digest'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
             del ghost_w, poisoned_w
             aggressive_memory_cleanup()
 

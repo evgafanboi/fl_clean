@@ -14,7 +14,7 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_unified_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_log_values, poisonedfl_unified_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, load_public_dataset_from_clients, lma_logits as _lma_logits, numpy_from_dataset
@@ -413,10 +413,10 @@ class FedDistillExpGuard(DistillationStrategy):
                 if st.client_id not in soft_client_ids:
                     soft_client_ids.append(st.client_id)
             del poison_model
-            _mal_norm = float(np.linalg.norm(_pfl.cached_update)) if _pfl.cached_update is not None else 0.0
+            _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl)
             context.logger.info(
-                "Round %s | PoisonedFL | c=%.4f mal_norm=%.4e | Ghost global model generated soft labels for %d clients",
-                round_number, _pfl.scaling_factor, _mal_norm, len(context.poisoned_clients),
+                "Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost global model generated soft labels for %d clients",
+                round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients),
             )
 
         from ..memory import clear_session

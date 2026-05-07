@@ -14,7 +14,7 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, ModelPool
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, lma_targets, load_public_dataset_from_clients, numpy_from_dataset, poisonedfl_ghost_model_type
@@ -64,7 +64,7 @@ def _predict_hard_labels(
     np.save(output_path, hard)
 
 
-def _hamming_filter(pred_files: List[str], tau: float, logger=None, round_number=None) -> List[int]:
+def _hamming_filter(pred_files: List[str], tau: float, logger=None, round_number=None, client_ids=None) -> List[int]:
     """
     Compute per-client harmonic mean of pairwise Hamming distances.
     Threshold = tau * mean(HM_i), range [0.5, 1.0].
@@ -97,7 +97,8 @@ def _hamming_filter(pred_files: List[str], tau: float, logger=None, round_number
     for i in range(K):
         tag = "PASS" if hm_scores[i] < threshold else "REJECT"
         if logger is not None:
-            logger.info("Round %s | HammingFilter | client_file_idx=%d | HM=%.4f | %s", round_number, i, hm_scores[i], tag)
+            client_id = client_ids[i] if client_ids is not None and i < len(client_ids) else i
+            logger.info("Round %s | HammingFilter | client_file_idx=%d | client_id=%s | HM=%.4f | %s", round_number, i, client_id, hm_scores[i], tag)
         if hm_scores[i] < threshold:
             survivors.append(i)
 
@@ -379,6 +380,11 @@ class FedKDIDS(DistillationStrategy):
                 context.logger.info("Round %s | Client %s [POISONED] | top3 pred-argmax: %s", round_number, cid, ghost_top)
             del ghost_hard, ghost_counts
 
+        if pred_files and len(pred_files) == len(pred_client_ids):
+            ordered = sorted(zip(pred_client_ids, pred_files), key=lambda item: item[0])
+            pred_client_ids = [cid for cid, _ in ordered]
+            pred_files = [path for _, path in ordered]
+
         context.logger.info("Round %s | StageI | prediction files=%d clients=%d", round_number, len(pred_files), len(pred_client_ids))
 
         del open_feature
@@ -387,7 +393,7 @@ class FedKDIDS(DistillationStrategy):
         # ---- Hamming filter (Verifier) ----
         print(f"\n{COLORS.HEADER}Round {round_number} Verifier (Hamming filter, tau={tau}){COLORS.ENDC}")
         if not skip_stage2_init and pred_files:
-            survivor_local_idx = _hamming_filter(pred_files, tau, logger=context.logger, round_number=round_number)
+            survivor_local_idx = _hamming_filter(pred_files, tau, logger=context.logger, round_number=round_number, client_ids=pred_client_ids)
             filtered_pred_files = [pred_files[i] for i in survivor_local_idx]
             filtered_cids = [pred_client_ids[i] for i in survivor_local_idx]
             rejected_cids = [pred_client_ids[i] for i in range(len(pred_files)) if i not in set(survivor_local_idx)]
@@ -499,7 +505,7 @@ class FedKDIDS(DistillationStrategy):
             if ghost_start is not None:
                 ghost.set_weights(ghost_start)
             print(f"{COLORS.WARNING}  [PoisonedFL] Ghost model generating logits for {len(context.poisoned_clients)} byzantine clients{COLORS.ENDC}")
-            ghost.fit(public_ds, epochs=config.dist_rounds, verbose=0)
+            ghost_distill_loss = ghost.fit(public_ds, epochs=config.dist_rounds, verbose=0)
             ghost_w = ghost.get_weights()
             del ghost
             poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
@@ -515,16 +521,16 @@ class FedKDIDS(DistillationStrategy):
                 ghost.fit(public_ds, epochs=config.dist_rounds, verbose=0)
                 ghost_w = ghost.get_weights()
                 del ghost
-                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True)
+                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
             poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
             if not _mixed:
                 for st in context.client_states:
                     if st.client_id in context.poisoned_clients:
                         st.data["w"] = poisoned_w
-            _mal_norm = float(np.linalg.norm(_pfl.cached_update)) if _pfl.cached_update is not None else 0.0
+            _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
             context.logger.info(
-                "Round %s | PoisonedFL | c=%.4f mal_norm=%.4e | Ghost trained on public_ds, injected into %d byzantine clients",
-                round_number, _pfl.scaling_factor, _mal_norm, len(context.poisoned_clients),
+                "Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost trained on public_ds, injected into %d byzantine clients",
+                round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients),
             )
             del ghost_w, poisoned_w
             aggressive_memory_cleanup()
