@@ -905,6 +905,7 @@ class FederatedLearningPipeline:
         if self.poison_attack == "poisonedfl" and client_id in self.poisoned_clients:
             state = self.poisoned_fl_state
             if state.cached_update is not None and latest_weights is not None:
+                state.has_applied_poison = True
                 offset, poisoned = 0, []
                 for w in latest_weights:
                     n = w.size

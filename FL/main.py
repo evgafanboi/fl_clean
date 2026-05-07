@@ -43,6 +43,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robust_threshold", type=float, default=0.75, help="AdaptiveRobustFilter tail score threshold")
     parser.add_argument("--robust_workers", type=int, default=16, help="Ours robust filter row-block worker threads")
     parser.add_argument("--robust_filter_v2", action="store_true", help="Ours: use one-removal-per-pass iterative robust filter")
+    parser.add_argument("--robust_filter_cronus", action="store_true", help="Ours: use pooled Cronus robust filter")
     # cronus
     parser.add_argument("--remove_dis", action="store_true", help="Cronus: use plain softmax predictions")
     # fedssd
@@ -58,8 +59,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda1", type=float, default=1.0, help="Weight for hybrid CE loss (for FedMLB)")
     parser.add_argument("--lambda2", type=float, default=1.0, help="Weight for KL divergence loss (for FedMLB)")
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for KL divergence (for FedMLB)")
-
-
+    
     # exp1
     parser.add_argument("--exp1_lambda", type=float, default=1.0, help="Lambda for KLD loss in Exp1 (L = CE + lambda * KLD)")
     parser.add_argument("--exp1_temperature", type=float, default=3.0, help="Temperature for KL divergence in Exp1")
@@ -183,6 +183,7 @@ def main(argv=None):
             robust_threshold=args.robust_threshold,
             robust_workers=args.robust_workers,
             robust_filter_v2=args.robust_filter_v2,
+            robust_filter_cronus=args.robust_filter_cronus,
             remove_dis=args.remove_dis,
             checkpoint=args.checkpoint,
             cleanup_interval=args.cleanup_interval,

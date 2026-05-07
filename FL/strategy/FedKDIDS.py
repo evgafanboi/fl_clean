@@ -522,7 +522,7 @@ class FedKDIDS(DistillationStrategy):
                 ghost_w = ghost.get_weights()
                 del ghost
                 poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
-            poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
+            poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w, _pfl)
             if not _mixed:
                 for st in context.client_states:
                     if st.client_id in context.poisoned_clients:

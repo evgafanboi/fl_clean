@@ -19,6 +19,7 @@ class PoisonedFLState:
         self.initial_scaling_factor = c0
         self.fixed_rand = None
         self.scaling_factor = c0
+        self.has_applied_poison = False
         self.prev_global = None
         self.last_grad = None
         self.last_poisoned = None
@@ -49,23 +50,33 @@ class PoisonedFLState:
         residual = history - last_grad.reshape(d, 1) * history_norm / (last_grad_norm + 1e-9)
         scale = np.nan_to_num(np.linalg.norm(residual, axis=1), nan=0.0, posinf=fmax, neginf=0.0)
         deviation = np.nan_to_num(scale * self.fixed_rand / (float(np.linalg.norm(scale)) + 1e-9), nan=0.0, posinf=1.0, neginf=-1.0)
-        aligned = int(np.sum(np.sign(last_grad) == self.fixed_rand))
-        k_99 = int(d / 2 + 2.326 * np.sqrt(d) / 2)
-        hypothesis_success = aligned >= k_99
         sf = self.scaling_factor
-        if allow_decay and not hypothesis_success and sf * 0.7 >= 0.5:
-            sf *= 0.7
+        if self.has_applied_poison:
+            aligned = int(np.sum(np.sign(last_grad) == self.fixed_rand))
+            k_99 = int(d / 2 + 2.326 * np.sqrt(d) / 2)
+            hypothesis_success = aligned >= k_99
+            if allow_decay and not hypothesis_success and sf * 0.7 >= 0.5:
+                sf *= 0.7
+            self.last_aligned = aligned
+            self.last_dimension = d
+        else:
+            aligned = None
+            k_99 = None
+            hypothesis_success = None
+            self.last_aligned = None
+            self.last_dimension = None
         self.scaling_factor = sf
         self.last_hypothesis_success = hypothesis_success
-        self.last_aligned = aligned
-        self.last_dimension = d
         mal_update = np.nan_to_num(sf * history_norm * deviation, nan=0.0, posinf=fmax, neginf=-fmax)
         mal_update = np.clip(mal_update, -fmax, fmax).astype(np.float32)
         self.last_grad = np.clip(last_grad, -fmax, fmax).astype(np.float32)
         self.last_poisoned = mal_update.copy()
         self.prev_global = current_flat.copy()
-        hypothesis = "H1" if hypothesis_success else "H0"
-        print(f"  [PoisonedFL] {hypothesis} c={sf:.4f}, aligned={aligned}/{d} (k99={k_99}), mal_norm={float(np.linalg.norm(mal_update)):.4e}")
+        if hypothesis_success is None:
+            print(f"  [PoisonedFL] armed c={sf:.4f}, hypothesis deferred, mal_norm={float(np.linalg.norm(mal_update)):.4e}")
+        else:
+            hypothesis = "H1" if hypothesis_success else "H0"
+            print(f"  [PoisonedFL] {hypothesis} c={sf:.4f}, aligned={aligned}/{d} (k99={k_99}), mal_norm={float(np.linalg.norm(mal_update)):.4e}")
         return mal_update
 
 
@@ -96,9 +107,11 @@ def poisonedfl_warmstart_weights(shared_state, state: PoisonedFLState, fallback=
     return [w.copy() for w in selected]
 
 
-def poisonedfl_store_round_weights(shared_state, proxy_w, poisoned_w):
+def poisonedfl_store_round_weights(shared_state, proxy_w, poisoned_w, state: PoisonedFLState = None):
     shared_state["poisonedfl_proxy_w"] = [w.copy() for w in proxy_w]
     shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
+    if state is not None and state.cached_update is not None:
+        state.has_applied_poison = True
 
 
 def poisonedfl_apply_cached_weights(base_weights, state: PoisonedFLState, track_as_prev: bool = False, previous_proxy=None):

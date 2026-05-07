@@ -17,7 +17,7 @@ from ..context import PipelineContext
 from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
-from .robust_filter import AdaptiveRobustFilter, IterativeRobustFilter
+from .robust_filter import AdaptiveRobustFilter, CronusRobustFilter, IterativeRobustFilter
 from .common import (
     create_model,
     create_private_dataset,
@@ -420,17 +420,25 @@ class Ours(DistillationStrategy):
         super().__init__(config)
         self.kd_epochs = getattr(config, "kd_epochs", 1)
         self.ce_epochs = config.epochs
-        filter_cls = IterativeRobustFilter if getattr(config, "robust_filter_v2", False) else AdaptiveRobustFilter
-        self.robust_filter = filter_cls(
-            budget=getattr(config, "robust_rm_budget", None) or 0,
-            tail_threshold=getattr(config, "robust_threshold", 0.75),
-            workers=getattr(config, "robust_workers", 8),
-        )
+        if getattr(config, "robust_filter_cronus", False):
+            self.robust_filter = CronusRobustFilter(
+                budget=getattr(config, "robust_rm_budget", None) or 0,
+                workers=getattr(config, "robust_workers", 8),
+            )
+        else:
+            filter_cls = IterativeRobustFilter if getattr(config, "robust_filter_v2", False) else AdaptiveRobustFilter
+            self.robust_filter = filter_cls(
+                budget=getattr(config, "robust_rm_budget", None) or 0,
+                tail_threshold=getattr(config, "robust_threshold", 0.75),
+                workers=getattr(config, "robust_workers", 8),
+            )
 
     def extra_log_tokens(self) -> Dict[str, float]:
         budget = getattr(self.config, "robust_rm_budget", 0)
         tokens = {"kd": self.config.ours_kd, "ekd_lambda": self.config.ours_ekd_lambda, "budget": budget}
-        if getattr(self.config, "robust_filter_v2", False):
+        if getattr(self.config, "robust_filter_cronus", False):
+            tokens["robust_filter"] = "cronus"
+        elif getattr(self.config, "robust_filter_v2", False):
             tokens["robust_filter"] = "v2"
         if self.config.ours_kd == "abkd":
             tokens.update({"ab_alpha": self.config.ab_alpha, "ab_beta": self.config.ab_beta, "temperature": self.config.ours_temperature})
@@ -816,7 +824,7 @@ class Ours(DistillationStrategy):
                     ghost_w = ghost.get_weights()
                     del ghost
                     poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
-                poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
+                poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w, _pfl)
                 _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
                 context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost KD'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
                 if not getattr(config, "mixed_models", False):
@@ -921,7 +929,7 @@ class Ours(DistillationStrategy):
                         ghost_w = ghost.get_weights()
                         del ghost
                         poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
-                    poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w)
+                    poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w, _pfl)
                     _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
                     context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost KD'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
                     if not getattr(config, "mixed_models", False):
