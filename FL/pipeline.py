@@ -1939,6 +1939,8 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     _mixed = getattr(config, 'mixed_models', False)
     _eval_model_arch = model_type
     eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
+    attack_type, _, _ = parse_poison_config(getattr(config, 'poison', None))
+    _poisonedfl_eval = attack_type == "poisonedfl" and bool(context.poisoned_clients)
 
     for round_number in range(config.rounds, 0, -1):
         if round_number in evaluated_rounds:
@@ -1956,6 +1958,10 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                 logger.info(f"Round {round_number} | SKIPPED (no weight record)")
                 print(f"{COLORS.WARNING}Round {round_number}: skipped (no weight record){COLORS.ENDC}")
                 continue
+            if _eval_model_arch != model_type:
+                del eval_model
+                eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
+                _eval_model_arch = model_type
 
             with open(weight_path, "rb") as _f:
                 weights = pickle.load(_f)
@@ -1987,8 +1993,24 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     continue
                 if client_bins:
                     round_metrics: dict[int, dict] = {}
+                    ghost_bin_path = None
+                    ghost_cid = None
                     for bin_path in client_bins:
                         cid = int(os.path.basename(bin_path).split("_")[1])
+                        if _poisonedfl_eval and cid in context.poisoned_clients:
+                            if ghost_bin_path is None:
+                                ghost_bin_path = bin_path
+                                ghost_cid = cid
+                            logger.info("Round %s | Client %s | [byzantine, skipped]", round_number, cid)
+                            print(f"{COLORS.WARNING}Client {cid}: [byzantine, skipped]{COLORS.ENDC}")
+                            continue
+                        if _mixed:
+                            from models.mixed_models import get_model_type_for_client
+                            arch = get_model_type_for_client(cid, n_clients)
+                            if arch != _eval_model_arch:
+                                del eval_model
+                                eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=arch)
+                                _eval_model_arch = arch
                         with open(bin_path, "rb") as _f:
                             c_weights = pickle.load(_f)
                         eval_model.set_weights(c_weights)
@@ -1998,14 +2020,15 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
                                     round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["Loss"])
                         print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
-                    avg = {k: float(np.mean([v[k] for v in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
-                    round_metrics[-1] = avg
-                    _record_metrics(context, round_number, round_metrics, excel_filename)
-                    logger.info("Round %s | AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                                round_number, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["Loss"])
-                    print(f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
-                          f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
-                    if context.poisoned_clients:
+                    if round_metrics:
+                        _record_metrics(context, round_number, round_metrics, excel_filename)
+                        avg = {k: float(np.mean([v[k] for v in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
+                        _record_metrics(context, round_number, {(-3 if _poisonedfl_eval else -1): avg}, excel_filename)
+                        logger.info("Round %s | AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                                    round_number, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["Loss"])
+                        print(f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
+                              f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
+                    if context.poisoned_clients and not _poisonedfl_eval:
                         _benign_cids = [c for c in round_metrics if c >= 0 and c not in context.poisoned_clients]
                         if _benign_cids:
                             _b_avg = {k: float(np.mean([round_metrics[c][k] for c in _benign_cids])) for k in avg}
@@ -2014,7 +2037,29 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                                         round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["Loss"])
                             print(f"{COLORS.OKGREEN}Round {round_number} Benign Avg | Acc={_b_avg['Acc']:.4f}, F1={_b_avg['F1']:.4f}, "
                                   f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}")
+                    if ghost_bin_path is not None:
+                        if _mixed:
+                            from models.mixed_models import get_model_type_for_client
+                            ghost_arch = get_model_type_for_client(ghost_cid, n_clients)
+                            if ghost_arch != _eval_model_arch:
+                                del eval_model
+                                eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=ghost_arch)
+                                _eval_model_arch = ghost_arch
+                        with open(ghost_bin_path, "rb") as _f:
+                            ghost_weights = pickle.load(_f)
+                        eval_model.set_weights(ghost_weights)
+                        del ghost_weights
+                        ghost_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
+                        _record_metrics(context, round_number, {-1: ghost_metrics}, excel_filename)
+                        logger.info("Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                                    round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["Loss"])
+                        print(f"{COLORS.OKGREEN}Round {round_number} PoisonedFL ghost | Acc={ghost_metrics['Acc']:.4f}, F1={ghost_metrics['F1']:.4f}, "
+                              f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}")
                 if os.path.exists(global_weight_path):
+                    if _eval_model_arch != model_type:
+                        del eval_model
+                        eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
+                        _eval_model_arch = model_type
                     with open(global_weight_path, "rb") as _f:
                         g_weights = pickle.load(_f)
                     eval_model.set_weights(g_weights)
@@ -2027,6 +2072,10 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     print(f"{COLORS.OKGREEN}Round {round_number} Global | Acc={g_metrics['Acc']:.4f}, F1={g_metrics['F1']:.4f}, "
                           f"Precision={g_metrics['Precision']:.4f}, Recall={g_metrics['Recall']:.4f}, Loss={g_metrics['Loss']:.4f}{COLORS.ENDC}")
             elif os.path.exists(global_weight_path):
+                if _eval_model_arch != model_type:
+                    del eval_model
+                    eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
+                    _eval_model_arch = model_type
                 with open(global_weight_path, "rb") as _f:
                     g_weights = pickle.load(_f)
                 eval_model.set_weights(g_weights)
@@ -2049,8 +2098,17 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     print(f"{COLORS.WARNING}Round {round_number}: skipped (no weight record){COLORS.ENDC}")
                     continue
                 round_metrics: dict[int, dict] = {}
+                ghost_bin_path = None
+                ghost_cid = None
                 for bin_path in client_bins:
                     cid = int(os.path.basename(bin_path).split("_")[1])
+                    if _poisonedfl_eval and cid in context.poisoned_clients:
+                        if ghost_bin_path is None:
+                            ghost_bin_path = bin_path
+                            ghost_cid = cid
+                        logger.info("Round %s | Client %s | [byzantine, skipped]", round_number, cid)
+                        print(f"{COLORS.WARNING}Client {cid}: [byzantine, skipped]{COLORS.ENDC}")
+                        continue
                     if _mixed:
                         from models.mixed_models import get_model_type_for_client
                         arch = get_model_type_for_client(cid, n_clients)
@@ -2067,18 +2125,19 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
                                 round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["Loss"])
                     print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
-                avg = {k: float(np.mean([m[k] for m in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
-                round_metrics[-1] = avg
-                _record_metrics(context, round_number, round_metrics, excel_filename)
-                logger.info(
-                    "Round %s | AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                    round_number, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["Loss"],
-                )
-                print(
-                    f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
-                    f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
-                )
-                if context.poisoned_clients:
+                if round_metrics:
+                    _record_metrics(context, round_number, round_metrics, excel_filename)
+                    avg = {k: float(np.mean([m[k] for m in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
+                    _record_metrics(context, round_number, {(-3 if _poisonedfl_eval else -1): avg}, excel_filename)
+                    logger.info(
+                        "Round %s | AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                        round_number, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["Loss"],
+                    )
+                    print(
+                        f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
+                        f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
+                    )
+                if context.poisoned_clients and not _poisonedfl_eval:
                     _benign_cids = [c for c in round_metrics if c >= 0 and c not in context.poisoned_clients]
                     if _benign_cids:
                         _b_avg = {k: float(np.mean([round_metrics[c][k] for c in _benign_cids])) for k in avg}
@@ -2091,6 +2150,28 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                             f"{COLORS.OKGREEN}Round {round_number} Benign Avg | Acc={_b_avg['Acc']:.4f}, F1={_b_avg['F1']:.4f}, "
                             f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}"
                         )
+                if ghost_bin_path is not None:
+                    if _mixed:
+                        from models.mixed_models import get_model_type_for_client
+                        ghost_arch = get_model_type_for_client(ghost_cid, n_clients)
+                        if ghost_arch != _eval_model_arch:
+                            del eval_model
+                            eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=ghost_arch)
+                            _eval_model_arch = ghost_arch
+                    with open(ghost_bin_path, "rb") as _f:
+                        ghost_weights = pickle.load(_f)
+                    eval_model.set_weights(ghost_weights)
+                    del ghost_weights
+                    ghost_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
+                    _record_metrics(context, round_number, {-1: ghost_metrics}, excel_filename)
+                    logger.info(
+                        "Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                        round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["Loss"],
+                    )
+                    print(
+                        f"{COLORS.OKGREEN}Round {round_number} PoisonedFL ghost | Acc={ghost_metrics['Acc']:.4f}, F1={ghost_metrics['F1']:.4f}, "
+                        f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}"
+                    )
 
     del eval_model, X_test, y_test, test_labels
     if context.results:

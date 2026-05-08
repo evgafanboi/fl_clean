@@ -14,7 +14,7 @@ from tqdm import tqdm
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_apply_cached_weights, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .robust_filter import AdaptiveRobustFilter, CronusRobustFilter, IterativeRobustFilter
@@ -487,7 +487,7 @@ class Ours(DistillationStrategy):
         _pfl_gen = getattr(context, 'poisoned_fl_state', None)
         _ghost_bytes = None
         _ghost_shape = None
-        _ghost_warm = poisonedfl_warmstart_weights(context.shared_state, _pfl_gen, fallback=context.shared_state.get("init_w")) if _pfl_gen is not None else None
+        _ghost_warm = poisonedfl_warmstart_weights(context.shared_state, _pfl_gen, fallback=context.shared_state.get("init_w"), prefer_poisoned=True) if _pfl_gen is not None else None
         if _pfl_gen is not None and context.poisoned_clients and _ghost_warm is not None:
             print(f"{COLORS.WARNING}  [PoisonedFL] Ghost model generating logits for {len(context.poisoned_clients)} byzantine clients{COLORS.ENDC}")
             _gm = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
@@ -624,7 +624,7 @@ class Ours(DistillationStrategy):
             if (client_idx + 1) % cleanup_interval == 0:
                 aggressive_memory_cleanup()
 
-        _ghost_warm = poisonedfl_warmstart_weights(context.shared_state, _pfl_m, fallback=context.shared_state.get("init_w")) if _pfl_m is not None else None
+        _ghost_warm = poisonedfl_warmstart_weights(context.shared_state, _pfl_m, fallback=context.shared_state.get("init_w"), prefer_poisoned=True) if _pfl_m is not None else None
         if _pfl_m is not None and context.poisoned_clients and _ghost_warm is not None:
             _gm = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
             _gm.set_weights(_ghost_warm)
@@ -793,7 +793,6 @@ class Ours(DistillationStrategy):
             self._run_kd_stage(context, consensus_logits, public_features, first_client=first_kd)
             if _pfl is not None and context.poisoned_clients:
                 _kd_m = getattr(config, "ours_kd", "ekd")
-                retry_proxy = context.shared_state.get("poisonedfl_proxy_w")
                 ghost = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
                 ghost_start = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
                 if ghost_start is not None:
@@ -807,23 +806,6 @@ class Ours(DistillationStrategy):
                 ghost_w = ghost.get_weights()
                 del ghost
                 poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
-                if (
-                    _pfl.last_hypothesis_success is False
-                    and _pfl.last_poisoned is not None
-                    and retry_proxy is not None
-                ):
-                    context.logger.info("Round %s | PoisonedFL | H0 -> retry ghost KD from previous unpoisoned proxy", round_number)
-                    ghost = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
-                    ghost.set_weights([w.copy() for w in retry_proxy])
-                    if _kd_m == "abkd":
-                        abkd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
-                                   config.ab_alpha, config.ab_beta, config.ours_temperature)
-                    else:
-                        ekd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
-                                  getattr(config, "ours_ekd_lambda", 1.0))
-                    ghost_w = ghost.get_weights()
-                    del ghost
-                    poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
                 poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w, _pfl)
                 _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
                 context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost KD'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
@@ -898,7 +880,6 @@ class Ours(DistillationStrategy):
                 self._run_kd_stage(context, consensus_logits, public_features, first_client=first_kd)
                 if _pfl is not None and context.poisoned_clients:
                     _kd_m = getattr(config, "ours_kd", "ekd")
-                    retry_proxy = context.shared_state.get("poisonedfl_proxy_w")
                     ghost = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
                     ghost_start = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
                     if ghost_start is not None:
@@ -912,23 +893,6 @@ class Ours(DistillationStrategy):
                     ghost_w = ghost.get_weights()
                     del ghost
                     poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
-                    if (
-                        _pfl.last_hypothesis_success is False
-                        and _pfl.last_poisoned is not None
-                        and retry_proxy is not None
-                    ):
-                        context.logger.info("Round %s | PoisonedFL | H0 -> retry ghost KD from previous unpoisoned proxy", round_number)
-                        ghost = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
-                        ghost.set_weights([w.copy() for w in retry_proxy])
-                        if _kd_m == "abkd":
-                            abkd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
-                                       config.ab_alpha, config.ab_beta, config.ours_temperature)
-                        else:
-                            ekd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
-                                      getattr(config, "ours_ekd_lambda", 1.0))
-                        ghost_w = ghost.get_weights()
-                        del ghost
-                        poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
                     poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w, _pfl)
                     _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
                     context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost KD'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))

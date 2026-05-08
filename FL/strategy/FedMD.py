@@ -13,7 +13,7 @@ from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
 from .base import DistillationStrategy
-from ..poison_utils import poisonedfl_apply_cached_weights, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights, parse_poison_config
+from ..poison_utils import poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights, parse_poison_config
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import (
     create_model,
@@ -349,7 +349,6 @@ class FedMD(DistillationStrategy):
         # ---- PoisonedFL: ghost model (digest only, no private data) ----
         _pfl = getattr(context, 'poisoned_fl_state', None)
         if _pfl is not None and context.poisoned_clients:
-            retry_proxy = context.shared_state.get("poisonedfl_proxy_w")
             ghost = create_model(context.input_dim, context.num_classes,
                                  config.batch_size, model_type=config.model_type)
             ghost_start = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
@@ -359,19 +358,6 @@ class FedMD(DistillationStrategy):
             ghost_w = ghost.get_weights()
             del ghost
             poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
-            if (
-                _pfl.last_hypothesis_success is False
-                and _pfl.last_poisoned is not None
-                and retry_proxy is not None
-            ):
-                context.logger.info("Round %s | PoisonedFL | H0 -> retry digest from previous unpoisoned proxy", round_number)
-                ghost = create_model(context.input_dim, context.num_classes,
-                                     config.batch_size, model_type=config.model_type)
-                ghost.set_weights([w.copy() for w in retry_proxy])
-                digest_phase(ghost, consensus_logits, public_features, config.batch_size, self.digest_epochs)
-                ghost_w = ghost.get_weights()
-                del ghost
-                poisoned_w = poisonedfl_apply_cached_weights(ghost_w, _pfl, track_as_prev=True, previous_proxy=retry_proxy)
             poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w, _pfl)
             _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
             for st in context.client_states:

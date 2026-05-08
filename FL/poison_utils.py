@@ -98,10 +98,13 @@ def poisonedfl_unified_weights(byz_weights_list, state: PoisonedFLState, allow_d
     return poisoned
 
 
-def poisonedfl_warmstart_weights(shared_state, state: PoisonedFLState, fallback=None):
+def poisonedfl_warmstart_weights(shared_state, state: PoisonedFLState, fallback=None, prefer_poisoned: bool = False):
     proxy_w = shared_state.get("poisonedfl_proxy_w")
     poisoned_w = shared_state.get("poisonedfl_ghost_w")
-    selected = poisoned_w or proxy_w or fallback
+    if prefer_poisoned:
+        selected = poisoned_w or proxy_w or fallback
+    else:
+        selected = proxy_w or poisoned_w or fallback
     if selected is None:
         return None
     return [w.copy() for w in selected]
@@ -114,30 +117,7 @@ def poisonedfl_store_round_weights(shared_state, proxy_w, poisoned_w, state: Poi
         state.has_applied_poison = True
 
 
-def poisonedfl_apply_cached_weights(base_weights, state: PoisonedFLState, track_as_prev: bool = False, previous_proxy=None):
-    if base_weights is None:
-        return None
-    fmax = float(np.finfo(np.float32).max)
-    base_flat = np.nan_to_num(np.concatenate([w.ravel() for w in base_weights]).astype(np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
-    if track_as_prev:
-        if previous_proxy is not None:
-            prev_flat = np.nan_to_num(np.concatenate([w.ravel() for w in previous_proxy]).astype(np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
-            state.last_grad = np.clip(base_flat - prev_flat, -fmax, fmax).astype(np.float32)
-        state.prev_global = base_flat.copy()
-    mal_update = state.cached_update if state.cached_update is not None else state.last_poisoned
-    if mal_update is None:
-        return [w.copy() for w in base_weights]
-    poisoned_flat = np.nan_to_num(base_flat + np.asarray(mal_update, dtype=np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
-    poisoned_flat = np.clip(poisoned_flat, -fmax, fmax)
-    offset, poisoned = 0, []
-    for w in base_weights:
-        n = w.size
-        poisoned.append(poisoned_flat[offset:offset + n].reshape(w.shape).astype(w.dtype))
-        offset += n
-    return poisoned
-
-
-def poisonedfl_log_values(state: PoisonedFLState, distill_loss=None):
+def poisonedfl_distill_loss_text(distill_loss):
     loss_value = None
     if distill_loss is not None:
         if hasattr(distill_loss, "history"):
@@ -146,7 +126,11 @@ def poisonedfl_log_values(state: PoisonedFLState, distill_loss=None):
                 loss_value = float(loss_hist[-1])
         else:
             loss_value = float(distill_loss)
-    distill_text = "n/a" if loss_value is None else f"{loss_value:.4f}"
+    return "n/a" if loss_value is None else f"{loss_value:.4f}"
+
+
+def poisonedfl_log_values(state: PoisonedFLState, distill_loss=None):
+    distill_text = poisonedfl_distill_loss_text(distill_loss)
     alignment_text = "n/a"
     if state.last_aligned is not None and state.last_dimension is not None:
         alignment_text = f"{state.last_aligned}/{state.last_dimension}"
