@@ -152,6 +152,7 @@ def hard_label_vote(pred_files: List[str], num_classes: int, logger=None) -> np.
     mmaps = [np.load(f, mmap_mode="r") for f in pred_files]
     sample_cnt = mmaps[0].shape[0]
     voted = np.empty(sample_cnt, dtype=np.int32)
+    zero_vote_defaults = 0
 
     chunk = 50_000
     for s in range(0, sample_cnt, chunk):
@@ -162,6 +163,7 @@ def hard_label_vote(pred_files: List[str], num_classes: int, logger=None) -> np.
             valid = labels_chunk < num_classes
             rows = np.arange(e - s)
             label_votes[rows[valid], labels_chunk[valid]] += 1
+        zero_vote_defaults += int((label_votes.sum(axis=1) == 0).sum())
         voted[s:e] = np.argmax(label_votes, axis=1)
         del label_votes
 
@@ -171,10 +173,12 @@ def hard_label_vote(pred_files: List[str], num_classes: int, logger=None) -> np.
     counts = np.bincount(voted, minlength=num_classes)[:num_classes]
     parts = [f"{i} ({100 * c / total:.1f} %)" for i, c in enumerate(counts)]
     lines = [" | ".join(parts[i:i + 10]) for i in range(0, len(parts), 10)]
-    msg = "Vote: " + "\n      ".join(lines)
+    zero_vote_msg = f"Zero-vote defaults to class 0: {zero_vote_defaults}/{total} ({100 * zero_vote_defaults / total:.1f}%)"
+    msg = "Vote: " + "\n      ".join(lines) + "\n      " + zero_vote_msg
     print(msg)
     if logger is not None:
         logger.info("Vote: %s", " | ".join(parts))
+        logger.info("Vote: %s", zero_vote_msg)
 
     return voted
 

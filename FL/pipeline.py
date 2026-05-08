@@ -1983,9 +1983,9 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
             )
         else:
             global_weight_path = os.path.join(round_dir, "global_weight.bin")
-            _is_ssfl = getattr(config, 'algorithm', '') == "SSFL-IDS"
+            _is_final_client_eval = getattr(config, 'algorithm', '') in {"SSFL-IDS", "FedKD-IDS"}
 
-            if _is_ssfl and round_number == config.rounds:
+            if _is_final_client_eval and round_number == config.rounds:
                 client_bins = sorted(glob.glob(os.path.join(round_dir, "client_*_weight.bin")), key=lambda p: int(os.path.basename(p).split("_")[1]))
                 if not client_bins and not os.path.exists(global_weight_path):
                     logger.info(f"Round {round_number} | SKIPPED (no weight record)")
