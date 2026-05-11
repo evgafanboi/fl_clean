@@ -2,6 +2,8 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from typing import List, Tuple, Optional
 
+from ..colors import COLORS
+
 
 FINITE_CAP = 1e6
 
@@ -38,20 +40,116 @@ def _adaptive_tail_block(S_block: np.ndarray, ref_hn: np.ndarray) -> Tuple[np.nd
     return is_byzantine.sum(axis=0), max_eig
 
 
-def _cronus_block(S_block: np.ndarray, threshold: float) -> Tuple[np.ndarray, Optional[float]]:
-    S_block = _finite_block(S_block)
-    rows, K_act, _ = S_block.shape
-    mu_S = S_block.mean(axis=1)
-    centered = S_block - mu_S[:, np.newaxis, :]
-    Sigma = np.einsum('nkd,nke->nde', centered, centered) / (K_act - 1)
-    eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
-    max_eigs = eigenvalues[:, -1]
-    above = max_eigs > threshold
-    block_max = float(max_eigs[above].max()) if above.any() else None
-    v_star = eigenvectors[:, :, -1]
-    abs_proj = np.abs(np.einsum('nkd,nd->nk', centered, v_star))
-    abs_proj[~above] = 0.0
-    return abs_proj.sum(axis=0), block_max
+_CRONUS_SUB_BATCH = 512
+
+
+def _cronus_first_mask(centered: np.ndarray, v_star: np.ndarray) -> np.ndarray:
+    abs_proj = np.abs(np.einsum('nkd,nd->nk', centered, v_star, optimize=True))
+    thresholds = np.sqrt(np.random.random(size=len(centered)))[:, np.newaxis] * abs_proj.max(axis=1, keepdims=True)
+    keep = abs_proj < thresholds
+    empty = ~keep.any(axis=1)
+    if empty.any():
+        empty_rows = np.flatnonzero(empty)
+        keep[empty_rows, np.argmin(abs_proj[empty_rows], axis=1)] = True
+    return keep
+
+
+def _cronus_refine_masks(
+    S_block: np.ndarray,
+    threshold: float,
+    budget: int,
+    survivor_mask: np.ndarray,
+) -> np.ndarray:
+    pending = np.ones(len(S_block), dtype=bool)
+
+    for _ in range(int(budget)):
+        row_idx = np.flatnonzero(pending)
+        if row_idx.size == 0:
+            break
+
+        active = survivor_mask[row_idx]
+        counts = active.sum(axis=1)
+        valid = counts > 1
+        if not valid.all():
+            pending[row_idx[~valid]] = False
+            row_idx = row_idx[valid]
+            if row_idx.size == 0:
+                break
+            active = active[valid]
+            counts = counts[valid]
+
+        block = S_block[row_idx]
+        mu = np.einsum('rk,rkd->rd', active, block, optimize=True) / counts[:, np.newaxis]
+        centered = (block - mu[:, np.newaxis, :]) * active[:, :, np.newaxis]
+        Sigma = np.einsum('nkd,nke->nde', centered, centered, optimize=True) / (counts - 1)[:, np.newaxis, np.newaxis]
+        eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
+        max_eigs = eigenvalues[:, -1]
+        triggered = max_eigs > threshold
+
+        if not triggered.any():
+            pending[row_idx] = False
+            break
+
+        pending[row_idx[~triggered]] = False
+        active = active[triggered]
+        centered = centered[triggered]
+        row_idx = row_idx[triggered]
+
+        abs_proj = np.abs(np.einsum('nkd,nd->nk', centered, eigenvectors[triggered, :, -1], optimize=True))
+        thresholds = np.sqrt(np.random.random(size=len(row_idx)))[:, np.newaxis] * abs_proj.max(axis=1, keepdims=True)
+        keep = active & (abs_proj < thresholds)
+        empty = ~keep.any(axis=1)
+        if empty.any():
+            empty_rows = np.flatnonzero(empty)
+            masked_proj = np.where(active[empty_rows], abs_proj[empty_rows], np.inf)
+            keep[empty_rows, np.argmin(masked_proj, axis=1)] = True
+        survivor_mask[row_idx] = keep
+
+    return survivor_mask
+
+
+def _cronus_exact_block(
+    S_block: np.ndarray,
+    threshold: float,
+    budget: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[float], np.ndarray]:
+    rows, K, _ = S_block.shape
+    survivor_mask = np.ones((rows, K), dtype=bool)
+    pre_top_eigs = np.zeros(rows, dtype=np.float64)
+
+    for sb0 in range(0, rows, _CRONUS_SUB_BATCH):
+        sb1 = min(sb0 + _CRONUS_SUB_BATCH, rows)
+        block = S_block[sb0:sb1]
+        centered = block - block.mean(axis=1, keepdims=True)
+        Sigma = np.einsum('nkd,nke->nde', centered, centered, optimize=True) / (K - 1)
+        eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
+        top_eigs = eigenvalues[:, -1]
+        pre_top_eigs[sb0:sb1] = top_eigs
+
+        triggered = top_eigs > threshold
+        if not triggered.any():
+            continue
+
+        block_mask = survivor_mask[sb0:sb1]
+        triggered_rows = np.flatnonzero(triggered)
+        first_keep = _cronus_first_mask(centered[triggered], eigenvectors[triggered, :, -1])
+        block_mask[triggered] = first_keep
+
+        if budget > 1:
+            block_mask[triggered] = _cronus_refine_masks(
+                block[triggered_rows],
+                threshold,
+                budget - 1,
+                first_keep.copy(),
+            )
+
+    survivor_weights = survivor_mask.astype(np.float32)
+    support = survivor_weights.sum(axis=1)
+    means = np.einsum('rk,rkd->rd', survivor_weights, S_block, optimize=True)
+    means = (means / support[:, np.newaxis]).astype(np.float32)
+    removal_counts = (~survivor_mask).sum(axis=0).astype(np.int64)
+    block_max = float(pre_top_eigs.max()) if rows > 0 else None
+    return means, survivor_mask, removal_counts, block_max, pre_top_eigs
 
 
 class RobustFilter:
@@ -269,8 +367,10 @@ class RobustFilter:
 
 class CronusRobustFilter:
     """
-    Cronus-specific robust filter with a fixed eigenvalue threshold of 9.
-    No epsilon, no slack, no tail bound — just budget-limited removal.
+    Paper-style Cronus filter with a fixed eigenvalue threshold of 9 and
+    Beta(2, 1) threshold sampling.
+
+    budget limits the number of Cronus filtering passes per sample.
     """
 
     THRESHOLD = 9.0
@@ -279,48 +379,78 @@ class CronusRobustFilter:
         self.budget = int(budget)
         self.workers = max(1, int(workers))
         self.row_block_size = max(1, int(row_block_size))
+        self.last_filter_stats = None
+        self._last_worker_log = None
 
-    def compute_robust_mean_batch(self, S_batch: np.ndarray) -> tuple:
+    def _log_effective_workers(self, rows: int, block_count: int, effective_workers: int) -> None:
+        signature = (rows, block_count, effective_workers)
+        if signature == self._last_worker_log:
+            return
+        print(
+            f"{COLORS.PURPLE}Cronus filter workers: requested={self.workers} "
+            f"effective={effective_workers} blocks={block_count} rows={rows} "
+            f"row_block_size={self.row_block_size}{COLORS.ENDC}"
+        )
+        self._last_worker_log = signature
+
+    def _store_filter_stats(self, top_eigs: np.ndarray) -> None:
+        self.last_filter_stats = {
+            "pre_top_eigs": top_eigs,
+            "min_eig": float(top_eigs.min()) if len(top_eigs) > 0 else None,
+            "mean_eig": float(top_eigs.mean()) if len(top_eigs) > 0 else None,
+            "med_eig": float(np.median(top_eigs)) if len(top_eigs) > 0 else None,
+            "max_eig": float(top_eigs.max()) if len(top_eigs) > 0 else None,
+        }
+
+    def filter_batch(self, S_batch: np.ndarray) -> tuple:
         S_batch = _finite_block(S_batch)
         N, K, D = S_batch.shape
-        active = np.ones(K, dtype=bool)
+        means = np.empty((N, D), dtype=np.float32)
+        survivor_mask = np.zeros((N, K), dtype=bool)
         removal_counts = np.zeros(K, dtype=np.int64)
         g_max_eig = None
+        pre_top_eigs = np.zeros(N, dtype=np.float64)
 
-        for _ in range(self.budget):
-            K_act = int(active.sum())
-            if K_act <= 1:
-                break
-            S_act = S_batch[:, active, :]
-            if self.workers > 1 and N > self.row_block_size:
-                blocks = [(start, min(start + self.row_block_size, N)) for start in range(0, N, self.row_block_size)]
-                proj_sums = np.zeros(K_act, dtype=np.float64)
-                cur = None
-                with ThreadPoolExecutor(max_workers=min(self.workers, len(blocks))) as pool:
-                    futures = [
-                        pool.submit(_cronus_block, S_act[start:end], self.THRESHOLD)
-                        for start, end in blocks
-                    ]
-                    for future in futures:
-                        block_proj, block_max = future.result()
-                        proj_sums += block_proj
-                        if block_max is not None and (cur is None or block_max > cur):
-                            cur = block_max
-            else:
-                proj_sums, cur = _cronus_block(S_act, self.THRESHOLD)
+        if self.budget <= 0 or K <= 1:
+            mu = S_batch.mean(axis=1)
+            means[:] = mu.astype(np.float32)
+            survivor_mask[:] = True
+            if K > 1:
+                centered = S_batch - mu[:, None, :]
+                Sigma = np.einsum('nkd,nke->nde', centered, centered) / (K - 1)
+                pre_top_eigs = np.linalg.eigvalsh(Sigma)[:, -1]
+                g_max_eig = float(pre_top_eigs.max())
+            self._store_filter_stats(pre_top_eigs)
+            return means, g_max_eig, removal_counts, survivor_mask
 
-            if cur is not None and (g_max_eig is None or cur > g_max_eig):
-                g_max_eig = cur
+        block_count = max(1, (N + self.row_block_size - 1) // self.row_block_size)
+        effective_workers = min(self.workers, block_count) if self.workers > 1 and N > self.row_block_size else 1
+        self._log_effective_workers(N, block_count, effective_workers)
 
-            if cur is None:
-                break
+        if effective_workers > 1:
+            blocks = [(start, min(start + self.row_block_size, N)) for start in range(0, N, self.row_block_size)]
+            with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+                futures = {
+                    pool.submit(_cronus_exact_block, S_batch[start:end], self.THRESHOLD, self.budget): (start, end)
+                    for start, end in blocks
+                }
+                for future, (start, end) in futures.items():
+                    block_means, block_survivors, block_counts, block_max, block_top_eigs = future.result()
+                    means[start:end] = block_means
+                    survivor_mask[start:end] = block_survivors
+                    removal_counts += block_counts
+                    pre_top_eigs[start:end] = block_top_eigs
+                    if block_max is not None and (g_max_eig is None or block_max > g_max_eig):
+                        g_max_eig = block_max
+        else:
+            means, survivor_mask, removal_counts, g_max_eig, pre_top_eigs = _cronus_exact_block(S_batch, self.THRESHOLD, self.budget)
 
-            worst_active = int(np.argmax(proj_sums))
-            worst_global = int(np.where(active)[0][worst_active])
-            active[worst_global] = False
-            removal_counts[worst_global] = 1
+        self._store_filter_stats(pre_top_eigs)
 
-        means = S_batch[:, active, :].mean(axis=1).astype(np.float32)
+        return means, g_max_eig, removal_counts, survivor_mask
+
+    def compute_robust_mean_batch(self, S_batch: np.ndarray) -> tuple:
+        means, g_max_eig, removal_counts, _ = self.filter_batch(S_batch)
         return means, g_max_eig, removal_counts, None
 
 

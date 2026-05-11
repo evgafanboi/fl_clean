@@ -29,12 +29,16 @@ class FDConfig:
     ab_alpha: float = 1.0
     ab_beta: float = 0.0
     ours_temperature: float = 4.0
+    kd_epochs: int = 2
     robust_epsilon: float = 0.2
     robust_rm_budget: Optional[int] = None
     robust_threshold: float = 0.75
     robust_workers: int = 8
     robust_filter_v2: bool = False
     robust_filter_cronus: bool = False
+    eva: bool = False
+    eva2: bool = False
+    evw: bool = False
     remove_dis: bool = False
     checkpoint: int = 0
     cleanup_interval: int = 10

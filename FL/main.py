@@ -41,7 +41,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (threshold sensitivity, not budget)")
     parser.add_argument("--robust_rm_budget", type=int, default=None, help="RobustFilter max removals (default: n_clients//2 - 1)")
     parser.add_argument("--robust_threshold", type=float, default=0.75, help="AdaptiveRobustFilter tail score threshold")
-    parser.add_argument("--robust_workers", type=int, default=16, help="Ours robust filter row-block worker threads")
+    parser.add_argument("--robust_workers", type=int, default=8, help="Ours robust filter row-block worker threads")
     parser.add_argument("--robust_filter_v2", action="store_true", help="Ours: use one-removal-per-pass iterative robust filter")
     parser.add_argument("--robust_filter_cronus", action="store_true", help="Ours: use pooled Cronus robust filter")
     # cronus
@@ -70,6 +70,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ab_beta", type=float, default=0.0, help="Beta for ABKD divergence")
     parser.add_argument("--ours_temperature", type=float, default=4.0, help="Temperature for ABKD softmax scaling")
     parser.add_argument("--kd_epochs", type=int, default=2, help="KD epochs for stage 1 in Ours strategy")
+    eva_group = parser.add_mutually_exclusive_group()
+    eva_group.add_argument("--eva", action="store_true", help="Ours: Energy-based Vote Abstention on survivor logits")
+    eva_group.add_argument("--eva2", action="store_true", help="Ours: Alternate Energy-based Vote Abstention (unique counting)")
+    eva_group.add_argument("--evw", action="store_true", help="Ours: Energy-based Vote Weighting on survivor logits")
 
     # distillation hyperparameters
     parser.add_argument("--gamma", type=float, default=1.0, help="Distillation temperature / weighting factor (for FD, FedMD, FedProto)")
@@ -178,12 +182,16 @@ def main(argv=None):
             ab_alpha=args.ab_alpha,
             ab_beta=args.ab_beta,
             ours_temperature=args.ours_temperature,
+            kd_epochs=args.kd_epochs,
             robust_epsilon=args.robust_epsilon,
             robust_rm_budget=robust_rm_budget,
             robust_threshold=args.robust_threshold,
             robust_workers=args.robust_workers,
             robust_filter_v2=args.robust_filter_v2,
             robust_filter_cronus=args.robust_filter_cronus,
+            eva=args.eva,
+            eva2=args.eva2,
+            evw=args.evw,
             remove_dis=args.remove_dis,
             checkpoint=args.checkpoint,
             cleanup_interval=args.cleanup_interval,

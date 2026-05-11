@@ -79,7 +79,7 @@ def _predict_to_file(model, X: np.ndarray, num_classes: int,
 def _robust_filter(pred_pack_path: str, pred_cids: List[int], n_samples: int,
                    num_classes: int, budget: int,
                    workers: int = 8,
-                   ) -> Tuple[np.ndarray, Optional[float], Optional[float], Set[int]]:
+                   ) -> Tuple[np.ndarray, Optional[float], Optional[float], Set[int], Optional[dict]]:
     rf = CronusRobustFilter(budget=budget, workers=workers)
     row_bytes = num_classes * 4
     CHUNK = 50_000
@@ -88,6 +88,7 @@ def _robust_filter(pred_pack_path: str, pred_cids: List[int], n_samples: int,
     max_ratio: Optional[float] = None
     removal_counts = np.zeros(len(pred_cids), dtype=np.int64)
     removed: Set[int] = set()
+    eig_chunks = []
     fp = open(pred_pack_path, "rb")
     boundary = 1.0 / num_classes
     off = 0
@@ -99,6 +100,9 @@ def _robust_filter(pred_pack_path: str, pred_cids: List[int], n_samples: int,
             for cid in pred_cids
         ], axis=1)
         means, batch_eig, batch_removals, batch_ratio = rf.compute_robust_mean_batch(S_batch)
+        eig_stats = getattr(rf, "last_filter_stats", None)
+        if eig_stats is not None:
+            eig_chunks.append(np.asarray(eig_stats["pre_top_eigs"], dtype=np.float64))
         if batch_eig is not None and (max_eig is None or batch_eig > max_eig):
             max_eig = batch_eig
         if batch_ratio is not None and (max_ratio is None or batch_ratio > max_ratio):
@@ -116,7 +120,17 @@ def _robust_filter(pred_pack_path: str, pred_cids: List[int], n_samples: int,
         del S_batch, means
     pbar.close()
     fp.close()
-    return pseudo, max_eig, max_ratio, removed
+    eig_report = None
+    if eig_chunks:
+        top_eigs = np.concatenate(eig_chunks)
+        eig_report = {
+            "n_samples": int(top_eigs.size),
+            "min_eig": float(top_eigs.min()),
+            "mean_eig": float(top_eigs.mean()),
+            "med_eig": float(np.median(top_eigs)),
+            "max_eig": float(top_eigs.max()),
+        }
+    return pseudo, max_eig, max_ratio, removed, eig_report
 
 
 # ── merged dataset (round 2+) ─────────────────────────────────────────
@@ -508,7 +522,7 @@ class Cronus(DistillationStrategy):
             budget = getattr(cfg, "robust_rm_budget", getattr(cfg, "n_clients", 100) // 2 - 1)
             pseudo_file = _pseudo_path(round_number)
             if not os.path.exists(pseudo_file):
-                pseudo, max_eig, max_ratio, removed_idx = _robust_filter(
+                pseudo, max_eig, max_ratio, removed_idx, eig_report = _robust_filter(
                     pred_pack_path, pred_cids, n_pub, context.num_classes, budget,
                     workers=getattr(cfg, "robust_workers", 8))
 
@@ -516,10 +530,17 @@ class Cronus(DistillationStrategy):
                 eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
                 valid_n = int(np.sum(pseudo >= 0))
                 print(f"  budget={budget}  max_eig={eig_s}  threshold=9  removed={removed_cids or 'none'}")
+                if eig_report is not None:
+                    print(f"  pre-filter eigs: min={eig_report['min_eig']:.6f} mean={eig_report['mean_eig']:.6f} med={eig_report['med_eig']:.6f} max={eig_report['max_eig']:.6f}")
                 print(f"  {valid_n}/{n_pub} pseudo-labeled")
                 context.logger.info(
                     "Round %s | RobustFilter | threshold=9 | max_eig=%s | removed=%s | valid=%d/%d",
                     round_number, eig_s, removed_cids or "none", valid_n, n_pub)
+                if eig_report is not None:
+                    context.logger.info(
+                        "Round %s | RobustFilter | pre_filter_eigs | n_samples=%d | min_eig=%.6f | mean_eig=%.6f | med_eig=%.6f | max_eig=%.6f",
+                        round_number, eig_report["n_samples"], eig_report["min_eig"], eig_report["mean_eig"], eig_report["med_eig"], eig_report["max_eig"],
+                    )
 
                 np.save(pseudo_file, pseudo)
                 del pseudo

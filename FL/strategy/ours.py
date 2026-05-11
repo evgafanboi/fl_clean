@@ -3,7 +3,7 @@ from __future__ import annotations
 import gc
 import os
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from ..backend import use_tf as _use_tf
@@ -30,10 +30,169 @@ from .common import (
 LOGITS_CACHE_DIR = os.path.join("temp_weights", "ours_cache")
 LOGIT_ABS_CAP = 1e6
 EKD_LOGIT_CLIP = 30.0
+EVA_PRIVATE_CHUNK = 100_000
+EVA_PUBLIC_CHUNK = 500_000
+EVA_EPS = 1e-6
+EVA_PRIVATE_QUANTILE = 0.95 # energy-based vote abstention quantile
+EVW_TAU1 = 0.0
+EVW_TAU2 = 1.0
 
 
 def _sanitize_logits(logits: np.ndarray, cap: float = LOGIT_ABS_CAP) -> np.ndarray:
     return np.nan_to_num(logits, nan=0.0, posinf=cap, neginf=-cap).astype(np.float32, copy=False)
+
+
+def _eva_mode(config) -> Optional[str]:
+    if getattr(config, "evw", False):
+        return "evw"
+    elif getattr(config, "eva", False):
+        return "eva"
+    elif getattr(config, "eva2", False):
+        return "eva2"
+    return None
+
+
+def _support_path(client_id: int) -> str:
+    return os.path.join(LOGITS_CACHE_DIR, f"client_{client_id}_support.bin")
+
+
+def _client_id_from_logit_path(path: str) -> int:
+    return int(os.path.basename(path).split("_")[1].split(".")[0])
+
+
+def _energy_from_logits(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+    scaled = np.asarray(logits, dtype=np.float64) / temperature
+    row_max = np.max(scaled, axis=1, keepdims=True)
+    lse = row_max[:, 0] + np.log(np.exp(scaled - row_max).sum(axis=1) + 1e-12)
+    return (-temperature * lse).astype(np.float32)
+
+
+def _support_weights_from_scores(scores: np.ndarray, mode: Optional[str]) -> np.ndarray:
+    if mode == "evw":
+        return np.clip((EVW_TAU2 - scores) / max(EVW_TAU2 - EVW_TAU1, EVA_EPS), 0.0, 1.0).astype(np.float32)
+    return np.ones_like(scores, dtype=np.float32)
+
+
+def _write_support_values(output_path: str, values: np.ndarray) -> None:
+    with open(output_path, "wb") as fp:
+        fp.write(np.asarray(values, dtype=np.float32).tobytes())
+
+
+def _load_private_energies(model_wrapper, private_X_path: str, batch_size: int) -> np.ndarray:
+    logits_model = model_wrapper.get_logits_model() if hasattr(model_wrapper, "get_logits_model") else model_wrapper
+    X_mmap = np.load(private_X_path, mmap_mode="r")
+    energies = []
+    for start in range(0, len(X_mmap), EVA_PRIVATE_CHUNK):
+        chunk = np.asarray(X_mmap[start:start + EVA_PRIVATE_CHUNK], dtype=np.float32)
+        logits = _sanitize_logits(logits_model.predict(chunk, batch_size=batch_size, verbose=0))
+        energies.append(_energy_from_logits(logits))
+        del chunk, logits
+    del X_mmap
+    if not energies:
+        return np.empty(0, dtype=np.float32)
+    energy = np.concatenate(energies, axis=0)
+    del energies
+    return energy
+
+
+def _compute_private_energy_quantile(model_wrapper, private_X_path: str, batch_size: int) -> float:
+    energy = _load_private_energies(model_wrapper, private_X_path, batch_size)
+    if energy.size == 0:
+        return 0.0
+    threshold = float(np.quantile(energy, EVA_PRIVATE_QUANTILE))
+    del energy
+    return threshold
+
+
+def _compute_private_energy_eva2(model_wrapper, private_X_path: str, batch_size: int) -> float:
+    energy = _load_private_energies(model_wrapper, private_X_path, batch_size)
+    if energy.size == 0:
+        return 0.0
+    unique_energy, counts = np.unique(energy, return_counts=True)
+    unique_energy = unique_energy[::-1]
+    counts = counts[::-1]
+    
+    total_energy = len(energy)
+    num_unique = len(unique_energy)
+    threshold = float(unique_energy[0])
+    
+    threshold_ratio = 1.0 / num_unique
+    
+    for i in range(num_unique):
+        c_i = counts[i]
+        if c_i / total_energy < threshold_ratio:
+            continue
+        else:
+            threshold = float(unique_energy[i])
+            break
+            
+    del energy
+    return threshold
+
+
+def _compute_private_energy_stats(model_wrapper, private_X_path: str, batch_size: int) -> Tuple[float, float]:
+    energy = _load_private_energies(model_wrapper, private_X_path, batch_size)
+    if energy.size == 0:
+        return 0.0, 1.0
+    mu = float(np.median(energy))
+    sigma = float(np.median(np.abs(energy - mu)) * 1.4826 + EVA_EPS)
+    del energy
+    return mu, sigma
+
+
+def generate_logits_and_support_to_file(
+    model_wrapper,
+    private_X_path: str,
+    public_features: np.ndarray,
+    batch_size: int,
+    output_path: str,
+    support_path: str,
+    mode: str,
+) -> tuple:
+    logits_model = model_wrapper.get_logits_model() if hasattr(model_wrapper, "get_logits_model") else model_wrapper
+    q95 = None
+    mu = None
+    sigma = None
+    if mode == "eva":
+        q95 = _compute_private_energy_quantile(model_wrapper, private_X_path, batch_size)
+    elif mode == "eva2":
+        q95 = _compute_private_energy_eva2(model_wrapper, private_X_path, batch_size)
+    else:
+        mu, sigma = _compute_private_energy_stats(model_wrapper, private_X_path, batch_size)
+    total_rows = 0
+    num_classes = None
+    support_sum = 0.0
+    support_nonzero = 0
+    with open(output_path, "wb") as log_fp, open(support_path, "wb") as support_fp:
+        for start in range(0, len(public_features), EVA_PUBLIC_CHUNK):
+            chunk = public_features[start:start + EVA_PUBLIC_CHUNK]
+            logits = _sanitize_logits(logits_model.predict(chunk, batch_size=batch_size, verbose=0))
+            if num_classes is None:
+                num_classes = logits.shape[1]
+            log_fp.write(logits.tobytes())
+            energies = _energy_from_logits(logits)
+            if mode == "eva" or mode == "eva2":
+                support = (energies <= q95).astype(np.float32)
+            else:
+                scores = (energies - mu) / sigma
+                support = _support_weights_from_scores(scores, mode)
+            support_fp.write(np.asarray(support, dtype=np.float32).tobytes())
+            total_rows += logits.shape[0]
+            support_sum += float(support.sum())
+            support_nonzero += int((support > 0).sum())
+            del logits, energies, support, chunk
+            if mode != "eva" and mode != "eva2":
+                del scores
+    stats = {
+        "support_mean": support_sum / max(total_rows, 1),
+        "support_rate": support_nonzero / max(total_rows, 1),
+    }
+    if mode == "eva" or mode == "eva2":
+        stats["q95"] = q95
+    else:
+        stats["mu"] = mu
+        stats["sigma"] = sigma
+    return output_path, (total_rows, num_classes), stats
 
 
 # ── Logit generation (chunked to disk) ──────────────────────────────────────
@@ -78,7 +237,7 @@ def compute_consensus_from_files(logit_files: List[str], shape: tuple) -> np.nda
 
 
 def compute_robust_consensus_from_files(
-    logit_files: List[str], shape: tuple, robust_filter: AdaptiveRobustFilter,
+    logit_files: List[str], shape: tuple, robust_filter,
     poisoned_client_ids=None, logger=None, round_number=None,
 ) -> tuple:
     n_clients = len(logit_files)
@@ -89,6 +248,8 @@ def compute_robust_consensus_from_files(
     max_eig = None
     max_ratio = None
     removal_counts = {c: 0 for c in range(n_clients)}  # samples excluded per client
+    samplewise_cronus = isinstance(robust_filter, CronusRobustFilter)
+    eig_chunks = [] if samplewise_cronus else None
 
     handles = [open(fpath, "rb") for fpath in logit_files]
     pbar = tqdm(total=n_samples, desc="Robust consensus", unit="sample")
@@ -99,15 +260,21 @@ def compute_robust_consensus_from_files(
             for h in handles
         ]
         S_batch = np.stack(client_chunks, axis=1)  # (rows, n_clients, n_classes)
-        means, batch_max_eig, removal_delta, batch_max_ratio = robust_filter.compute_robust_mean_batch(S_batch)
+        if samplewise_cronus:
+            means, batch_max_eig, removal_delta, _ = robust_filter.filter_batch(S_batch)
+            batch_max_ratio = None
+            eig_stats = getattr(robust_filter, "last_filter_stats", None)
+            if eig_stats is not None:
+                eig_chunks.append(np.asarray(eig_stats["pre_top_eigs"], dtype=np.float64))
+        else:
+            means, batch_max_eig, removal_delta, batch_max_ratio = robust_filter.compute_robust_mean_batch(S_batch)
         consensus[offset : offset + rows] = means
         if batch_max_eig is not None and (max_eig is None or batch_max_eig > max_eig):
             max_eig = batch_max_eig
         if batch_max_ratio is not None and (max_ratio is None or batch_max_ratio > max_ratio):
             max_ratio = batch_max_ratio
         for c in range(n_clients):
-            if removal_delta[c] > 0:
-                removal_counts[c] += rows
+            removal_counts[c] += int(removal_delta[c]) if samplewise_cronus else rows * int(removal_delta[c] > 0)
         pbar.update(rows)
         del client_chunks, S_batch, means
     pbar.close()
@@ -130,7 +297,157 @@ def compute_robust_consensus_from_files(
             round_number, TP, FP, TN, FN, TPR, FPR, TNR, FNR,
         )
 
-    return consensus, max_eig, max_ratio, removal_counts
+    eig_report = None
+    if samplewise_cronus and eig_chunks:
+        top_eigs = np.concatenate(eig_chunks)
+        eig_report = {
+            "n_samples": int(top_eigs.size),
+            "min_eig": float(top_eigs.min()),
+            "mean_eig": float(top_eigs.mean()),
+            "med_eig": float(np.median(top_eigs)),
+            "max_eig": float(top_eigs.max()),
+        }
+
+    return consensus, max_eig, max_ratio, removal_counts, eig_report
+
+
+def compute_supported_consensus_from_files(
+    logit_files: List[str],
+    support_files: List[str],
+    shape: tuple,
+    mode: str,
+    robust_filter=None,
+    poisoned_client_ids=None,
+    logger=None,
+    round_number=None,
+) -> tuple:
+    n_clients = len(logit_files)
+    n_samples, n_classes = shape
+    consensus = np.zeros(shape, dtype=np.float32)
+    supported_mask = np.zeros(n_samples, dtype=bool)
+    chunk_rows = 100_000
+    row_bytes = n_classes * 4
+    support_bytes = 4
+    max_eig = None
+    max_ratio = None
+    removal_counts = {c: 0 for c in range(n_clients)}
+    samplewise_cronus = isinstance(robust_filter, CronusRobustFilter)
+    eig_chunks = [] if samplewise_cronus else None
+
+    log_handles = [open(fpath, "rb") for fpath in logit_files]
+    support_handles = [open(fpath, "rb") for fpath in support_files]
+    pbar = tqdm(total=n_samples, desc="Robust consensus", unit="sample")
+    budget = getattr(robust_filter, "budget", 0) if robust_filter is not None else 0
+    for offset in range(0, n_samples, chunk_rows):
+        rows = min(chunk_rows, n_samples - offset)
+        client_chunks = [
+            _sanitize_logits(np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes))
+            for h in log_handles
+        ]
+        support_chunks = [
+            np.frombuffer(h.read(rows * support_bytes), dtype=np.float32)
+            for h in support_handles
+        ]
+        S_batch = np.stack(client_chunks, axis=1)
+        Q_batch = np.stack(support_chunks, axis=1).astype(np.float32)
+        chunk_consensus = consensus[offset:offset + rows]
+
+        if mode == "eva" or mode == "eva2":
+            if budget > 0:
+                if samplewise_cronus:
+                    _, batch_max_eig, removal_delta, survivor_mask = robust_filter.filter_batch(S_batch)
+                    batch_max_ratio = None
+                    survivor_weights = survivor_mask.astype(np.float32)
+                    eig_stats = getattr(robust_filter, "last_filter_stats", None)
+                    if eig_stats is not None:
+                        eig_chunks.append(np.asarray(eig_stats["pre_top_eigs"], dtype=np.float64))
+                else:
+                    _, batch_max_eig, removal_delta, batch_max_ratio = robust_filter.compute_robust_mean_batch(S_batch)
+                    survivor_weights = np.broadcast_to((removal_delta == 0).astype(np.float32), (rows, n_clients))
+                if batch_max_eig is not None and (max_eig is None or batch_max_eig > max_eig):
+                    max_eig = batch_max_eig
+                if batch_max_ratio is not None and (max_ratio is None or batch_max_ratio > max_ratio):
+                    max_ratio = batch_max_ratio
+                for c in range(n_clients):
+                    removal_counts[c] += int(removal_delta[c]) if samplewise_cronus else rows * int(removal_delta[c] > 0)
+            else:
+                survivor_weights = np.ones((rows, n_clients), dtype=np.float32)
+
+            Q_survivors = (Q_batch > 0.0).astype(np.float32) * survivor_weights
+            support_mass = Q_survivors.sum(axis=1)
+            valid = support_mass > 0.0
+            if valid.any():
+                masked_sum = np.einsum("rk,rkc->rc", Q_survivors[valid], S_batch[valid], optimize=True)
+                chunk_consensus[valid] = (masked_sum / support_mass[valid, np.newaxis]).astype(np.float32)
+                supported_mask[offset:offset + rows] = valid
+                del masked_sum
+            del Q_survivors, support_mass, valid
+        else:
+            if budget > 0:
+                if samplewise_cronus:
+                    _, batch_max_eig, removal_delta, survivor_mask = robust_filter.filter_batch(S_batch)
+                    batch_max_ratio = None
+                    survivor_weights = survivor_mask.astype(np.float32)
+                    eig_stats = getattr(robust_filter, "last_filter_stats", None)
+                    if eig_stats is not None:
+                        eig_chunks.append(np.asarray(eig_stats["pre_top_eigs"], dtype=np.float64))
+                else:
+                    _, batch_max_eig, removal_delta, batch_max_ratio = robust_filter.compute_robust_mean_batch(S_batch)
+                    survivor_weights = np.broadcast_to((removal_delta == 0).astype(np.float32), (rows, n_clients))
+                if batch_max_eig is not None and (max_eig is None or batch_max_eig > max_eig):
+                    max_eig = batch_max_eig
+                if batch_max_ratio is not None and (max_ratio is None or batch_max_ratio > max_ratio):
+                    max_ratio = batch_max_ratio
+                for c in range(n_clients):
+                    removal_counts[c] += int(removal_delta[c]) if samplewise_cronus else rows * int(removal_delta[c] > 0)
+            else:
+                survivor_weights = np.ones((rows, n_clients), dtype=np.float32)
+
+            Q_survivors = Q_batch * survivor_weights
+            support_mass = Q_survivors.sum(axis=1)
+            valid = support_mass > 0.0
+            if valid.any():
+                weighted_sum = np.einsum("rk,rkc->rc", Q_survivors[valid], S_batch[valid], optimize=True)
+                chunk_consensus[valid] = (weighted_sum / support_mass[valid, np.newaxis]).astype(np.float32)
+                supported_mask[offset:offset + rows] = valid
+            del Q_survivors, support_mass, valid
+
+        pbar.update(rows)
+        del client_chunks, support_chunks, S_batch, Q_batch
+    pbar.close()
+    for handle in log_handles:
+        handle.close()
+    for handle in support_handles:
+        handle.close()
+
+    if poisoned_client_ids is not None and logger is not None and budget > 0:
+        poisoned_set = set(poisoned_client_ids)
+        predicted_removed = {c for c, v in removal_counts.items() if v > 0}
+        TP = len(predicted_removed & poisoned_set)
+        FP = len(predicted_removed - poisoned_set)
+        FN = len(poisoned_set - predicted_removed)
+        TN = n_clients - TP - FP - FN
+        TPR = TP / max(1, TP + FN)
+        FPR = FP / max(1, FP + TN)
+        TNR = TN / max(1, TN + FP)
+        FNR = FN / max(1, FN + TP)
+        logger.info(
+            "Round %s | FilterMetrics | TP=%d FP=%d TN=%d FN=%d | TPR=%.3f FPR=%.3f TNR=%.3f FNR=%.3f",
+            round_number, TP, FP, TN, FN, TPR, FPR, TNR, FNR,
+        )
+
+    eig_report = None
+    if samplewise_cronus and eig_chunks:
+        top_eigs = np.concatenate(eig_chunks)
+        eig_report = {
+            "n_samples": int(top_eigs.size),
+            "min_eig": float(top_eigs.min()),
+            "mean_eig": float(top_eigs.mean()),
+            "med_eig": float(np.median(top_eigs)),
+            "max_eig": float(top_eigs.max()),
+        }
+
+    return consensus, supported_mask, max_eig, max_ratio, removal_counts, eig_report
 
 
 # ── Stage 2: KD (pure distillation, no CE) ──────────────────────────────────
@@ -418,8 +735,9 @@ class Ours(DistillationStrategy):
 
     def __init__(self, config) -> None:
         super().__init__(config)
-        self.kd_epochs = getattr(config, "kd_epochs", 1)
+        self.kd_epochs = getattr(config, "kd_epochs", 2)
         self.ce_epochs = config.epochs
+        self.eva_mode = _eva_mode(config)
         if getattr(config, "robust_filter_cronus", False):
             self.robust_filter = CronusRobustFilter(
                 budget=getattr(config, "robust_rm_budget", None) or 0,
@@ -436,6 +754,8 @@ class Ours(DistillationStrategy):
     def extra_log_tokens(self) -> Dict[str, float]:
         budget = getattr(self.config, "robust_rm_budget", 0)
         tokens = {"kd": self.config.ours_kd, "ekd_lambda": self.config.ours_ekd_lambda, "budget": budget}
+        if self.eva_mode is not None:
+            tokens["eva_mode"] = self.eva_mode
         if getattr(self.config, "robust_filter_cronus", False):
             tokens["robust_filter"] = "cronus"
         elif getattr(self.config, "robust_filter_v2", False):
@@ -476,6 +796,7 @@ class Ours(DistillationStrategy):
         pool = context.model_pool
         logit_files = []
         logit_shape = None
+        eva_mode = self.eva_mode
         attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
 
@@ -521,6 +842,8 @@ class Ours(DistillationStrategy):
                 if _lma_adv_bytes is not None:
                     with open(fpath, "wb") as _hf:
                         _hf.write(_lma_adv_bytes)
+                    if eva_mode is not None:
+                        _write_support_values(_support_path(state.client_id), np.ones(_lma_adv_shape[0], dtype=np.float32))
                     logit_files.append(fpath)
                     if logit_shape is None:
                         logit_shape = _lma_adv_shape
@@ -532,6 +855,8 @@ class Ours(DistillationStrategy):
                 if _ghost_bytes is not None:
                     with open(fpath, 'wb') as _gf:
                         _gf.write(_ghost_bytes)
+                    if eva_mode is not None:
+                        _write_support_values(_support_path(state.client_id), np.ones(_ghost_shape[0], dtype=np.float32))
                     logit_files.append(fpath)
                     if logit_shape is None:
                         logit_shape = _ghost_shape
@@ -548,9 +873,34 @@ class Ours(DistillationStrategy):
                 model.set_weights(poisoned_w)
                 print(f"{COLORS.WARNING}  [POISON] Client {state.client_id}: gradient_scale applied (\u00d7{poison_value}){COLORS.ENDC}")
                 context.logger.info("Round %s | Client %s [POISON] gradient_scale \u00d7%s applied", self._cur_round, state.client_id, poison_value)
-            _, shape = generate_logits_to_file(
-                model, public_features, config.batch_size, fpath,
-            )
+            if eva_mode is not None:
+                _, shape, support_stats = generate_logits_and_support_to_file(
+                    model, state.paths["train_X"], public_features, config.batch_size, fpath, _support_path(state.client_id), eva_mode,
+                )
+                if eva_mode == "eva" or eva_mode == "eva2":
+                    context.logger.info(
+                        "Round %s | Client %s | %s | q95=%.4f support_rate=%.3f support_mean=%.3f",
+                        self._cur_round,
+                        state.client_id,
+                        eva_mode.upper(),
+                        support_stats["q95"],
+                        support_stats["support_rate"],
+                        support_stats["support_mean"],
+                    )
+                else:
+                    context.logger.info(
+                        "Round %s | Client %s | EVW | mu=%.4f sigma=%.4f support_rate=%.3f support_mean=%.3f",
+                        self._cur_round,
+                        state.client_id,
+                        support_stats["mu"],
+                        support_stats["sigma"],
+                        support_stats["support_rate"],
+                        support_stats["support_mean"],
+                    )
+            else:
+                _, shape = generate_logits_to_file(
+                    model, public_features, config.batch_size, fpath,
+                )
 
             pool.release(model)
             logit_files.append(fpath)
@@ -657,6 +1007,11 @@ class Ours(DistillationStrategy):
         pool = context.model_pool
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
 
+        if len(public_features) == 0:
+            context.logger.info("Round %s | KD skipped (0 supported public samples)", self._cur_round)
+            print(f"{COLORS.WARNING}Round {self._cur_round}: KD skipped (0 supported public samples){COLORS.ENDC}")
+            return
+
         _pfl_kd = getattr(context, 'poisoned_fl_state', None)
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_client:
@@ -729,11 +1084,50 @@ class Ours(DistillationStrategy):
                     "last_client_idx": client_idx,
                 })
 
+    def _run_poisonedfl_ghost_stage(self, context, consensus_logits, public_features, round_number: int) -> None:
+        _pfl = getattr(context, 'poisoned_fl_state', None)
+        if _pfl is None or not context.poisoned_clients:
+            return
+        config = context.config
+        _kd_m = getattr(config, "ours_kd", "ekd")
+        ghost = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
+        ghost_start = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
+        if ghost_start is not None:
+            ghost.set_weights(ghost_start)
+        if len(public_features) > 0:
+            if _kd_m == "abkd":
+                ghost_distill_loss = abkd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
+                                                config.ab_alpha, config.ab_beta, config.ours_temperature)
+            else:
+                ghost_distill_loss = ekd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
+                                               getattr(config, "ours_ekd_lambda", 1.0))
+            ghost_w = ghost.get_weights()
+        else:
+            ghost_distill_loss = None
+            ghost_w = ghost.get_weights()
+            context.logger.info("Round %s | EVA | PoisonedFL ghost KD skipped (0 supported public samples)", round_number)
+            print(f"{COLORS.WARNING}Round {round_number}: PoisonedFL ghost KD skipped (0 supported public samples){COLORS.ENDC}")
+        del ghost
+        poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
+        poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w, _pfl)
+        _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
+        context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost KD'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
+        if not getattr(config, "mixed_models", False):
+            _pool_g = context.model_pool
+            for st in context.client_states:
+                if st.client_id in context.poisoned_clients:
+                    m = _pool_g.checkout(st.client_id)
+                    m.set_weights(poisoned_w)
+                    _pool_g.checkin(st.client_id, m)
+        del ghost_w, poisoned_w
+        aggressive_memory_cleanup()
+
     def run_round(self, context: PipelineContext, round_number: int) -> Dict[int, Dict[str, float]]:
         round_start = time.time()
         config = context.config
         public_features = np.load(context.shared_state["public_features_path"], mmap_mode="r")
-        no_filter = getattr(config, "robust_rm_budget", 0) == 0
+        eva_mode = self.eva_mode
+        no_filter = getattr(config, "robust_rm_budget", 0) == 0 and eva_mode is None
         _pfl = getattr(context, 'poisoned_fl_state', None)
 
         os.makedirs(LOGITS_CACHE_DIR, exist_ok=True)
@@ -835,6 +1229,7 @@ class Ours(DistillationStrategy):
 
             if not skip_kd:
                 consensus_path = os.path.join(LOGITS_CACHE_DIR, f"r{round_number}_consensus.npy")
+                support_mask_path = os.path.join(LOGITS_CACHE_DIR, f"r{round_number}_supported_mask.npy")
                 if logit_shape is None and not os.path.exists(consensus_path):
                     raise RuntimeError(
                         "logit_shape is None — no logit files were produced or recovered. "
@@ -843,11 +1238,50 @@ class Ours(DistillationStrategy):
                 if skip_kd and os.path.exists(consensus_path):
                     print(f"\n{COLORS.OKCYAN}Loading cached consensus logits{COLORS.ENDC}")
                     consensus_logits = np.load(consensus_path)
+                    if eva_mode is not None and os.path.exists(support_mask_path):
+                        supported_mask = np.load(support_mask_path).astype(bool)
+                    else:
+                        supported_mask = np.ones(len(consensus_logits), dtype=bool)
                 else:
                     budget = getattr(config, "robust_rm_budget", 0)
-                    if budget == 0:
+                    if eva_mode is not None:
+                        support_files = [_support_path(_client_id_from_logit_path(path)) for path in logit_files]
+                        robust_filter = None if budget == 0 else self.robust_filter
+                        label = "weighted" if eva_mode == "evw" else "abstention"
+                        print(f"\n{COLORS.OKCYAN}Computing {label} consensus logits ({eva_mode.upper()}){COLORS.ENDC}")
+                        consensus_logits, supported_mask, max_eig, max_ratio, removal_counts, eig_report = compute_supported_consensus_from_files(
+                            logit_files, support_files, logit_shape, eva_mode, robust_filter,
+                            poisoned_client_ids=(None if _pfl is not None else context.poisoned_clients),
+                            logger=context.logger,
+                            round_number=round_number,
+                        )
+                        unsupported = int((~supported_mask).sum())
+                        print(f"  Consensus shape: {consensus_logits.shape}")
+                        print(f"  unsupported rows={unsupported}/{len(supported_mask)} ({100 * unsupported / max(len(supported_mask), 1):.1f}%)")
+                        if budget > 0:
+                            eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
+                            ratio_s = f"{max_ratio:.4f}" if max_ratio is not None else "N/A"
+                            top_removed = sorted(removal_counts.items(), key=lambda x: -x[1])
+                            print(f"  max_eig={eig_s}  max_ratio={ratio_s}  top removals (client_idx: count): {top_removed[:5]}")
+                            context.logger.info(
+                                "Round %s | EVAConsensus | mode=%s | max_eig=%s | max_ratio=%s | removals=%s | unsupported=%d/%d",
+                                round_number, eva_mode, eig_s, ratio_s, top_removed, unsupported, len(supported_mask),
+                            )
+                            if eig_report is not None:
+                                print(f"  pre-filter eigs: min={eig_report['min_eig']:.6f} mean={eig_report['mean_eig']:.6f} med={eig_report['med_eig']:.6f} max={eig_report['max_eig']:.6f}")
+                                context.logger.info(
+                                    "Round %s | EVAConsensus | mode=%s | pre_filter_eigs | n_samples=%d | min_eig=%.6f | mean_eig=%.6f | med_eig=%.6f | max_eig=%.6f",
+                                    round_number, eva_mode, eig_report["n_samples"], eig_report["min_eig"], eig_report["mean_eig"], eig_report["med_eig"], eig_report["max_eig"],
+                                )
+                        else:
+                            context.logger.info(
+                                "Round %s | EVAConsensus | mode=%s | budget=0 | unsupported=%d/%d",
+                                round_number, eva_mode, unsupported, len(supported_mask),
+                            )
+                    elif budget == 0:
                         print(f"\n{COLORS.OKCYAN}Computing mean consensus logits (no filtering){COLORS.ENDC}")
                         consensus_logits = compute_consensus_from_files(logit_files, logit_shape)
+                        supported_mask = np.ones(len(consensus_logits), dtype=bool)
                         print(f"  Consensus shape: {consensus_logits.shape}")
                         context.logger.info(
                             "Round %s | MeanConsensus | budget=0 (no filtering)",
@@ -855,12 +1289,13 @@ class Ours(DistillationStrategy):
                         )
                     else:
                         print(f"\n{COLORS.OKCYAN}Computing robust consensus logits (budget={budget}){COLORS.ENDC}")
-                        consensus_logits, max_eig, max_ratio, removal_counts = compute_robust_consensus_from_files(
+                        consensus_logits, max_eig, max_ratio, removal_counts, eig_report = compute_robust_consensus_from_files(
                             logit_files, logit_shape, self.robust_filter,
                             poisoned_client_ids=(None if _pfl is not None else context.poisoned_clients),
                             logger=context.logger,
                             round_number=round_number,
                         )
+                        supported_mask = np.ones(len(consensus_logits), dtype=bool)
                         print(f"  Consensus shape: {consensus_logits.shape}")
                         eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
                         ratio_s = f"{max_ratio:.4f}" if max_ratio is not None else "N/A"
@@ -870,45 +1305,36 @@ class Ours(DistillationStrategy):
                             "Round %s | RobustConsensus | max_eig=%s | max_ratio=%s | removals=%s",
                             round_number, eig_s, ratio_s, top_removed,
                         )
+                        if eig_report is not None:
+                            print(f"  pre-filter eigs: min={eig_report['min_eig']:.6f} mean={eig_report['mean_eig']:.6f} med={eig_report['med_eig']:.6f} max={eig_report['max_eig']:.6f}")
+                            context.logger.info(
+                                "Round %s | RobustConsensus | pre_filter_eigs | n_samples=%d | min_eig=%.6f | mean_eig=%.6f | med_eig=%.6f | max_eig=%.6f",
+                                round_number, eig_report["n_samples"], eig_report["min_eig"], eig_report["mean_eig"], eig_report["med_eig"], eig_report["max_eig"],
+                            )
                     np.save(consensus_path, consensus_logits)
+                    if eva_mode is not None:
+                        np.save(support_mask_path, supported_mask.astype(np.uint8))
                     context.shared_state["lma_stale_consensus"] = consensus_logits.copy()
 
                 for fpath in logit_files:
                     if os.path.exists(fpath):
                         os.remove(fpath)
+                if eva_mode is not None:
+                    for fpath in [_support_path(_client_id_from_logit_path(path)) for path in logit_files]:
+                        if os.path.exists(fpath):
+                            os.remove(fpath)
 
-                self._run_kd_stage(context, consensus_logits, public_features, first_client=first_kd)
-                if _pfl is not None and context.poisoned_clients:
-                    _kd_m = getattr(config, "ours_kd", "ekd")
-                    ghost = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
-                    ghost_start = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
-                    if ghost_start is not None:
-                        ghost.set_weights(ghost_start)
-                    if _kd_m == "abkd":
-                        ghost_distill_loss = abkd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
-                                                        config.ab_alpha, config.ab_beta, config.ours_temperature)
-                    else:
-                        ghost_distill_loss = ekd_stage(ghost, consensus_logits, public_features, config.batch_size, self.kd_epochs,
-                                                       getattr(config, "ours_ekd_lambda", 1.0))
-                    ghost_w = ghost.get_weights()
-                    del ghost
-                    poisoned_w = poisonedfl_unified_weights([ghost_w], _pfl)
-                    poisonedfl_store_round_weights(context.shared_state, ghost_w, poisoned_w, _pfl)
-                    _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
-                    context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost KD'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
-                    if not getattr(config, "mixed_models", False):
-                        _pool_g = context.model_pool
-                        for st in context.client_states:
-                            if st.client_id in context.poisoned_clients:
-                                m = _pool_g.checkout(st.client_id)
-                                m.set_weights(poisoned_w)
-                                _pool_g.checkin(st.client_id, m)
-                    del ghost_w, poisoned_w
-                    aggressive_memory_cleanup()
+                kd_public_features = np.asarray(public_features[supported_mask], dtype=np.float32) if not supported_mask.all() else np.asarray(public_features, dtype=np.float32)
+                kd_consensus_logits = consensus_logits[supported_mask]
+                self._run_kd_stage(context, kd_consensus_logits, kd_public_features, first_client=first_kd)
+                self._run_poisonedfl_ghost_stage(context, kd_consensus_logits, kd_public_features, round_number)
 
                 del consensus_logits
+                del kd_public_features, kd_consensus_logits, supported_mask
                 if os.path.exists(consensus_path):
                     os.remove(consensus_path)
+                if eva_mode is not None and os.path.exists(support_mask_path):
+                    os.remove(support_mask_path)
 
         del public_features
         aggressive_memory_cleanup()

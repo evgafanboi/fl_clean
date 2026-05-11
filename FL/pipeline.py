@@ -88,6 +88,7 @@ def _config_fingerprint(config) -> str:
     d.pop('rounds', None)
     d.pop('skip_eval', None)
     d.pop('fresh_run', None)
+    d.pop('robust_workers', None)
     raw = str(sorted(d.items()))
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
