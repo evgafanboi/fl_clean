@@ -506,6 +506,28 @@ class AdaptiveRobustFilter:
                     max_eig = block_max_eig
         return counts.astype(np.float64) / n_rows, max_eig
 
+    def _count_tails(self, S_act: np.ndarray) -> Tuple[np.ndarray, Optional[float]]:
+        from scipy.special import ndtri
+        n_rows, K_act, _ = S_act.shape
+        k_vals = np.arange(1, K_act + 1, dtype=np.float64)
+        ref_hn = ndtri(0.5 + 0.5 * (k_vals - 0.375) / (K_act + 0.25))
+        if self.workers == 1 or n_rows <= self.row_block_size:
+            return _adaptive_tail_block(S_act, ref_hn)
+        counts = np.zeros(K_act, dtype=np.int64)
+        max_eig = None
+        blocks = list(self._iter_row_blocks(n_rows))
+        with ThreadPoolExecutor(max_workers=min(self.workers, len(blocks))) as pool:
+            futures = [
+                pool.submit(_adaptive_tail_block, S_act[start:end], ref_hn)
+                for start, end in blocks
+            ]
+            for future in futures:
+                block_counts, block_max_eig = future.result()
+                counts += block_counts
+                if max_eig is None or block_max_eig > max_eig:
+                    max_eig = block_max_eig
+        return counts, max_eig
+
     def _select_flagged(self, scores: np.ndarray, budget_left: int) -> np.ndarray:
         flagged = np.where(scores >= self.tail_threshold)[0]
         if len(flagged) <= budget_left:
@@ -551,6 +573,150 @@ class IterativeRobustFilter(AdaptiveRobustFilter):
             return flagged
         best_local = int(flagged[np.argmax(scores[flagged])])
         return np.array([best_local], dtype=np.int64)
+
+
+class RobustFilterV3:
+    """
+    Per-sample batch-spectral filter.
+
+    For each public sample, projects onto the top covariance eigenvector,
+    MAD-standardises, then removes ALL clients whose sorted standardised
+    deviation exceeds its rank-specific Blom half-normal reference in one
+    batch.  The mean and covariance are recomputed on the surviving set and
+    the check is repeated until no client exceeds its reference or fewer
+    than K//2 clients remain for that sample.
+
+    Discard counts are accumulated across all samples; clients whose discard
+    fraction exceeds robust_threshold are excluded from the final mean.
+    No budget parameter — K//2 floor and robust_threshold are the only controls.
+
+    Parameters
+    ----------
+    robust_threshold : float
+        Remove client i if (times_discarded / n_samples) > robust_threshold.
+        Default 0.3.
+    workers : int
+        Number of row-block worker threads.
+    row_block_size : int
+        Rows per worker block.
+    """
+
+    def __init__(self, robust_threshold: float = 0.3, workers: int = 8, row_block_size: int = 4096, **_kw):
+        self.robust_threshold = robust_threshold
+        self.workers = max(1, int(workers))
+        self.row_block_size = max(1, int(row_block_size))
+
+    def _iter_row_blocks(self, n_rows: int):
+        for start in range(0, n_rows, self.row_block_size):
+            yield start, min(start + self.row_block_size, n_rows)
+
+    def count_discards_block(self, S_block: np.ndarray) -> Tuple[np.ndarray, Optional[float]]:
+        from scipy.special import ndtri
+        S_block = _finite_block(S_block)
+        rows, K, D = S_block.shape
+        K_min = max(K // 2, 1)
+        discard_mask = np.zeros((rows, K), dtype=bool)
+        pending = np.ones(rows, dtype=bool)
+        g_max_eig = None
+
+        # Precompute Blom reference vectors for every possible active-client count.
+        blom_refs = {
+            k: ndtri(0.5 + 0.5 * (np.arange(1, k + 1, dtype=np.float64) - 0.375) / (k + 0.25))
+            for k in range(max(K_min, 1), K + 1)
+        }
+
+        for _ in range(K - K_min):
+            row_idx = np.flatnonzero(pending)
+            if row_idx.size == 0:
+                break
+            active = ~discard_mask[row_idx]
+            counts = active.sum(axis=1)
+
+            too_few = counts <= K_min
+            if too_few.any():
+                pending[row_idx[too_few]] = False
+                row_idx = row_idx[~too_few]
+                if row_idx.size == 0:
+                    break
+                active = active[~too_few]
+                counts = counts[~too_few]
+
+            # ── batched eigendecomposition over all pending rows ──────────
+            block = S_block[row_idx].astype(np.float64)
+            act_f = active.astype(np.float64)
+            mu = np.einsum('rk,rkd->rd', act_f, block) / counts[:, None]
+            centered = (block - mu[:, None, :]) * active[:, :, None]
+            Sigma = np.einsum('nkd,nke->nde', centered, centered) / np.maximum(counts - 1, 1)[:, None, None]
+            eigenvalues, eigenvectors = np.linalg.eigh(Sigma)
+            cur_max = float(eigenvalues[:, -1].max())
+            if g_max_eig is None or cur_max > g_max_eig:
+                g_max_eig = cur_max
+
+            v_star = eigenvectors[:, :, -1]
+            projections = np.einsum('nkd,nd->nk', centered, v_star)
+            proj_active = np.where(active, projections, np.nan)
+            med_p = np.nanmedian(proj_active, axis=1, keepdims=True)
+            abs_dev = np.abs(projections - med_p)
+            sigma_r = np.maximum(
+                np.nanmedian(np.where(active, abs_dev, np.nan), axis=1, keepdims=True) * 1.4826,
+                1e-10,
+            )
+            # inactive clients get -inf so they never exceed any reference
+            abs_z = np.where(active, abs_dev / sigma_r, -np.inf)
+
+            # ── sort per row; active clients occupy the rightmost K_r slots ─
+            sort_idx = np.argsort(abs_z, axis=1)                      # (n_pending, K)
+            sorted_z = np.take_along_axis(abs_z, sort_idx, axis=1)    # (n_pending, K)
+
+            # ── compare all active ranks to their Blom reference; batch per K_r ─
+            new_discards = np.zeros((len(row_idx), K), dtype=bool)
+            any_flagged = False
+            for K_r in np.unique(counts):
+                K_r = int(K_r)
+                if K_r <= K_min:
+                    continue
+                grp = counts == K_r
+                ref = blom_refs[K_r]                              # (K_r,)
+                active_z = sorted_z[grp, K - K_r:]                # (n_grp, K_r)
+                exceeds = active_z > ref[None, :]                  # (n_grp, K_r)
+                if not exceeds.any():
+                    continue
+                any_flagged = True
+                active_idx = sort_idx[grp, K - K_r:]              # (n_grp, K_r)
+                flag = np.zeros((int(grp.sum()), K), dtype=bool)
+                np.put_along_axis(flag, active_idx, exceeds, axis=1)
+                new_discards[grp] |= flag
+
+            if not any_flagged:
+                pending[:] = False
+                break
+
+            had_flag = new_discards.any(axis=1)
+            discard_mask[row_idx] |= new_discards
+            pending[row_idx[~had_flag]] = False
+
+        return discard_mask.sum(axis=0).astype(np.int64), g_max_eig
+
+    def count_discards(self, S_batch: np.ndarray) -> Tuple[np.ndarray, Optional[float]]:
+        S_batch = _finite_block(S_batch)
+        rows, K, _ = S_batch.shape
+        blocks = list(self._iter_row_blocks(rows))
+        effective_workers = min(self.workers, len(blocks)) if self.workers > 1 else 1
+        if effective_workers == 1:
+            return self.count_discards_block(S_batch)
+        total_counts = np.zeros(K, dtype=np.int64)
+        g_max_eig = None
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            futures = [
+                pool.submit(self.count_discards_block, S_batch[start:end])
+                for start, end in blocks
+            ]
+            for future in futures:
+                counts, block_max = future.result()
+                total_counts += counts
+                if block_max is not None and (g_max_eig is None or block_max > g_max_eig):
+                    g_max_eig = block_max
+        return total_counts, g_max_eig
 
 
 class RobustFilterWeights(RobustFilter):

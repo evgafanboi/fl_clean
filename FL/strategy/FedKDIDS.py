@@ -444,7 +444,7 @@ class FedKDIDS(DistillationStrategy):
                 continue
 
             _pfl_s2 = getattr(context, 'poisoned_fl_state', None)
-            if _pfl_s2 is not None and state.client_id in context.poisoned_clients:
+            if state.client_id in context.poisoned_clients and (_pfl_s2 is not None or attack_type == "lma"):
                 continue
 
             if s2_idx > 0 and s2_idx % _REFRESH_EVERY == 0:
@@ -474,7 +474,10 @@ class FedKDIDS(DistillationStrategy):
                 model = create_model(context.input_dim, context.num_classes,
                                      config.batch_size, model_type=arch)
 
-            model.set_weights(state.data["w"] if state.data["w"] is not None else context.shared_state["init_w"])
+            if state.data["w"] is not None:
+                model.set_weights(state.data["w"])
+            elif not _mixed:
+                model.set_weights(context.shared_state["init_w"])
             print(f"Client {state.client_id}: training on pseudo-labeled public data")
             model.fit(public_ds, epochs=config.dist_rounds, verbose=0)
             state.data["w"] = model.get_weights()

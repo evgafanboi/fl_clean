@@ -34,7 +34,9 @@ class FDConfig:
     robust_rm_budget: Optional[int] = None
     robust_threshold: float = 0.75
     robust_workers: int = 8
+    robust_filter_v1: bool = False
     robust_filter_v2: bool = False
+    robust_filter_v3: bool = False
     robust_filter_cronus: bool = False
     eva: bool = False
     eva2: bool = False
