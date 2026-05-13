@@ -695,7 +695,7 @@ class RobustFilterV3:
             discard_mask[row_idx] |= new_discards
             pending[row_idx[~had_flag]] = False
 
-        return discard_mask.sum(axis=0).astype(np.int64), g_max_eig
+        return discard_mask.sum(axis=0).astype(np.int64), discard_mask, g_max_eig
 
     def count_discards(self, S_batch: np.ndarray) -> Tuple[np.ndarray, Optional[float]]:
         S_batch = _finite_block(S_batch)
@@ -703,7 +703,8 @@ class RobustFilterV3:
         blocks = list(self._iter_row_blocks(rows))
         effective_workers = min(self.workers, len(blocks)) if self.workers > 1 else 1
         if effective_workers == 1:
-            return self.count_discards_block(S_batch)
+            counts, _, g_max_eig = self.count_discards_block(S_batch)
+            return counts, g_max_eig
         total_counts = np.zeros(K, dtype=np.int64)
         g_max_eig = None
         with ThreadPoolExecutor(max_workers=effective_workers) as pool:
@@ -712,11 +713,33 @@ class RobustFilterV3:
                 for start, end in blocks
             ]
             for future in futures:
-                counts, block_max = future.result()
+                counts, _, block_max = future.result()
                 total_counts += counts
                 if block_max is not None and (g_max_eig is None or block_max > g_max_eig):
                     g_max_eig = block_max
         return total_counts, g_max_eig
+
+    def count_discards_mask(self, S_batch: np.ndarray) -> Tuple[np.ndarray, Optional[float]]:
+        S_batch = _finite_block(S_batch)
+        rows, K, _ = S_batch.shape
+        blocks = list(self._iter_row_blocks(rows))
+        effective_workers = min(self.workers, len(blocks)) if self.workers > 1 else 1
+        if effective_workers == 1:
+            _, full_mask, g_max_eig = self.count_discards_block(S_batch)
+            return full_mask, g_max_eig
+        full_mask = np.zeros((rows, K), dtype=bool)
+        g_max_eig = None
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            futures = [
+                (start, end, pool.submit(self.count_discards_block, S_batch[start:end]))
+                for start, end in blocks
+            ]
+            for start, end, future in futures:
+                _, block_mask, block_max = future.result()
+                full_mask[start:end] = block_mask
+                if block_max is not None and (g_max_eig is None or block_max > g_max_eig):
+                    g_max_eig = block_max
+        return full_mask, g_max_eig
 
 
 class RobustFilterWeights(RobustFilter):

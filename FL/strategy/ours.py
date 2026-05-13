@@ -254,6 +254,7 @@ def compute_robust_consensus_from_files(
     if isinstance(robust_filter, RobustFilterV3):
         total_counts = np.zeros(n_clients, dtype=np.int64)
         total_rows = 0
+        chunk_masks = []
         handles = [open(fpath, "rb") for fpath in logit_files]
         pbar = tqdm(total=n_samples, desc="Scoring (v3)", unit="sample")
         for offset in range(0, n_samples, chunk_rows):
@@ -263,8 +264,9 @@ def compute_robust_consensus_from_files(
                 for h in handles
             ]
             S_batch = np.stack(client_chunks, axis=1)
-            chunk_counts, chunk_max = robust_filter.count_discards(S_batch)
-            total_counts += chunk_counts
+            chunk_mask, chunk_max = robust_filter.count_discards_mask(S_batch)
+            total_counts += chunk_mask.sum(axis=0)
+            chunk_masks.append(chunk_mask)
             total_rows += rows
             if chunk_max is not None and (max_eig is None or chunk_max > max_eig):
                 max_eig = chunk_max
@@ -278,21 +280,35 @@ def compute_robust_consensus_from_files(
         for c in range(n_clients):
             if not survivor[c]:
                 removal_counts[c] = total_rows
+        n_failed = int((~survivor).sum())
+        failed_fracs = sorted([(c, float(discard_frac[c])) for c in range(n_clients) if not survivor[c]], key=lambda x: -x[1])
+        msg = f"  V3 filter: threshold={robust_filter.robust_threshold:.2f} | {n_failed}/{n_clients} clients failed | top failed: {failed_fracs[:10]}"
+        print(msg)
+        if logger is not None:
+            logger.info(msg)
+        v3_supported = np.zeros(n_samples, dtype=bool)
         handles = [open(fpath, "rb") for fpath in logit_files]
         pbar = tqdm(total=n_samples, desc="Mean pass (v3)", unit="sample")
-        for offset in range(0, n_samples, chunk_rows):
+        for chunk_i, offset in enumerate(range(0, n_samples, chunk_rows)):
             rows = min(chunk_rows, n_samples - offset)
             client_chunks = [
                 _sanitize_logits(np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes))
                 for h in handles
             ]
             S_batch = np.stack(client_chunks, axis=1)
-            consensus[offset : offset + rows] = S_batch[:, survivor, :].mean(axis=1).astype(np.float32)
+            per_sample_alive = (~chunk_masks[chunk_i]) & survivor[np.newaxis, :]
+            alive_f = per_sample_alive.astype(np.float32)
+            n_alive = alive_f.sum(axis=1, keepdims=True)
+            has_alive = (n_alive[:, 0] > 0)
+            v3_supported[offset:offset + rows] = has_alive
+            n_alive = n_alive.clip(min=1)
+            consensus[offset:offset + rows] = (np.einsum('rkc,rk->rc', S_batch, alive_f, optimize=True) / n_alive).astype(np.float32)
             pbar.update(rows)
-            del client_chunks, S_batch
+            del client_chunks, S_batch, per_sample_alive, alive_f, n_alive
         pbar.close()
         for h in handles:
             h.close()
+        return consensus, max_eig, max_ratio, removal_counts, eig_report, v3_supported
     elif type(robust_filter) is AdaptiveRobustFilter:
         active = np.ones(n_clients, dtype=bool)
         removed_total = 0
@@ -408,7 +424,7 @@ def compute_robust_consensus_from_files(
             "max_eig": float(top_eigs.max()),
         }
 
-    return consensus, max_eig, max_ratio, removal_counts, eig_report
+    return consensus, max_eig, max_ratio, removal_counts, eig_report, None
 
 
 def compute_supported_consensus_from_files(
@@ -434,20 +450,13 @@ def compute_supported_consensus_from_files(
     samplewise_cronus = isinstance(robust_filter, CronusRobustFilter)
     eig_chunks = [] if samplewise_cronus else None
 
-    log_handles = [open(fpath, "rb") for fpath in logit_files]
-    support_handles = [open(fpath, "rb") for fpath in support_files]
-    pbar = tqdm(total=n_samples, desc="Robust consensus", unit="sample")
     budget = getattr(robust_filter, "budget", 0) if robust_filter is not None else 0
     global_v3 = isinstance(robust_filter, RobustFilterV3) if robust_filter is not None else False
     global_adaptive = type(robust_filter) is AdaptiveRobustFilter if robust_filter is not None else False
     if global_v3:
         total_counts = np.zeros(n_clients, dtype=np.int64)
         total_rows_v3 = 0
-        pbar.close()
-        for h in log_handles:
-            h.close()
-        for h in support_handles:
-            h.close()
+        chunk_masks = []
         handles = [open(fpath, "rb") for fpath in logit_files]
         score_pbar = tqdm(total=n_samples, desc="Scoring (v3)", unit="sample")
         for offset in range(0, n_samples, chunk_rows):
@@ -457,8 +466,9 @@ def compute_supported_consensus_from_files(
                 for h in handles
             ]
             S_batch = np.stack(client_chunks, axis=1)
-            chunk_counts, chunk_max = robust_filter.count_discards(S_batch)
-            total_counts += chunk_counts
+            chunk_mask, chunk_max = robust_filter.count_discards_mask(S_batch)
+            total_counts += chunk_mask.sum(axis=0)
+            chunk_masks.append(chunk_mask)
             total_rows_v3 += rows
             if chunk_max is not None and (max_eig is None or chunk_max > max_eig):
                 max_eig = chunk_max
@@ -472,11 +482,16 @@ def compute_supported_consensus_from_files(
         for c in range(n_clients):
             if not survivor[c]:
                 removal_counts[c] = total_rows_v3
-        survivor_weights = survivor.astype(np.float32)
+        n_failed = int((~survivor).sum())
+        failed_fracs = sorted([(c, float(discard_frac[c])) for c in range(n_clients) if not survivor[c]], key=lambda x: -x[1])
+        msg = f"  V3 filter: threshold={robust_filter.robust_threshold:.2f} | {n_failed}/{n_clients} clients failed | top failed: {failed_fracs[:10]}"
+        print(msg)
+        if logger is not None:
+            logger.info(msg)
         log_handles = [open(fpath, "rb") for fpath in logit_files]
         support_handles = [open(fpath, "rb") for fpath in support_files]
         mean_pbar = tqdm(total=n_samples, desc="Mean pass (v3)", unit="sample")
-        for offset in range(0, n_samples, chunk_rows):
+        for chunk_i, offset in enumerate(range(0, n_samples, chunk_rows)):
             rows = min(chunk_rows, n_samples - offset)
             client_chunks = [
                 _sanitize_logits(np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes))
@@ -489,10 +504,11 @@ def compute_supported_consensus_from_files(
             S_batch = np.stack(client_chunks, axis=1)
             Q_batch = np.stack(support_chunks, axis=1).astype(np.float32)
             chunk_consensus = consensus[offset:offset + rows]
+            per_sample_alive = (~chunk_masks[chunk_i]) & survivor[np.newaxis, :]
             if mode == "eva" or mode == "eva2":
-                Q_survivors = (Q_batch > 0.0).astype(np.float32) * survivor_weights
+                Q_survivors = (Q_batch > 0.0).astype(np.float32) * per_sample_alive.astype(np.float32)
             else:
-                Q_survivors = Q_batch * survivor_weights
+                Q_survivors = Q_batch * per_sample_alive.astype(np.float32)
             support_mass = Q_survivors.sum(axis=1)
             valid = support_mass > 0.0
             if valid.any():
@@ -500,7 +516,7 @@ def compute_supported_consensus_from_files(
                 chunk_consensus[valid] = (weighted_sum / support_mass[valid, np.newaxis]).astype(np.float32)
                 supported_mask[offset:offset + rows] = valid
                 del weighted_sum
-            del Q_survivors, support_mass, valid
+            del Q_survivors, support_mass, valid, per_sample_alive
             mean_pbar.update(rows)
             del client_chunks, support_chunks, S_batch, Q_batch
         mean_pbar.close()
@@ -509,11 +525,6 @@ def compute_supported_consensus_from_files(
         for handle in support_handles:
             handle.close()
     elif global_adaptive:
-        pbar.close()
-        for h in log_handles:
-            h.close()
-        for h in support_handles:
-            h.close()
         active = np.ones(n_clients, dtype=bool)
         removed_total = 0
         g_max_eig = None
@@ -592,6 +603,9 @@ def compute_supported_consensus_from_files(
         for handle in support_handles:
             handle.close()
     else:
+        log_handles = [open(fpath, "rb") for fpath in logit_files]
+        support_handles = [open(fpath, "rb") for fpath in support_files]
+        pbar = tqdm(total=n_samples, desc="Robust consensus", unit="sample")
         for offset in range(0, n_samples, chunk_rows):
             rows = min(chunk_rows, n_samples - offset)
             client_chunks = [
@@ -1558,13 +1572,13 @@ class Ours(DistillationStrategy):
                         )
                     else:
                         print(f"\n{COLORS.OKCYAN}Computing robust consensus logits (budget={budget}){COLORS.ENDC}")
-                        consensus_logits, max_eig, max_ratio, removal_counts, eig_report = compute_robust_consensus_from_files(
+                        consensus_logits, max_eig, max_ratio, removal_counts, eig_report, v3_mask = compute_robust_consensus_from_files(
                             logit_files, logit_shape, self.robust_filter,
                             poisoned_client_ids=(None if _pfl is not None else context.poisoned_clients),
                             logger=context.logger,
                             round_number=round_number,
                         )
-                        supported_mask = np.ones(len(consensus_logits), dtype=bool)
+                        supported_mask = v3_mask if v3_mask is not None else np.ones(len(consensus_logits), dtype=bool)
                         print(f"  Consensus shape: {consensus_logits.shape}")
                         eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
                         ratio_s = f"{max_ratio:.4f}" if max_ratio is not None else "N/A"
