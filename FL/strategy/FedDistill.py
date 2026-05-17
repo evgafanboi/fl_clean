@@ -14,7 +14,7 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_log_values, poisonedfl_unified_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_broadcast_weights, poisonedfl_log_values
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, load_public_dataset_from_clients, lma_logits as _lma_logits, numpy_from_dataset
@@ -401,8 +401,7 @@ class FedDistillExpGuard(DistillationStrategy):
         # ---- PoisonedFL: poison the current global model once, then copy logits ----
         _pfl = getattr(context, "poisoned_fl_state", None)
         if _pfl is not None and context.poisoned_clients:
-            poisoned_w = poisonedfl_unified_weights([global_w], _pfl)
-            context.shared_state["poisonedfl_ghost_w"] = [w.copy() for w in poisoned_w]
+            poisoned_w = poisonedfl_broadcast_weights(global_w, _pfl)
             poison_model = create_model(context.input_dim, context.num_classes,
                                         config.batch_size, model_type=config.model_type)
             poison_model.set_weights(poisoned_w)
@@ -415,7 +414,7 @@ class FedDistillExpGuard(DistillationStrategy):
             del poison_model
             _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl)
             context.logger.info(
-                "Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost global model generated soft labels for %d clients",
+                "Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Broadcast global model generated soft labels for %d clients",
                 round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients),
             )
 

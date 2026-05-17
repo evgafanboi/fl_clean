@@ -45,6 +45,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robust_filter_v1", action="store_true", help="Ours: use one-shot contiguous-tail filter (AdaptiveRobustFilter, old default)")
     parser.add_argument("--robust_filter_v2", action="store_true", help="Ours: use one-removal-per-pass iterative robust filter")
     parser.add_argument("--robust_filter_v3", action="store_true", help="Ours: use per-sample batch-spectral filter (default)")
+    parser.add_argument("--robust_filter_v4", action="store_true", help="Ours: use per-sample batch-spectral filter with CoMed center + t-distribution reference")
+    parser.add_argument("--robust_v", type=float, default=4.0, help="V4 t-distribution degrees of freedom (lower = more lenient)")
     parser.add_argument("--robust_filter_cronus", action="store_true", help="Ours: use pooled Cronus robust filter")
     # cronus
     parser.add_argument("--remove_dis", action="store_true", help="Cronus: use plain softmax predictions")
@@ -192,6 +194,8 @@ def main(argv=None):
             robust_filter_v1=args.robust_filter_v1,
             robust_filter_v2=args.robust_filter_v2,
             robust_filter_v3=args.robust_filter_v3,
+            robust_filter_v4=args.robust_filter_v4,
+            robust_v=args.robust_v,
             robust_filter_cronus=args.robust_filter_cronus,
             eva=args.eva,
             eva2=args.eva2,

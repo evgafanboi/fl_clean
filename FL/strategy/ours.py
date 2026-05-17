@@ -17,7 +17,7 @@ from ..context import PipelineContext
 from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
-from .robust_filter import AdaptiveRobustFilter, CronusRobustFilter, IterativeRobustFilter, RobustFilterV3
+from .robust_filter import AdaptiveRobustFilter, CronusRobustFilter, IterativeRobustFilter, RobustFilterV3, RobustFilterV4
 from .common import (
     create_model,
     create_private_dataset,
@@ -40,6 +40,25 @@ EVW_TAU2 = 1.0
 
 def _sanitize_logits(logits: np.ndarray, cap: float = LOGIT_ABS_CAP) -> np.ndarray:
     return np.nan_to_num(logits, nan=0.0, posinf=cap, neginf=-cap).astype(np.float32, copy=False)
+
+
+def _format_v3_discard_ratios(discard_frac: np.ndarray, survivor: np.ndarray, limit: int = 10) -> List[Tuple[int, float]]:
+    return sorted(
+        [
+            (client_id, round(float(discard_frac[client_id]), 4))
+            for client_id in range(len(discard_frac))
+            if not survivor[client_id]
+        ],
+        key=lambda item: -item[1],
+    )[:limit]
+
+
+def _format_removal_summary(robust_filter, removal_counts: Dict[int, int]) -> Tuple[str, object]:
+    if type(robust_filter) is RobustFilterV3:
+        removed_client_ids = sorted(client_id for client_id, count in removal_counts.items() if count > 0)
+        return "removed client_ids", removed_client_ids
+    top_removed = sorted(removal_counts.items(), key=lambda item: -item[1])
+    return "top removals (client_idx: count)", top_removed[:5]
 
 
 def _eva_mode(config) -> Optional[str]:
@@ -251,7 +270,7 @@ def compute_robust_consensus_from_files(
     samplewise_cronus = isinstance(robust_filter, CronusRobustFilter)
     eig_chunks = [] if samplewise_cronus else None
 
-    if isinstance(robust_filter, RobustFilterV3):
+    if isinstance(robust_filter, (RobustFilterV3, RobustFilterV4)):
         total_counts = np.zeros(n_clients, dtype=np.int64)
         total_rows = 0
         chunk_masks = []
@@ -281,8 +300,8 @@ def compute_robust_consensus_from_files(
             if not survivor[c]:
                 removal_counts[c] = total_rows
         n_failed = int((~survivor).sum())
-        failed_fracs = sorted([(c, float(discard_frac[c])) for c in range(n_clients) if not survivor[c]], key=lambda x: -x[1])
-        msg = f"  V3 filter: threshold={robust_filter.robust_threshold:.2f} | {n_failed}/{n_clients} clients failed | top failed: {failed_fracs[:10]}"
+        failed_ratios = _format_v3_discard_ratios(discard_frac, survivor)
+        msg = f"  V3 filter: threshold={robust_filter.robust_threshold:.2f} | {n_failed}/{n_clients} clients failed | top discard ratios: {failed_ratios}"
         print(msg)
         if logger is not None:
             logger.info(msg)
@@ -451,7 +470,7 @@ def compute_supported_consensus_from_files(
     eig_chunks = [] if samplewise_cronus else None
 
     budget = getattr(robust_filter, "budget", 0) if robust_filter is not None else 0
-    global_v3 = isinstance(robust_filter, RobustFilterV3) if robust_filter is not None else False
+    global_v3 = isinstance(robust_filter, (RobustFilterV3, RobustFilterV4)) if robust_filter is not None else False
     global_adaptive = type(robust_filter) is AdaptiveRobustFilter if robust_filter is not None else False
     if global_v3:
         total_counts = np.zeros(n_clients, dtype=np.int64)
@@ -483,8 +502,8 @@ def compute_supported_consensus_from_files(
             if not survivor[c]:
                 removal_counts[c] = total_rows_v3
         n_failed = int((~survivor).sum())
-        failed_fracs = sorted([(c, float(discard_frac[c])) for c in range(n_clients) if not survivor[c]], key=lambda x: -x[1])
-        msg = f"  V3 filter: threshold={robust_filter.robust_threshold:.2f} | {n_failed}/{n_clients} clients failed | top failed: {failed_fracs[:10]}"
+        failed_ratios = _format_v3_discard_ratios(discard_frac, survivor)
+        msg = f"  V3 filter: threshold={robust_filter.robust_threshold:.2f} | {n_failed}/{n_clients} clients failed | top discard ratios: {failed_ratios}"
         print(msg)
         if logger is not None:
             logger.info(msg)
@@ -1011,6 +1030,12 @@ class Ours(DistillationStrategy):
                 budget=getattr(config, "robust_rm_budget", None) or 0,
                 workers=getattr(config, "robust_workers", 8),
             )
+        elif getattr(config, "robust_filter_v4", False):
+            self.robust_filter = RobustFilterV4(
+                robust_threshold=getattr(config, "robust_threshold", 0.3),
+                t_df=getattr(config, "robust_v", 4.0),
+                workers=getattr(config, "robust_workers", 8),
+            )
         elif getattr(config, "robust_filter_v2", False):
             self.robust_filter = IterativeRobustFilter(
                 budget=getattr(config, "robust_rm_budget", None) or 0,
@@ -1036,6 +1061,10 @@ class Ours(DistillationStrategy):
             tokens["eva_mode"] = self.eva_mode
         if getattr(self.config, "robust_filter_cronus", False):
             tokens["robust_filter"] = "cronus"
+        if getattr(self.config, "robust_filter_v4", False):
+            tokens["robust_filter"] = "v4"
+            tokens["robust_threshold"] = getattr(self.config, "robust_threshold", 0.3)
+            tokens["robust_v"] = getattr(self.config, "robust_v", 4.0)
         elif getattr(self.config, "robust_filter_v2", False):
             tokens["robust_filter"] = "v2"
         elif getattr(self.config, "robust_filter_v1", False):
@@ -1410,7 +1439,7 @@ class Ours(DistillationStrategy):
         config = context.config
         public_features = np.load(context.shared_state["public_features_path"], mmap_mode="r")
         eva_mode = self.eva_mode
-        no_filter = not isinstance(self.robust_filter, RobustFilterV3) and getattr(config, "robust_rm_budget", 0) == 0 and eva_mode is None
+        no_filter = not isinstance(self.robust_filter, (RobustFilterV3, RobustFilterV4)) and getattr(config, "robust_rm_budget", 0) == 0 and eva_mode is None
         _pfl = getattr(context, 'poisoned_fl_state', None)
 
         os.makedirs(LOGITS_CACHE_DIR, exist_ok=True)
@@ -1518,7 +1547,7 @@ class Ours(DistillationStrategy):
                         "logit_shape is None — no logit files were produced or recovered. "
                         "Check that client logit .bin files exist in the cache directory."
                     )
-                if skip_kd and os.path.exists(consensus_path):
+                if skip_logits and os.path.exists(consensus_path):
                     print(f"\n{COLORS.OKCYAN}Loading cached consensus logits{COLORS.ENDC}")
                     consensus_logits = np.load(consensus_path)
                     if eva_mode is not None and os.path.exists(support_mask_path):
@@ -1544,11 +1573,11 @@ class Ours(DistillationStrategy):
                         if budget > 0:
                             eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
                             ratio_s = f"{max_ratio:.4f}" if max_ratio is not None else "N/A"
-                            top_removed = sorted(removal_counts.items(), key=lambda x: -x[1])
-                            print(f"  max_eig={eig_s}  max_ratio={ratio_s}  top removals (client_idx: count): {top_removed[:5]}")
+                            removal_label, removal_value = _format_removal_summary(self.robust_filter, removal_counts)
+                            print(f"  max_eig={eig_s}  max_ratio={ratio_s}  {removal_label}: {removal_value}")
                             context.logger.info(
                                 "Round %s | EVAConsensus | mode=%s | max_eig=%s | max_ratio=%s | removals=%s | unsupported=%d/%d",
-                                round_number, eva_mode, eig_s, ratio_s, top_removed, unsupported, len(supported_mask),
+                                round_number, eva_mode, eig_s, ratio_s, removal_value, unsupported, len(supported_mask),
                             )
                             if eig_report is not None:
                                 print(f"  pre-filter eigs: min={eig_report['min_eig']:.6f} mean={eig_report['mean_eig']:.6f} med={eig_report['med_eig']:.6f} max={eig_report['max_eig']:.6f}")
@@ -1582,11 +1611,11 @@ class Ours(DistillationStrategy):
                         print(f"  Consensus shape: {consensus_logits.shape}")
                         eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
                         ratio_s = f"{max_ratio:.4f}" if max_ratio is not None else "N/A"
-                        top_removed = sorted(removal_counts.items(), key=lambda x: -x[1])
-                        print(f"  max_eig={eig_s}  max_ratio={ratio_s}  top removals (client_idx: count): {top_removed[:5]}")
+                        removal_label, removal_value = _format_removal_summary(self.robust_filter, removal_counts)
+                        print(f"  max_eig={eig_s}  max_ratio={ratio_s}  {removal_label}: {removal_value}")
                         context.logger.info(
                             "Round %s | RobustConsensus | max_eig=%s | max_ratio=%s | removals=%s",
-                            round_number, eig_s, ratio_s, top_removed,
+                            round_number, eig_s, ratio_s, removal_value,
                         )
                         if eig_report is not None:
                             print(f"  pre-filter eigs: min={eig_report['min_eig']:.6f} mean={eig_report['mean_eig']:.6f} med={eig_report['med_eig']:.6f} max={eig_report['max_eig']:.6f}")
@@ -1597,7 +1626,8 @@ class Ours(DistillationStrategy):
                     np.save(consensus_path, consensus_logits)
                     if eva_mode is not None:
                         np.save(support_mask_path, supported_mask.astype(np.uint8))
-                    context.shared_state["lma_stale_consensus"] = consensus_logits.copy()
+
+                context.shared_state["lma_stale_consensus"] = consensus_logits.copy()
 
                 for fpath in logit_files:
                     if os.path.exists(fpath):

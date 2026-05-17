@@ -37,6 +37,8 @@ class FDConfig:
     robust_filter_v1: bool = False
     robust_filter_v2: bool = False
     robust_filter_v3: bool = False
+    robust_filter_v4: bool = False
+    robust_v: float = 4.0
     robust_filter_cronus: bool = False
     eva: bool = False
     eva2: bool = False
