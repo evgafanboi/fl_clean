@@ -2,7 +2,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 from .colors import COLORS
 
@@ -30,6 +30,62 @@ def _truncate_after_last_round(filepath: str) -> None:
         search_start = line_end + 1
     if last_pos > 0 and last_pos < len(data):
         p.write_bytes(data[:last_pos])
+
+
+def _checkpoint_stem_for_log(filepath: str) -> str:
+    stem = Path(filepath).stem
+    detailed_suffix = "_detailed_class_metrics"
+    if stem.endswith(detailed_suffix):
+        stem = stem[:-len(detailed_suffix)]
+    return stem
+
+
+def _load_checkpoint_info_for_log(filepath: str) -> Dict[str, str]:
+    stem = _checkpoint_stem_for_log(filepath)
+    info_path = Path("checkpoint") / stem / "info.txt"
+    if not info_path.exists():
+        return {}
+    info: Dict[str, str] = {}
+    for line in info_path.read_text().splitlines():
+        key, _, val = line.partition(": ")
+        if key:
+            info[key] = val
+    return info
+
+
+def _truncate_after_checkpoint_client(filepath: str, round_number: int, client_id: int) -> bool:
+    p = Path(filepath)
+    if not p.exists():
+        return False
+    data = p.read_bytes()
+    prefix = f"Round {round_number} | Client {client_id}".encode()
+    safe_end = -1
+    offset = 0
+    for line in data.splitlines(keepends=True):
+        if prefix in line:
+            safe_end = offset + len(line)
+        offset += len(line)
+    if safe_end > 0 and safe_end < len(data):
+        p.write_bytes(data[:safe_end])
+        return True
+    return False
+
+
+def _truncate_for_resume(filepath: str) -> None:
+    info = _load_checkpoint_info_for_log(filepath)
+    if not info:
+        _truncate_after_last_round(filepath)
+        return
+    if info.get("round_complete", "true") == "true":
+        _truncate_after_last_round(filepath)
+        return
+    try:
+        round_number = int(info.get("round", "0"))
+        client_id = int(info.get("stage_client", "-1"))
+    except ValueError:
+        return
+    if client_id >= 0 and _truncate_after_checkpoint_client(filepath, round_number, client_id):
+        return
 
 
 def log_timestamp(logger: logging.Logger, message: str) -> None:
@@ -69,10 +125,10 @@ def setup_logger(
 
     mode = 'a' if resume else 'w'
     if resume:
-        _truncate_after_last_round(log_filename)
+        _truncate_for_resume(log_filename)
         if create_detailed_log:
             detailed_log_filename = log_filename.replace('.log', '_detailed_class_metrics.log')
-            _truncate_after_last_round(detailed_log_filename)
+            _truncate_for_resume(detailed_log_filename)
 
     logging.basicConfig(
         filename=log_filename,

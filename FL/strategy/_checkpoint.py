@@ -36,6 +36,8 @@ from typing import Any, Dict, Optional
 
 from ..colors import COLORS
 
+_POISONEDFL_STATE_KEY = "__poisoned_fl_state__"
+
 # Avoid circular import — callers pass PipelineContext; we only need .log_filename
 # so we accept Any.
 
@@ -57,6 +59,9 @@ def save_mid_round(context: Any, tag: str, payload: Dict[str, Any]) -> None:
     os.makedirs(d, exist_ok=True)
     tmp = os.path.join(d, f"{tag}_mid.bin.tmp")
     dst = os.path.join(d, f"{tag}_mid.bin")
+    if getattr(context, "poisoned_fl_state", None) is not None and _POISONEDFL_STATE_KEY not in payload:
+        payload = dict(payload)
+        payload[_POISONEDFL_STATE_KEY] = context.poisoned_fl_state
 
     # Determine first_idx: only write clients that are new since the last checkpoint
     # (same stage = incremental; stage transition = full rewrite from 0)
@@ -135,6 +140,9 @@ def load_mid_round(context: Any, tag: str, round_number: int) -> Optional[Dict[s
         payload = pickle.load(f)
     if payload.get("round") != round_number:
         return None
+    saved_pfl_state = payload.pop(_POISONEDFL_STATE_KEY, None)
+    if saved_pfl_state is not None:
+        context.poisoned_fl_state = saved_pfl_state
     return payload
 
 

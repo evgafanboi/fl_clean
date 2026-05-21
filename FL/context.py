@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 import numpy as np
 from sklearn.metrics import f1_score, precision_score, recall_score
 from .backend import use_tf as _use_tf
+from .evaluation import summarize_prob_predictions
 if _use_tf():
     import tensorflow as tf
 
@@ -194,11 +195,8 @@ def evaluate_model(model: Any, X_test: np.ndarray, y_labels: np.ndarray,
     # No gradients needed for eval — use a larger batch to saturate the GPU.
     infer_bs = batch_size * 4 if not _use_tf() else batch_size
     preds = base.predict(X_test, batch_size=infer_bs, verbose=0)
-    pred_labels = np.argmax(preds, axis=1).astype(np.int32)
-    y_oh = np.zeros((len(y_labels), num_classes), dtype=np.float32)
-    y_oh[np.arange(len(y_labels)), y_labels] = 1.0
-    loss = float(-np.sum(y_oh * np.log(np.clip(preds, 1e-7, 1.0)))) / len(y_labels)
-    del preds, y_oh
+    pred_labels, loss, auprc, ece = summarize_prob_predictions(y_labels, preds, num_classes)
+    del preds
 
     accuracy = float(np.mean(pred_labels == y_labels))
     f1 = float(f1_score(y_labels, pred_labels, average="macro", zero_division=0))
@@ -210,5 +208,7 @@ def evaluate_model(model: Any, X_test: np.ndarray, y_labels: np.ndarray,
         "F1": f1,
         "Precision": precision,
         "Recall": recall,
+        "AUPRC": auprc,
+        "ECE": ece,
         "Loss": loss,
     }

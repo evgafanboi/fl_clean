@@ -1325,10 +1325,14 @@ class Ours(DistillationStrategy):
             return
 
         _pfl_kd = getattr(context, 'poisoned_fl_state', None)
+        attack_type, _, _ = parse_poison_config(getattr(config, "poison", None))
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_client:
                 continue
-            if _pfl_kd is not None and state.client_id in context.poisoned_clients:
+            _poisoned = state.client_id in context.poisoned_clients
+            if _poisoned and (_pfl_kd is not None or attack_type == "lma"):
+                _tag = "PoisonedFL" if _pfl_kd is not None else "LMA"
+                context.logger.info("Round %s | Client %s [%s] KD skipped", self._cur_round, state.client_id, _tag)
                 continue
             print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 2 ({kd_method.upper()}){COLORS.ENDC}")
             model = pool.checkout(state.client_id)

@@ -1,1 +1,0 @@
-This directory stores log outputs from all simulations.

@@ -7,6 +7,7 @@ from .backend import get_torch_loader_kwargs as _torch_loader_kwargs, use_tf as 
 if _use_tf():
     import tensorflow as tf
 from sklearn.metrics import (
+    average_precision_score,
     classification_report,
     confusion_matrix,
     f1_score,
@@ -15,6 +16,44 @@ from sklearn.metrics import (
 )
 
 PerClassMetrics = Tuple[np.ndarray, np.ndarray, np.ndarray]
+
+
+def summarize_prob_predictions(
+    y_true: np.ndarray,
+    y_pred_proba: np.ndarray,
+    num_classes: int,
+    ece_bins: int = 15,
+) -> Tuple[np.ndarray, float, float, float]:
+    y_true = np.asarray(y_true, dtype=np.int32).ravel()
+    y_pred_proba = np.asarray(y_pred_proba, dtype=np.float64)
+    pred_labels = np.argmax(y_pred_proba, axis=1).astype(np.int32)
+
+    y_true_oh = np.zeros((len(y_true), num_classes), dtype=np.float32)
+    y_true_oh[np.arange(len(y_true)), y_true] = 1.0
+    loss = float(-np.mean(np.sum(y_true_oh * np.log(np.clip(y_pred_proba, 1e-7, 1.0)), axis=1)))
+
+    present_classes = np.flatnonzero(y_true_oh.sum(axis=0) > 0)
+    if len(present_classes) > 0:
+        auprc = float(np.mean([
+            average_precision_score(y_true_oh[:, class_idx], y_pred_proba[:, class_idx])
+            for class_idx in present_classes
+        ]))
+    else:
+        auprc = 0.0
+
+    confidences = y_pred_proba[np.arange(len(pred_labels)), pred_labels]
+    correctness = (pred_labels == y_true).astype(np.float64)
+    bin_ids = np.digitize(confidences, np.linspace(0.0, 1.0, ece_bins + 1)[1:-1], right=True)
+    ece = 0.0
+    total = max(len(confidences), 1)
+    for bin_idx in range(ece_bins):
+        mask = bin_ids == bin_idx
+        if not np.any(mask):
+            continue
+        ece += abs(correctness[mask].mean() - confidences[mask].mean()) * (mask.sum() / total)
+
+    del y_true_oh, confidences, correctness, bin_ids
+    return pred_labels, loss, auprc, float(ece)
 
 
 def evaluate_model_streaming(
@@ -113,7 +152,6 @@ def evaluate_model_with_metrics(
         base_model = base_model.model
 
     y_pred_proba = base_model.predict(test_dataset, verbose=0)
-    y_pred = np.argmax(y_pred_proba, axis=1)
 
     if y_true_cache is not None:
         y_true = y_true_cache
@@ -128,9 +166,7 @@ def evaluate_model_with_metrics(
         y_true = np.concatenate(y_true_parts)
         del y_true_parts
 
-    y_true_oh = np.eye(num_classes, dtype=np.float32)[y_true]
-    test_loss = float(-np.mean(np.sum(y_true_oh * np.log(np.clip(y_pred_proba, 1e-7, 1.0)), axis=1)))
-    del y_true_oh
+    y_pred, test_loss, auprc, ece = summarize_prob_predictions(y_true, y_pred_proba, num_classes)
 
     accuracy = float(np.mean(y_true == y_pred))
 
@@ -172,6 +208,8 @@ def evaluate_model_with_metrics(
         per_class_metrics,
         cm,
         class_report,
+        auprc,
+        ece,
     )
 
 

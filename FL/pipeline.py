@@ -3,6 +3,7 @@ import glob
 import logging
 import os
 import pickle
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -36,6 +37,12 @@ from .decentralized import (
     compute_model_similarity_scores, select_model_similarity_server, log_model_similarity_selection,
 )
 from .poison_utils import parse_poison_config, get_or_create_poisoned_clients, PoisonedDataLoader, apply_gradient_scale_poison, PoisonedFLState
+
+
+_STANDARD_EVAL_COLUMNS = ['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall', 'AUPRC', 'ECE']
+_STANDARD_EVAL_REQUIRED_COLUMNS = ('Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall', 'AUPRC', 'ECE')
+_DISTILL_EVAL_REQUIRED_SUFFIXES = ('Acc', 'F1', 'Precision', 'Recall', 'AUPRC', 'ECE', 'Loss')
+_POISONEDFL_STATE_KEY = "__poisoned_fl_state__"
 
 
 def _record_round_weights(log_filename, round_num, global_weights=None, context=None):
@@ -91,6 +98,31 @@ def _config_fingerprint(config) -> str:
     d.pop('robust_workers', None)
     raw = str(sorted(d.items()))
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _allow_eval_shortcut_from_records(ckpt_info_path: str, config) -> tuple[bool, Dict[str, str]]:
+    if not os.path.exists(ckpt_info_path):
+        return True, {}
+    info = {}
+    with open(ckpt_info_path) as f:
+        for line in f:
+            key, _, val = line.strip().partition(": ")
+            if key:
+                info[key] = val
+    saved_hash = info.get("config_hash", "")
+    current_hash = _config_fingerprint(config)
+    if saved_hash and saved_hash != current_hash:
+        return False, info
+    saved_backend = info.get("backend", "")
+    current_backend = "tensorflow" if _use_tf() else "pytorch"
+    if saved_backend and saved_backend != current_backend:
+        return False, info
+    try:
+        saved_round = int(info.get("round", "0"))
+    except ValueError:
+        return False, info
+    round_complete = info.get("round_complete", "true") == "true"
+    return round_complete and saved_round >= config.rounds, info
 
 
 @dataclass
@@ -489,6 +521,8 @@ class FederatedLearningPipeline:
         })
 
         self._save_strategy_state(ckpt_dir)
+        if self.poisoned_fl_state is not None:
+            self._atomic_pickle(os.path.join(ckpt_dir, "poisoned_fl_state.bin"), self.poisoned_fl_state)
 
         info_lines = [
             f"round: {round_num}",
@@ -535,6 +569,8 @@ class FederatedLearningPipeline:
 
         if ms_prev_scores is not None:
             self._atomic_pickle(os.path.join(ckpt_dir, "ms_prev_scores.bin"), ms_prev_scores)
+        if self.poisoned_fl_state is not None:
+            self._atomic_pickle(os.path.join(ckpt_dir, "poisoned_fl_state.bin"), self.poisoned_fl_state)
 
         self._save_strategy_state(ckpt_dir)
         self.results_df.to_pickle(os.path.join(ckpt_dir, "results_df.pkl"))
@@ -582,6 +618,13 @@ class FederatedLearningPipeline:
         if os.path.exists(ms_path):
             with open(ms_path, "rb") as f:
                 ms_prev_scores = pickle.load(f)
+
+        pfl_state_path = os.path.join(ckpt_dir, "poisoned_fl_state.bin")
+        if os.path.exists(pfl_state_path):
+            with open(pfl_state_path, "rb") as f:
+                self.poisoned_fl_state = pickle.load(f)
+        elif self.poison_attack == "poisonedfl":
+            print(f"{COLORS.WARNING}Checkpoint missing PoisonedFL adaptive state; resume will restart attack adaptation{COLORS.ENDC}")
 
         strategy_state_path = os.path.join(ckpt_dir, "strategy_state.bin")
         if os.path.exists(strategy_state_path):
@@ -1127,16 +1170,21 @@ class FederatedLearningPipeline:
         # Check if final weight records already exist — skip training entirely
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
         record_base = os.path.join("temp_weights", f"{stem}_weight_record")
+        ckpt_info_path = os.path.join(self._checkpoint_dir(), "info.txt")
+        _allow_final_record_shortcut, _shortcut_info = _allow_eval_shortcut_from_records(ckpt_info_path, self.config)
         _final_record_exists = os.path.exists(
             os.path.join(record_base, f"round_{self.config.rounds}", "global_weight.bin")
         )
-        if _final_record_exists:
+        if _final_record_exists and _allow_final_record_shortcut:
             log_timestamp(self.logger, f"Weight records found (round {self.config.rounds}), skipping to evaluation")
             print(f"{COLORS.OKGREEN}Weight records found for round {self.config.rounds} — skipping to evaluation{COLORS.ENDC}")
             self._run_eval_from_records(
                 input_dim, num_classes, class_names, partition_label, excel_filename, record_base,
             )
             return
+        if _final_record_exists and not _allow_final_record_shortcut:
+            _stage = _shortcut_info.get("stage", "?")
+            print(f"{COLORS.WARNING}Final-round weight records exist, but checkpoint is not fully complete (stage={_stage}) — resuming training{COLORS.ENDC}")
 
         # Special handling for None strategy (independent learning)
         if self.config.strategy == "None":
@@ -1458,27 +1506,30 @@ class FederatedLearningPipeline:
         # Resume: load any previously completed rounds
         evaluated_rounds: set = set()
         if self.config.fresh_run:
-            self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
+            self.results_df = pd.DataFrame(columns=_STANDARD_EVAL_COLUMNS)
         elif os.path.exists(progress_path):
             try:
                 self.results_df = pd.read_pickle(progress_path)
-                evaluated_rounds = set(self.results_df['Round'].astype(int).tolist())
-                print(f"{COLORS.OKCYAN}Resuming eval — {len(evaluated_rounds)} rounds already done{COLORS.ENDC}")
             except Exception:
-                self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
+                self.results_df = pd.DataFrame(columns=_STANDARD_EVAL_COLUMNS)
         elif os.path.exists(excel_filename):
             try:
                 try:
                     existing_df = pd.read_excel(excel_filename, sheet_name='Overall_Metrics')
                 except Exception:
                     existing_df = pd.read_excel(excel_filename, sheet_name=0)
-                evaluated_rounds = set(existing_df['Round'].astype(int).tolist())
                 self.results_df = existing_df
-                print(f"{COLORS.OKCYAN}Resuming eval — {len(evaluated_rounds)} rounds already done{COLORS.ENDC}")
             except Exception:
-                self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
+                self.results_df = pd.DataFrame(columns=_STANDARD_EVAL_COLUMNS)
         else:
-            self.results_df = pd.DataFrame(columns=['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall'])
+            self.results_df = pd.DataFrame(columns=_STANDARD_EVAL_COLUMNS)
+
+        evaluated_rounds = _completed_standard_eval_rounds(self.results_df)
+        if not self.results_df.empty and 'Round' in self.results_df.columns:
+            keep_rows = self.results_df['Round'].astype(int).isin(evaluated_rounds)
+            self.results_df = self.results_df.loc[keep_rows].copy()
+        if evaluated_rounds:
+            print(f"{COLORS.OKCYAN}Resuming eval — {len(evaluated_rounds)} rounds already done{COLORS.ENDC}")
 
         eval_batch_size = min(self.config.batch_size, 2048)
         test_dataset = load_test_dataset(eval_batch_size, num_classes)
@@ -1527,21 +1578,26 @@ class FederatedLearningPipeline:
             per_class_metrics = result[5]
             confusion_mat = result[6]
             class_report = result[7] if len(result) > 7 else ""
+            auprc = result[8] if len(result) > 8 else 0.0
+            ece = result[9] if len(result) > 9 else 0.0
 
             self.logger.info(
                 f"Round {round_num} | GLOBAL | Acc: {accuracy:.4f} | F1: {f1_value:.4f} | "
-                f"Precision: {precision:.4f} | Recall: {recall:.4f} | Loss: {test_loss:.4f}"
+                f"Precision: {precision:.4f} | Recall: {recall:.4f} | AUPRC: {auprc:.4f} | ECE: {ece:.4f} | Loss: {test_loss:.4f}"
             )
             print(
                 f"{COLORS.OKGREEN}Round {round_num} | Acc={accuracy:.4f}, F1={f1_value:.4f}, "
-                f"Precision={precision:.4f}, Recall={recall:.4f}, Loss={test_loss:.4f}{COLORS.ENDC}"
+                f"Precision={precision:.4f}, Recall={recall:.4f}, AUPRC={auprc:.4f}, ECE={ece:.4f}, Loss={test_loss:.4f}{COLORS.ENDC}"
             )
             if class_report and self.detailed_logger is not None:
                 self.detailed_logger.info(f"Round {round_num}\n{class_report}")
 
+            if not self.results_df.empty and 'Round' in self.results_df.columns:
+                self.results_df = self.results_df.loc[self.results_df['Round'].astype(int) != round_num].copy()
             new_row = pd.DataFrame({
                 'Round': [round_num], 'Loss': [test_loss], 'Accuracy': [accuracy],
                 'F1_Score': [f1_value], 'Precision': [precision], 'Recall': [recall],
+                'AUPRC': [auprc], 'ECE': [ece],
             })
             self.results_df = pd.concat([self.results_df, new_row], ignore_index=True)
 
@@ -1584,6 +1640,85 @@ def _clear_eval_artifacts(excel_filename: str) -> None:
         os.remove(excel_filename)
     if os.path.exists(progress_path):
         os.remove(progress_path)
+
+
+def _completed_standard_eval_rounds(results_df: pd.DataFrame) -> set:
+    if results_df is None or results_df.empty or 'Round' not in results_df.columns:
+        return set()
+    if any(col not in results_df.columns for col in _STANDARD_EVAL_REQUIRED_COLUMNS):
+        return set()
+    complete_rows = results_df.loc[:, list(_STANDARD_EVAL_REQUIRED_COLUMNS)].notna().all(axis=1)
+    return set(results_df.loc[complete_rows, 'Round'].astype(int).tolist())
+
+
+def _load_distill_results_from_excel(excel_filename: str) -> Dict[int, Dict[str, float]]:
+    existing = pd.read_excel(excel_filename, sheet_name=0, index_col=0)
+    loaded: Dict[int, Dict[str, float]] = {}
+    for client_id, row in existing.iterrows():
+        cid = client_id.item() if isinstance(client_id, np.generic) else client_id
+        if isinstance(cid, float) and cid.is_integer():
+            cid = int(cid)
+        if isinstance(cid, str):
+            try:
+                cid = int(cid)
+            except ValueError:
+                pass
+        metrics = {str(col): value for col, value in row.items() if not pd.isna(value)}
+        loaded[cid] = metrics
+    return loaded
+
+
+def _round_has_distill_eval_metrics(metrics_dict: Dict[str, float], round_number: int) -> bool:
+    prefix = f"Round_{round_number}_"
+    return all(f"{prefix}{suffix}" in metrics_dict for suffix in _DISTILL_EVAL_REQUIRED_SUFFIXES)
+
+
+def _completed_distill_eval_rounds(results: Dict[int, Dict[str, float]]) -> set:
+    if not isinstance(results, dict) or not results:
+        return set()
+
+    candidate_rounds = set()
+    for metrics_dict in results.values():
+        if not isinstance(metrics_dict, dict):
+            continue
+        for key in metrics_dict:
+            match = re.match(r'Round_(\d+)_', str(key))
+            if match:
+                candidate_rounds.add(int(match.group(1)))
+
+    completed = set()
+    summary_ids = (-3, -2, -1)
+    for round_number in sorted(candidate_rounds):
+        if any(
+            isinstance(results.get(client_id), dict)
+            and _round_has_distill_eval_metrics(results[client_id], round_number)
+            for client_id in summary_ids
+        ):
+            completed.add(round_number)
+            continue
+        if any(
+            isinstance(metrics_dict, dict) and _round_has_distill_eval_metrics(metrics_dict, round_number)
+            for metrics_dict in results.values()
+        ):
+            completed.add(round_number)
+    return completed
+
+
+def _clear_distill_round_metrics(results: Dict[int, Dict[str, float]], round_number: int) -> None:
+    if not isinstance(results, dict) or not results:
+        return
+    prefix = f"Round_{round_number}_"
+    empty_ids = []
+    for client_id, metrics_dict in list(results.items()):
+        if not isinstance(metrics_dict, dict):
+            continue
+        stale_keys = [key for key in metrics_dict if str(key).startswith(prefix)]
+        for key in stale_keys:
+            del metrics_dict[key]
+        if not metrics_dict:
+            empty_ids.append(client_id)
+    for client_id in empty_ids:
+        del results[client_id]
 
 
 def run_distillation_pipeline(config, strategy) -> None:
@@ -1712,6 +1847,7 @@ def run_distillation_pipeline(config, strategy) -> None:
     start_round = 1
     ckpt_stem = os.path.splitext(os.path.basename(log_filename))[0]
     ckpt_dir = os.path.join("checkpoint", ckpt_stem)
+    ckpt_info_path = os.path.join(ckpt_dir, "info.txt")
     if getattr(config, 'fresh_run', False):
         _wr_stem = os.path.splitext(os.path.basename(log_filename))[0]
         _wr_base = os.path.join("temp_weights", f"{_wr_stem}_weight_record")
@@ -1722,7 +1858,6 @@ def run_distillation_pipeline(config, strategy) -> None:
         _clear_eval_artifacts(excel_filename)
         print(f"{COLORS.OKCYAN}fresh_run: cleared weight records, checkpoint, and eval artifacts{COLORS.ENDC}")
     if config.checkpoint:
-        ckpt_info_path = os.path.join(ckpt_dir, "info.txt")
         if os.path.exists(ckpt_info_path):
             ckpt_info = {}
             with open(ckpt_info_path) as f:
@@ -1743,13 +1878,20 @@ def run_distillation_pipeline(config, strategy) -> None:
                 _round_done = ckpt_info.get("round_complete", "true") == "true"
                 start_round = _ckpt_round + 1 if _round_done else _ckpt_round
                 shared_path = os.path.join(ckpt_dir, "shared_state.bin")
+                _loaded_pfl_state = False
                 if os.path.exists(shared_path) and os.path.getsize(shared_path) > 0:
                     with open(shared_path, "rb") as _f:
                         saved_shared = pickle.load(_f)
+                    saved_pfl_state = saved_shared.pop(_POISONEDFL_STATE_KEY, None)
                     context.shared_state.update(saved_shared)
+                    if saved_pfl_state is not None:
+                        context.poisoned_fl_state = saved_pfl_state
+                        _loaded_pfl_state = True
                 results_path = os.path.join(ckpt_dir, "results.pkl")
                 if os.path.exists(results_path):
                     context.results = pd.read_pickle(results_path)
+                if attack_type == "poisonedfl" and start_round > 1 and not _loaded_pfl_state:
+                    print(f"{COLORS.WARNING}Checkpoint missing PoisonedFL adaptive state; resume will restart attack adaptation{COLORS.ENDC}")
                 if _round_done:
                     print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {_ckpt_round}) -> starting round {start_round}{COLORS.ENDC}")
                 else:
@@ -1784,6 +1926,7 @@ def run_distillation_pipeline(config, strategy) -> None:
     record_base = os.path.join("temp_weights", f"{stem}_weight_record")
     final_round_dir = os.path.join(record_base, f"round_{config.rounds}")
     _global_model_strategy = getattr(strategy, "has_global_model", False)
+    _allow_final_record_shortcut, _shortcut_info = _allow_eval_shortcut_from_records(ckpt_info_path, config)
 
     if _global_model_strategy:
         _final_exists = os.path.exists(os.path.join(final_round_dir, "global_weight.bin"))
@@ -1792,11 +1935,14 @@ def run_distillation_pipeline(config, strategy) -> None:
             os.path.exists(os.path.join(final_round_dir, f"client_{i}_weight.bin"))
             for i in range(n_clients)
         )
-    if _final_exists:
+    if _final_exists and _allow_final_record_shortcut:
         log_timestamp(logger, f"Weight records found (round {config.rounds}), skipping training")
         print(f"{COLORS.OKGREEN}Weight records found up to round {config.rounds} — skipping to evaluation{COLORS.ENDC}")
         _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, _global_model_strategy)
         return
+    if _final_exists and not _allow_final_record_shortcut:
+        _stage = _shortcut_info.get("stage", "?")
+        print(f"{COLORS.WARNING}Final-round weight records exist, but checkpoint is not fully complete (stage={_stage}) — resuming training{COLORS.ENDC}")
 
     def _write_ckpt_info(rnd, complete):
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -1847,6 +1993,8 @@ def run_distillation_pipeline(config, strategy) -> None:
                         pass
                 if not skip:
                     saveable_shared[k] = v
+            if context.poisoned_fl_state is not None:
+                saveable_shared[_POISONEDFL_STATE_KEY] = context.poisoned_fl_state
             _shared_tmp = os.path.join(ckpt_dir, "shared_state.bin.tmp")
             _shared_dst = os.path.join(ckpt_dir, "shared_state.bin")
             with open(_shared_tmp, "wb") as _f:
@@ -1892,37 +2040,26 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     print(f"\n{COLORS.HEADER}[EVALUATION]{COLORS.ENDC}")
     progress_path = _eval_progress_path(excel_filename)
 
-    evaluated_rounds: set = set()
     if getattr(config, 'fresh_run', False):
         context.results = {}
     elif os.path.exists(progress_path):
         try:
-            context.results = pd.read_pickle(progress_path)
+            loaded = pd.read_pickle(progress_path)
+            context.results = loaded if isinstance(loaded, dict) else {}
         except Exception:
             context.results = {}
     elif os.path.exists(excel_filename):
         try:
-            existing = pd.read_excel(excel_filename, sheet_name=0)
-            if context.results is None:
-                context.results = {}
-            for _, row in existing.iterrows():
-                pass
-            if "Round" in existing.columns:
-                evaluated_rounds = set(existing.columns.str.extract(r'Round_(\d+)_', expand=False).dropna().astype(int))
+            context.results = _load_distill_results_from_excel(excel_filename)
         except Exception:
-            pass
-    if not evaluated_rounds and context.results:
-        for cid, metrics_dict in context.results.items():
-            for k in metrics_dict:
-                import re as _re
-                m = _re.match(r'Round_(\d+)_', k)
-                if m:
-                    evaluated_rounds.add(int(m.group(1)))
-    if evaluated_rounds:
-        print(f"{COLORS.OKCYAN}Resuming eval — rounds already done: {sorted(evaluated_rounds)}{COLORS.ENDC}")
+            context.results = {}
 
     if context.results is None:
         context.results = {}
+
+    evaluated_rounds = _completed_distill_eval_rounds(context.results)
+    if evaluated_rounds:
+        print(f"{COLORS.OKCYAN}Resuming eval — rounds already done: {sorted(evaluated_rounds)}{COLORS.ENDC}")
 
     X_test = np.load("data/X_test.npy").astype(np.float32)
     y_test = np.load("data/y_test.npy")
@@ -1942,6 +2079,8 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
     attack_type, _, _ = parse_poison_config(getattr(config, 'poison', None))
     _poisonedfl_eval = attack_type == "poisonedfl" and bool(context.poisoned_clients)
+    _lma_eval = attack_type == "lma" and bool(context.poisoned_clients)
+    _skip_synthetic_byzantine_eval = _poisonedfl_eval or _lma_eval
 
     for round_number in range(config.rounds, 0, -1):
         if round_number in evaluated_rounds:
@@ -1950,6 +2089,8 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
 
         if config.skip_eval and round_number != config.rounds:
             continue
+
+        _clear_distill_round_metrics(context.results, round_number)
 
         round_dir = os.path.join(record_base, f"round_{round_number}")
 
@@ -1974,13 +2115,13 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
             _record_metrics(context, round_number, round_metrics, excel_filename)
 
             logger.info(
-                "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
                 round_number, metrics["Acc"], metrics["F1"],
-                metrics["Precision"], metrics["Recall"], metrics["Loss"],
+                metrics["Precision"], metrics["Recall"], metrics["AUPRC"], metrics["ECE"], metrics["Loss"],
             )
             print(
                 f"{COLORS.OKGREEN}Round {round_number} | Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, AUPRC={metrics['AUPRC']:.4f}, ECE={metrics['ECE']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
             )
         else:
             global_weight_path = os.path.join(round_dir, "global_weight.bin")
@@ -1998,8 +2139,8 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     ghost_cid = None
                     for bin_path in client_bins:
                         cid = int(os.path.basename(bin_path).split("_")[1])
-                        if _poisonedfl_eval and cid in context.poisoned_clients:
-                            if ghost_bin_path is None:
+                        if _skip_synthetic_byzantine_eval and cid in context.poisoned_clients:
+                            if _poisonedfl_eval and ghost_bin_path is None:
                                 ghost_bin_path = bin_path
                                 ghost_cid = cid
                             logger.info("Round %s | Client %s | [byzantine, skipped]", round_number, cid)
@@ -2018,26 +2159,27 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         del c_weights
                         m = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
                         round_metrics[cid] = m
-                        logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                                    round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["Loss"])
-                        print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
+                        logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
+                                    round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["AUPRC"], m["ECE"], m["Loss"])
+                        print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, AUPRC={m['AUPRC']:.4f}, ECE={m['ECE']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
                     if round_metrics:
                         _record_metrics(context, round_number, round_metrics, excel_filename)
                         avg = {k: float(np.mean([v[k] for v in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
-                        _record_metrics(context, round_number, {(-3 if _poisonedfl_eval else -1): avg}, excel_filename)
-                        logger.info("Round %s | AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                                    round_number, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["Loss"])
-                        print(f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
-                              f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
-                    if context.poisoned_clients and not _poisonedfl_eval:
+                        _record_metrics(context, round_number, {(-3 if _skip_synthetic_byzantine_eval else -1): avg}, excel_filename)
+                        _avg_label = "BENIGN_AVG" if _skip_synthetic_byzantine_eval else "AVG"
+                        logger.info("Round %s | %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
+                            round_number, _avg_label, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["AUPRC"], avg["ECE"], avg["Loss"])
+                        print(f"{COLORS.OKGREEN}Round {round_number} {_avg_label.replace('_', ' ')} | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
+                              f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, AUPRC={avg['AUPRC']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
+                    if context.poisoned_clients and not _skip_synthetic_byzantine_eval:
                         _benign_cids = [c for c in round_metrics if c >= 0 and c not in context.poisoned_clients]
                         if _benign_cids:
                             _b_avg = {k: float(np.mean([round_metrics[c][k] for c in _benign_cids])) for k in avg}
                             _record_metrics(context, round_number, {-3: _b_avg}, excel_filename)
-                            logger.info("Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                                        round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["Loss"])
+                            logger.info("Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
+                                        round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["AUPRC"], _b_avg["ECE"], _b_avg["Loss"])
                             print(f"{COLORS.OKGREEN}Round {round_number} Benign Avg | Acc={_b_avg['Acc']:.4f}, F1={_b_avg['F1']:.4f}, "
-                                  f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}")
+                                  f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, AUPRC={_b_avg['AUPRC']:.4f}, ECE={_b_avg['ECE']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}")
                     if ghost_bin_path is not None:
                         if _mixed:
                             from models.mixed_models import get_model_type_for_client
@@ -2052,10 +2194,10 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         del ghost_weights
                         ghost_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
                         _record_metrics(context, round_number, {-1: ghost_metrics}, excel_filename)
-                        logger.info("Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                                    round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["Loss"])
+                        logger.info("Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
+                                round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["AUPRC"], ghost_metrics["ECE"], ghost_metrics["Loss"])
                         print(f"{COLORS.OKGREEN}Round {round_number} PoisonedFL ghost | Acc={ghost_metrics['Acc']:.4f}, F1={ghost_metrics['F1']:.4f}, "
-                              f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}")
+                            f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, AUPRC={ghost_metrics['AUPRC']:.4f}, ECE={ghost_metrics['ECE']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}")
                 if os.path.exists(global_weight_path):
                     if _eval_model_arch != model_type:
                         del eval_model
@@ -2067,11 +2209,11 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     del g_weights
                     g_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
                     _record_metrics(context, round_number, {-2: g_metrics}, excel_filename)
-                    logger.info("Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                    logger.info("Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
                                 round_number, g_metrics["Acc"], g_metrics["F1"],
-                                g_metrics["Precision"], g_metrics["Recall"], g_metrics["Loss"])
+                                g_metrics["Precision"], g_metrics["Recall"], g_metrics["AUPRC"], g_metrics["ECE"], g_metrics["Loss"])
                     print(f"{COLORS.OKGREEN}Round {round_number} Global | Acc={g_metrics['Acc']:.4f}, F1={g_metrics['F1']:.4f}, "
-                          f"Precision={g_metrics['Precision']:.4f}, Recall={g_metrics['Recall']:.4f}, Loss={g_metrics['Loss']:.4f}{COLORS.ENDC}")
+                          f"Precision={g_metrics['Precision']:.4f}, Recall={g_metrics['Recall']:.4f}, AUPRC={g_metrics['AUPRC']:.4f}, ECE={g_metrics['ECE']:.4f}, Loss={g_metrics['Loss']:.4f}{COLORS.ENDC}")
             elif os.path.exists(global_weight_path):
                 if _eval_model_arch != model_type:
                     del eval_model
@@ -2084,13 +2226,13 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                 g_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
                 _record_metrics(context, round_number, {-2: g_metrics}, excel_filename)
                 logger.info(
-                    "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
+                    "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
                     round_number, g_metrics["Acc"], g_metrics["F1"],
-                    g_metrics["Precision"], g_metrics["Recall"], g_metrics["Loss"],
+                    g_metrics["Precision"], g_metrics["Recall"], g_metrics["AUPRC"], g_metrics["ECE"], g_metrics["Loss"],
                 )
                 print(
                     f"{COLORS.OKGREEN}Round {round_number} Global | Acc={g_metrics['Acc']:.4f}, F1={g_metrics['F1']:.4f}, "
-                    f"Precision={g_metrics['Precision']:.4f}, Recall={g_metrics['Recall']:.4f}, Loss={g_metrics['Loss']:.4f}{COLORS.ENDC}"
+                    f"Precision={g_metrics['Precision']:.4f}, Recall={g_metrics['Recall']:.4f}, AUPRC={g_metrics['AUPRC']:.4f}, ECE={g_metrics['ECE']:.4f}, Loss={g_metrics['Loss']:.4f}{COLORS.ENDC}"
                 )
             else:
                 client_bins = sorted(glob.glob(os.path.join(round_dir, "client_*_weight.bin")), key=lambda p: int(os.path.basename(p).split("_")[1]))
@@ -2103,8 +2245,8 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                 ghost_cid = None
                 for bin_path in client_bins:
                     cid = int(os.path.basename(bin_path).split("_")[1])
-                    if _poisonedfl_eval and cid in context.poisoned_clients:
-                        if ghost_bin_path is None:
+                    if _skip_synthetic_byzantine_eval and cid in context.poisoned_clients:
+                        if _poisonedfl_eval and ghost_bin_path is None:
                             ghost_bin_path = bin_path
                             ghost_cid = cid
                         logger.info("Round %s | Client %s | [byzantine, skipped]", round_number, cid)
@@ -2123,33 +2265,34 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     del c_weights
                     m = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
                     round_metrics[cid] = m
-                    logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                                round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["Loss"])
-                    print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
+                    logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
+                                round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["AUPRC"], m["ECE"], m["Loss"])
+                    print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, AUPRC={m['AUPRC']:.4f}, ECE={m['ECE']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
                 if round_metrics:
                     _record_metrics(context, round_number, round_metrics, excel_filename)
                     avg = {k: float(np.mean([m[k] for m in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
-                    _record_metrics(context, round_number, {(-3 if _poisonedfl_eval else -1): avg}, excel_filename)
+                    _record_metrics(context, round_number, {(-3 if _skip_synthetic_byzantine_eval else -1): avg}, excel_filename)
+                    _avg_label = "BENIGN_AVG" if _skip_synthetic_byzantine_eval else "AVG"
                     logger.info(
-                        "Round %s | AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                        round_number, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["Loss"],
+                        "Round %s | %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
+                        round_number, _avg_label, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["AUPRC"], avg["ECE"], avg["Loss"],
                     )
                     print(
-                        f"{COLORS.OKGREEN}Round {round_number} Avg | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
-                        f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
+                        f"{COLORS.OKGREEN}Round {round_number} {_avg_label.replace('_', ' ')} | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
+                        f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, AUPRC={avg['AUPRC']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
                     )
-                if context.poisoned_clients and not _poisonedfl_eval:
+                if context.poisoned_clients and not _skip_synthetic_byzantine_eval:
                     _benign_cids = [c for c in round_metrics if c >= 0 and c not in context.poisoned_clients]
                     if _benign_cids:
                         _b_avg = {k: float(np.mean([round_metrics[c][k] for c in _benign_cids])) for k in avg}
                         _record_metrics(context, round_number, {-3: _b_avg}, excel_filename)
                         logger.info(
-                            "Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                            round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["Loss"],
+                            "Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
+                            round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["AUPRC"], _b_avg["ECE"], _b_avg["Loss"],
                         )
                         print(
                             f"{COLORS.OKGREEN}Round {round_number} Benign Avg | Acc={_b_avg['Acc']:.4f}, F1={_b_avg['F1']:.4f}, "
-                            f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}"
+                            f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, AUPRC={_b_avg['AUPRC']:.4f}, ECE={_b_avg['ECE']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}"
                         )
                 if ghost_bin_path is not None:
                     if _mixed:
@@ -2166,12 +2309,12 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     ghost_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
                     _record_metrics(context, round_number, {-1: ghost_metrics}, excel_filename)
                     logger.info(
-                        "Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | Loss: %.4f",
-                        round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["Loss"],
+                        "Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
+                        round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["AUPRC"], ghost_metrics["ECE"], ghost_metrics["Loss"],
                     )
                     print(
                         f"{COLORS.OKGREEN}Round {round_number} PoisonedFL ghost | Acc={ghost_metrics['Acc']:.4f}, F1={ghost_metrics['F1']:.4f}, "
-                        f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}"
+                        f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, AUPRC={ghost_metrics['AUPRC']:.4f}, ECE={ghost_metrics['ECE']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}"
                     )
 
     del eval_model, X_test, y_test, test_labels
