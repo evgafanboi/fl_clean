@@ -41,7 +41,7 @@ from .poison_utils import parse_poison_config, get_or_create_poisoned_clients, P
 
 _STANDARD_EVAL_COLUMNS = ['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall', 'AUPRC', 'ECE']
 _STANDARD_EVAL_REQUIRED_COLUMNS = ('Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall', 'AUPRC', 'ECE')
-_DISTILL_EVAL_REQUIRED_SUFFIXES = ('Acc', 'F1', 'Precision', 'Recall', 'AUPRC', 'ECE', 'Loss')
+_DISTILL_EVAL_REQUIRED_SUFFIXES = ('Acc', 'F1', 'Precision', 'Recall', 'ECE', 'Loss')
 _POISONEDFL_STATE_KEY = "__poisoned_fl_state__"
 
 
@@ -96,6 +96,8 @@ def _config_fingerprint(config) -> str:
     d.pop('skip_eval', None)
     d.pop('fresh_run', None)
     d.pop('robust_workers', None)
+    d.pop('f1_curve', None)
+    d.pop('cache_test_set', None)
     raw = str(sorted(d.items()))
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -2033,7 +2035,8 @@ def run_distillation_pipeline(config, strategy) -> None:
 
 
 def _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, global_model_eval=False):
-    from .context import evaluate_model
+    from .context import evaluate_model, get_model_proba
+    from .evaluation import plot_f1_threshold_curve
     from .strategy.common import create_model as create_strategy_model
 
     log_timestamp(logger, "=== EVALUATION ===")
@@ -2058,6 +2061,8 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
         context.results = {}
 
     evaluated_rounds = _completed_distill_eval_rounds(context.results)
+    if getattr(config, 'f1_curve', False):
+        evaluated_rounds.discard(config.rounds)
     if evaluated_rounds:
         print(f"{COLORS.OKCYAN}Resuming eval — rounds already done: {sorted(evaluated_rounds)}{COLORS.ENDC}")
 
@@ -2081,6 +2086,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     _poisonedfl_eval = attack_type == "poisonedfl" and bool(context.poisoned_clients)
     _lma_eval = attack_type == "lma" and bool(context.poisoned_clients)
     _skip_synthetic_byzantine_eval = _poisonedfl_eval or _lma_eval
+    _f1_log_stem = os.path.splitext(os.path.basename(log_filename))[0]
 
     for round_number in range(config.rounds, 0, -1):
         if round_number in evaluated_rounds:
@@ -2157,29 +2163,36 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                             c_weights = pickle.load(_f)
                         eval_model.set_weights(c_weights)
                         del c_weights
-                        m = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
+                        _cap = getattr(config, 'f1_curve', False) and round_number == config.rounds
+                        result = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes, compute_auprc=False, return_proba=_cap)
+                        m, _proba = result if _cap else (result, None)
+                        if _cap:
+                            _c_plot = os.path.join("results", "plots", f"{_f1_log_stem}_r{round_number}_c{cid}_f1_curve.png")
+                            _best_theta, _best_f1 = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}")
+                            logger.info("Round %s | Client %s | F1_CURVE best_theta=%.2f best_f1=%.4f", round_number, cid, _best_theta, _best_f1)
+                            del _proba
                         round_metrics[cid] = m
-                        logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
-                                    round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["AUPRC"], m["ECE"], m["Loss"])
-                        print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, AUPRC={m['AUPRC']:.4f}, ECE={m['ECE']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
+                        logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
+                                    round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["ECE"], m["Loss"])
+                        print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, ECE={m['ECE']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
                     if round_metrics:
                         _record_metrics(context, round_number, round_metrics, excel_filename)
                         avg = {k: float(np.mean([v[k] for v in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
                         _record_metrics(context, round_number, {(-3 if _skip_synthetic_byzantine_eval else -1): avg}, excel_filename)
                         _avg_label = "BENIGN_AVG" if _skip_synthetic_byzantine_eval else "AVG"
-                        logger.info("Round %s | %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
-                            round_number, _avg_label, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["AUPRC"], avg["ECE"], avg["Loss"])
+                        logger.info("Round %s | %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
+                            round_number, _avg_label, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["ECE"], avg["Loss"])
                         print(f"{COLORS.OKGREEN}Round {round_number} {_avg_label.replace('_', ' ')} | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
-                              f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, AUPRC={avg['AUPRC']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
+                              f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
                     if context.poisoned_clients and not _skip_synthetic_byzantine_eval:
                         _benign_cids = [c for c in round_metrics if c >= 0 and c not in context.poisoned_clients]
                         if _benign_cids:
                             _b_avg = {k: float(np.mean([round_metrics[c][k] for c in _benign_cids])) for k in avg}
                             _record_metrics(context, round_number, {-3: _b_avg}, excel_filename)
-                            logger.info("Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
-                                        round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["AUPRC"], _b_avg["ECE"], _b_avg["Loss"])
+                            logger.info("Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
+                                        round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["ECE"], _b_avg["Loss"])
                             print(f"{COLORS.OKGREEN}Round {round_number} Benign Avg | Acc={_b_avg['Acc']:.4f}, F1={_b_avg['F1']:.4f}, "
-                                  f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, AUPRC={_b_avg['AUPRC']:.4f}, ECE={_b_avg['ECE']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}")
+                                    f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, ECE={_b_avg['ECE']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}")
                     if ghost_bin_path is not None:
                         if _mixed:
                             from models.mixed_models import get_model_type_for_client
@@ -2192,12 +2205,12 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                             ghost_weights = pickle.load(_f)
                         eval_model.set_weights(ghost_weights)
                         del ghost_weights
-                        ghost_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
+                        ghost_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes, compute_auprc=False)
                         _record_metrics(context, round_number, {-1: ghost_metrics}, excel_filename)
-                        logger.info("Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
-                                round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["AUPRC"], ghost_metrics["ECE"], ghost_metrics["Loss"])
+                        logger.info("Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
+                                round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["ECE"], ghost_metrics["Loss"])
                         print(f"{COLORS.OKGREEN}Round {round_number} PoisonedFL ghost | Acc={ghost_metrics['Acc']:.4f}, F1={ghost_metrics['F1']:.4f}, "
-                            f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, AUPRC={ghost_metrics['AUPRC']:.4f}, ECE={ghost_metrics['ECE']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}")
+                            f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, ECE={ghost_metrics['ECE']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}")
                 if os.path.exists(global_weight_path):
                     if _eval_model_arch != model_type:
                         del eval_model
@@ -2263,23 +2276,30 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         c_weights = pickle.load(_f)
                     eval_model.set_weights(c_weights)
                     del c_weights
-                    m = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
+                    _cap = getattr(config, 'f1_curve', False) and round_number == config.rounds
+                    result = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes, compute_auprc=False, return_proba=_cap)
+                    m, _proba = result if _cap else (result, None)
+                    if _cap:
+                        _c_plot = os.path.join("results", "plots", f"{_f1_log_stem}_r{round_number}_c{cid}_f1_curve.png")
+                        _best_theta, _best_f1 = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}")
+                        logger.info("Round %s | Client %s | F1_CURVE best_theta=%.2f best_f1=%.4f", round_number, cid, _best_theta, _best_f1)
+                        del _proba
                     round_metrics[cid] = m
-                    logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
-                                round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["AUPRC"], m["ECE"], m["Loss"])
-                    print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, AUPRC={m['AUPRC']:.4f}, ECE={m['ECE']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
+                    logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
+                                round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["ECE"], m["Loss"])
+                    print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, ECE={m['ECE']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
                 if round_metrics:
                     _record_metrics(context, round_number, round_metrics, excel_filename)
                     avg = {k: float(np.mean([m[k] for m in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
                     _record_metrics(context, round_number, {(-3 if _skip_synthetic_byzantine_eval else -1): avg}, excel_filename)
                     _avg_label = "BENIGN_AVG" if _skip_synthetic_byzantine_eval else "AVG"
                     logger.info(
-                        "Round %s | %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
-                        round_number, _avg_label, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["AUPRC"], avg["ECE"], avg["Loss"],
+                        "Round %s | %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
+                        round_number, _avg_label, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["ECE"], avg["Loss"],
                     )
                     print(
                         f"{COLORS.OKGREEN}Round {round_number} {_avg_label.replace('_', ' ')} | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
-                        f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, AUPRC={avg['AUPRC']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
+                        f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
                     )
                 if context.poisoned_clients and not _skip_synthetic_byzantine_eval:
                     _benign_cids = [c for c in round_metrics if c >= 0 and c not in context.poisoned_clients]
@@ -2287,12 +2307,12 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         _b_avg = {k: float(np.mean([round_metrics[c][k] for c in _benign_cids])) for k in avg}
                         _record_metrics(context, round_number, {-3: _b_avg}, excel_filename)
                         logger.info(
-                            "Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
-                            round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["AUPRC"], _b_avg["ECE"], _b_avg["Loss"],
+                            "Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
+                            round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["ECE"], _b_avg["Loss"],
                         )
                         print(
                             f"{COLORS.OKGREEN}Round {round_number} Benign Avg | Acc={_b_avg['Acc']:.4f}, F1={_b_avg['F1']:.4f}, "
-                            f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, AUPRC={_b_avg['AUPRC']:.4f}, ECE={_b_avg['ECE']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}"
+                            f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, ECE={_b_avg['ECE']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}"
                         )
                 if ghost_bin_path is not None:
                     if _mixed:
@@ -2306,16 +2326,33 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         ghost_weights = pickle.load(_f)
                     eval_model.set_weights(ghost_weights)
                     del ghost_weights
-                    ghost_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
+                    ghost_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes, compute_auprc=False)
                     _record_metrics(context, round_number, {-1: ghost_metrics}, excel_filename)
                     logger.info(
-                        "Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
-                        round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["AUPRC"], ghost_metrics["ECE"], ghost_metrics["Loss"],
+                        "Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
+                        round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["ECE"], ghost_metrics["Loss"],
                     )
                     print(
                         f"{COLORS.OKGREEN}Round {round_number} PoisonedFL ghost | Acc={ghost_metrics['Acc']:.4f}, F1={ghost_metrics['F1']:.4f}, "
-                        f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, AUPRC={ghost_metrics['AUPRC']:.4f}, ECE={ghost_metrics['ECE']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}"
+                        f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, ECE={ghost_metrics['ECE']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}"
                     )
+
+    if getattr(config, 'f1_curve', False) and global_model_eval:
+        plot_path = os.path.join("results", "plots", f"{_f1_log_stem}_f1_curve.png")
+        label = getattr(config, 'algorithm', 'model')
+        weight_path = os.path.join(record_base, f"round_{config.rounds}", "global_weight.bin")
+        if os.path.exists(weight_path):
+            if _eval_model_arch != model_type:
+                del eval_model
+                eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
+            with open(weight_path, "rb") as _f:
+                weights = pickle.load(_f)
+            eval_model.set_weights(weights)
+            del weights
+            proba = get_model_proba(eval_model, X_test, config.batch_size)
+            _best_theta, _best_f1 = plot_f1_threshold_curve(test_labels, proba, plot_path, label=label)
+            logger.info("F1_CURVE | GLOBAL | best_theta=%.2f best_f1=%.4f", _best_theta, _best_f1)
+            del proba
 
     del eval_model, X_test, y_test, test_labels
     if context.results:

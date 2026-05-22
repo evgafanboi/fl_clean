@@ -118,6 +118,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cleanup_interval", type=int, default=25, help="Run tf.keras.backend.clear_session + gc.collect every N clients")
 
     # checkpointing
+    parser.add_argument("--f1_curve", action="store_true", help="Plot F1 vs confidence-threshold curve for FedDistill/Ours at final round")
     parser.add_argument("--checkpoint", type=int, nargs='?', const=1, default=0, help="Checkpoint every N clients (0=disabled, bare flag=every client)")
     parser.add_argument("--fresh_run", action="store_true", help="Delete existing weight records for this run and start fresh")
     parser.add_argument("--cache_test_set", action="store_true", help="Pin X_test to GPU VRAM before evaluation (avoids repeated host↔device transfers; ~1 GB VRAM)")
@@ -209,6 +210,7 @@ def main(argv=None):
             mixed_models=args.mixed_models,
             hamming_tau=args.hamming_tau,
             exp_rho=args.exp_rho,
+            f1_curve=args.f1_curve,
         )
         
         strategy = strategy_registry[args.strategy](config)

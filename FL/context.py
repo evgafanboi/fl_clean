@@ -186,29 +186,41 @@ class PipelineContext:
             self.record_client_weight(round_num, st.client_id, w)
 
 
+def get_model_proba(model: Any, X_test: np.ndarray, batch_size: int) -> np.ndarray:
+    base = model.base_model if hasattr(model, "base_model") else model
+    if hasattr(base, "model"):
+        base = base.model
+    infer_bs = batch_size * 4 if not _use_tf() else batch_size
+    return base.predict(X_test, batch_size=infer_bs, verbose=0)
+
+
 def evaluate_model(model: Any, X_test: np.ndarray, y_labels: np.ndarray,
-                   batch_size: int, num_classes: int) -> Dict[str, float]:
+                   batch_size: int, num_classes: int, compute_auprc: bool = True,
+                   return_proba: bool = False):
     base = model.base_model if hasattr(model, "base_model") else model
     if hasattr(base, "model"):
         base = base.model
 
-    # No gradients needed for eval — use a larger batch to saturate the GPU.
     infer_bs = batch_size * 4 if not _use_tf() else batch_size
     preds = base.predict(X_test, batch_size=infer_bs, verbose=0)
-    pred_labels, loss, auprc, ece = summarize_prob_predictions(y_labels, preds, num_classes)
-    del preds
+    pred_labels, loss, auprc, ece = summarize_prob_predictions(y_labels, preds, num_classes, compute_auprc=compute_auprc)
 
     accuracy = float(np.mean(pred_labels == y_labels))
     f1 = float(f1_score(y_labels, pred_labels, average="macro", zero_division=0))
     precision = float(precision_score(y_labels, pred_labels, average="macro", zero_division=0))
     recall = float(recall_score(y_labels, pred_labels, average="macro", zero_division=0))
 
-    return {
+    metrics = {
         "Acc": accuracy,
         "F1": f1,
         "Precision": precision,
         "Recall": recall,
-        "AUPRC": auprc,
         "ECE": ece,
         "Loss": loss,
     }
+    if compute_auprc:
+        metrics["AUPRC"] = auprc
+    if return_proba:
+        return metrics, preds
+    del preds
+    return metrics

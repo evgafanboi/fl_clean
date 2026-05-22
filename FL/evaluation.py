@@ -18,30 +18,87 @@ from sklearn.metrics import (
 PerClassMetrics = Tuple[np.ndarray, np.ndarray, np.ndarray]
 
 
+def plot_f1_threshold_curve(
+    y_true: np.ndarray,
+    y_pred_proba: np.ndarray,
+    plot_path: str,
+    label: str = "model",
+    n_steps: int = 20,
+) -> None:
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+
+    thresholds = np.linspace(0.0, 0.95, n_steps)
+    max_conf = y_pred_proba.max(axis=1)
+    f1_vals, coverage_vals = [], []
+    for theta in thresholds:
+        mask = max_conf >= theta
+        if mask.sum() == 0:
+            f1_vals.append(0.0)
+            coverage_vals.append(0.0)
+            continue
+        f1_vals.append(float(f1_score(y_true[mask], y_pred_proba[mask].argmax(axis=1), average="macro", zero_division=0)))
+        coverage_vals.append(float(mask.mean()))
+
+    best_idx = int(np.argmax(f1_vals))
+    best_theta = float(thresholds[best_idx])
+    best_f1 = float(f1_vals[best_idx])
+
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    ax1.plot(thresholds, f1_vals, "b-o", markersize=4, label=f"{label} F1")
+    ax1.axvline(best_theta, color="b", linestyle=":", alpha=0.6, label=f"best θ={best_theta:.2f} F1={best_f1:.4f}")
+    ax1.set_xlabel("Confidence Threshold θ")
+    ax1.set_ylabel("Macro F1", color="b")
+    ax1.tick_params(axis="y", labelcolor="b")
+    ax1.set_ylim(0, 1)
+    ax2 = ax1.twinx()
+    ax2.plot(thresholds, coverage_vals, "r--s", markersize=4, label="Coverage")
+    ax2.set_ylabel("Coverage (fraction retained)", color="r")
+    ax2.tick_params(axis="y", labelcolor="r")
+    ax2.set_ylim(0, 1)
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="lower left")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"F1-threshold curve saved → {plot_path} (best θ={best_theta:.2f}, F1={best_f1:.4f})")
+    return best_theta, best_f1
+
+
 def summarize_prob_predictions(
     y_true: np.ndarray,
     y_pred_proba: np.ndarray,
     num_classes: int,
     ece_bins: int = 15,
+    compute_auprc: bool = True,
 ) -> Tuple[np.ndarray, float, float, float]:
     y_true = np.asarray(y_true, dtype=np.int32).ravel()
-    y_pred_proba = np.asarray(y_pred_proba, dtype=np.float64)
+    y_pred_proba = np.asarray(y_pred_proba, dtype=np.float64 if compute_auprc else np.float32)
     pred_labels = np.argmax(y_pred_proba, axis=1).astype(np.int32)
+    row_ids = np.arange(len(y_true))
 
-    y_true_oh = np.zeros((len(y_true), num_classes), dtype=np.float32)
-    y_true_oh[np.arange(len(y_true)), y_true] = 1.0
-    loss = float(-np.mean(np.sum(y_true_oh * np.log(np.clip(y_pred_proba, 1e-7, 1.0)), axis=1)))
+    loss = float(-np.mean(np.log(np.clip(y_pred_proba[row_ids, y_true], 1e-7, 1.0))))
 
-    present_classes = np.flatnonzero(y_true_oh.sum(axis=0) > 0)
-    if len(present_classes) > 0:
-        auprc = float(np.mean([
-            average_precision_score(y_true_oh[:, class_idx], y_pred_proba[:, class_idx])
-            for class_idx in present_classes
-        ]))
+    if compute_auprc:
+        y_true_oh = np.zeros((len(y_true), num_classes), dtype=np.float32)
+        y_true_oh[row_ids, y_true] = 1.0
+        present_classes = np.unique(y_true)
+        if len(present_classes) > 0:
+            auprc = float(np.mean([
+                average_precision_score(y_true_oh[:, class_idx], y_pred_proba[:, class_idx])
+                for class_idx in present_classes
+            ]))
+        else:
+            auprc = 0.0
+        del y_true_oh
     else:
         auprc = 0.0
 
-    confidences = y_pred_proba[np.arange(len(pred_labels)), pred_labels]
+    confidences = y_pred_proba[row_ids, pred_labels]
     correctness = (pred_labels == y_true).astype(np.float64)
     bin_ids = np.digitize(confidences, np.linspace(0.0, 1.0, ece_bins + 1)[1:-1], right=True)
     ece = 0.0
@@ -52,7 +109,7 @@ def summarize_prob_predictions(
             continue
         ece += abs(correctness[mask].mean() - confidences[mask].mean()) * (mask.sum() / total)
 
-    del y_true_oh, confidences, correctness, bin_ids
+    del row_ids, confidences, correctness, bin_ids
     return pred_labels, loss, auprc, float(ece)
 
 

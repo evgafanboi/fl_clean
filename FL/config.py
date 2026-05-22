@@ -52,6 +52,7 @@ class FDConfig:
     mixed_models: bool = False
     hamming_tau: float = 0.5
     exp_rho: float = 0.05
+    f1_curve: bool = False
 
     def to_algorithm_params(self) -> dict:
         return {
