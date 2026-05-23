@@ -264,13 +264,16 @@ class SSFLIDS(DistillationStrategy):
             aggressive_memory_cleanup()
             disc_pool.refresh()
 
-        base_mmap = np.load(_base_public_path(), mmap_mode="r")
-        permutation = np.random.permutation(n_public)
-        open_feature = np.array(base_mmap[permutation], dtype=np.float32)
-        del base_mmap
-
         os.makedirs(SSFLIDS_CACHE_DIR, exist_ok=True)
         pub_X_path = _round_public_path(round_number)
+        if os.path.exists(pub_X_path):
+            open_feature = np.array(np.load(pub_X_path, mmap_mode="r"), dtype=np.float32)
+        else:
+            base_mmap = np.load(_base_public_path(), mmap_mode="r")
+            permutation = np.random.permutation(n_public)
+            open_feature = np.array(base_mmap[permutation], dtype=np.float32)
+            del base_mmap
+            np.save(pub_X_path, open_feature)
 
         print(f"\n{COLORS.HEADER}Round {round_number} Stage I{COLORS.ENDC}")
         pred_files: List[str] = []
@@ -297,9 +300,6 @@ class SSFLIDS(DistillationStrategy):
                 else:
                     first_s1 = mid["last_client_idx"] + 1
                 print(f"{COLORS.OKGREEN}Resuming round {round_number} stage {stage} from client {mid['last_client_idx'] + 1}{COLORS.ENDC}")
-
-        if not os.path.exists(pub_X_path):
-            np.save(pub_X_path, open_feature)
 
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_s1:

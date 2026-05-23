@@ -32,19 +32,41 @@ def plot_f1_threshold_curve(
 
     thresholds = np.linspace(0.0, 0.95, n_steps)
     max_conf = y_pred_proba.max(axis=1)
-    f1_vals, coverage_vals = [], []
+    f1_vals, coverage_vals, acc_vals, precision_vals, recall_vals = [], [], [], [], []
     for theta in thresholds:
         mask = max_conf >= theta
         if mask.sum() == 0:
             f1_vals.append(0.0)
             coverage_vals.append(0.0)
+            acc_vals.append(0.0)
+            precision_vals.append(0.0)
+            recall_vals.append(0.0)
             continue
-        f1_vals.append(float(f1_score(y_true[mask], y_pred_proba[mask].argmax(axis=1), average="macro", zero_division=0)))
+        preds = y_pred_proba[mask].argmax(axis=1)
+        true = y_true[mask]
+        f1_vals.append(float(f1_score(true, preds, average="macro", zero_division=0)))
         coverage_vals.append(float(mask.mean()))
+        acc_vals.append(float(np.mean(preds == true)))
+        precision_vals.append(float(precision_score(true, preds, average="macro", zero_division=0)))
+        recall_vals.append(float(recall_score(true, preds, average="macro", zero_division=0)))
 
     best_idx = int(np.argmax(f1_vals))
     best_theta = float(thresholds[best_idx])
     best_f1 = float(f1_vals[best_idx])
+    min_cov_idx = int(np.argmin(coverage_vals))
+    min_cov_theta = float(thresholds[min_cov_idx])
+    min_cov = float(coverage_vals[min_cov_idx])
+
+    best_point = {
+        "theta": best_theta, "Acc": acc_vals[best_idx], "F1": best_f1,
+        "Precision": precision_vals[best_idx], "Recall": recall_vals[best_idx],
+        "Coverage": coverage_vals[best_idx],
+    }
+    min_cov_point = {
+        "theta": min_cov_theta, "Acc": acc_vals[min_cov_idx], "F1": f1_vals[min_cov_idx],
+        "Precision": precision_vals[min_cov_idx], "Recall": recall_vals[min_cov_idx],
+        "Coverage": min_cov,
+    }
 
     fig, ax1 = plt.subplots(figsize=(8, 5))
     ax1.plot(thresholds, f1_vals, "b-o", markersize=4, label=f"{label} F1")
@@ -65,8 +87,8 @@ def plot_f1_threshold_curve(
     os.makedirs(os.path.dirname(plot_path), exist_ok=True)
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
-    print(f"F1-threshold curve saved → {plot_path} (best θ={best_theta:.2f}, F1={best_f1:.4f})")
-    return best_theta, best_f1
+    print(f"F1-threshold curve saved → {plot_path} | Best θ={best_theta:.2f}: Acc={best_point['Acc']:.4f} F1={best_f1:.4f} P={best_point['Precision']:.4f} R={best_point['Recall']:.4f} Cov={best_point['Coverage']:.4f} | MinCov θ={min_cov_theta:.2f}: Acc={min_cov_point['Acc']:.4f} F1={min_cov_point['F1']:.4f} P={min_cov_point['Precision']:.4f} R={min_cov_point['Recall']:.4f} Cov={min_cov:.4f}")
+    return best_point, min_cov_point
 
 
 def summarize_prob_predictions(

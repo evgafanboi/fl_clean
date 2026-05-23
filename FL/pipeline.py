@@ -2143,6 +2143,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     round_metrics: dict[int, dict] = {}
                     ghost_bin_path = None
                     ghost_cid = None
+                    _f1_curve_results = []
                     for bin_path in client_bins:
                         cid = int(os.path.basename(bin_path).split("_")[1])
                         if _skip_synthetic_byzantine_eval and cid in context.poisoned_clients:
@@ -2167,9 +2168,11 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         result = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes, compute_auprc=False, return_proba=_cap)
                         m, _proba = result if _cap else (result, None)
                         if _cap:
-                            _c_plot = os.path.join("results", "plots", f"{_f1_log_stem}_r{round_number}_c{cid}_f1_curve.png")
-                            _best_theta, _best_f1 = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}")
-                            logger.info("Round %s | Client %s | F1_CURVE best_theta=%.2f best_f1=%.4f", round_number, cid, _best_theta, _best_f1)
+                            _c_plot = os.path.join("results", "plots", _f1_log_stem, f"client_{cid}.png")
+                            _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}")
+                            logger.info("Round %s | Client %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f",
+                                round_number, cid, _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"])
+                            _f1_curve_results.append((_best_pt, _min_cov_pt))
                             del _proba
                         round_metrics[cid] = m
                         logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
@@ -2184,6 +2187,17 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                             round_number, _avg_label, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["ECE"], avg["Loss"])
                         print(f"{COLORS.OKGREEN}Round {round_number} {_avg_label.replace('_', ' ')} | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
                               f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
+                        if _f1_curve_results:
+                            _mk = ["Acc", "F1", "Precision", "Recall", "Coverage"]
+                            _avg_best = {k: float(np.mean([r[0][k] for r in _f1_curve_results])) for k in _mk}
+                            _avg_best_theta = float(np.mean([r[0]["theta"] for r in _f1_curve_results]))
+                            _avg_mc = {k: float(np.mean([r[1][k] for r in _f1_curve_results])) for k in _mk}
+                            _avg_mc_theta = float(np.mean([r[1]["theta"] for r in _f1_curve_results]))
+                            logger.info("Round %s | %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f",
+                                round_number, _avg_label,
+                                _avg_best_theta, _avg_best["Acc"], _avg_best["F1"], _avg_best["Precision"], _avg_best["Recall"], _avg_best["Coverage"],
+                                _avg_mc_theta, _avg_mc["Acc"], _avg_mc["F1"], _avg_mc["Precision"], _avg_mc["Recall"], _avg_mc["Coverage"])
+                            print(f"{COLORS.OKGREEN}  Best θ={_avg_best_theta:.2f}: Acc={_avg_best['Acc']:.4f} F1={_avg_best['F1']:.4f} P={_avg_best['Precision']:.4f} R={_avg_best['Recall']:.4f} Cov={_avg_best['Coverage']:.4f} | MinCov θ={_avg_mc_theta:.2f}: Acc={_avg_mc['Acc']:.4f} F1={_avg_mc['F1']:.4f} P={_avg_mc['Precision']:.4f} R={_avg_mc['Recall']:.4f} Cov={_avg_mc['Coverage']:.4f}{COLORS.ENDC}")
                     if context.poisoned_clients and not _skip_synthetic_byzantine_eval:
                         _benign_cids = [c for c in round_metrics if c >= 0 and c not in context.poisoned_clients]
                         if _benign_cids:
@@ -2256,6 +2270,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                 round_metrics: dict[int, dict] = {}
                 ghost_bin_path = None
                 ghost_cid = None
+                _f1_curve_results = []
                 for bin_path in client_bins:
                     cid = int(os.path.basename(bin_path).split("_")[1])
                     if _skip_synthetic_byzantine_eval and cid in context.poisoned_clients:
@@ -2280,9 +2295,11 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     result = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes, compute_auprc=False, return_proba=_cap)
                     m, _proba = result if _cap else (result, None)
                     if _cap:
-                        _c_plot = os.path.join("results", "plots", f"{_f1_log_stem}_r{round_number}_c{cid}_f1_curve.png")
-                        _best_theta, _best_f1 = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}")
-                        logger.info("Round %s | Client %s | F1_CURVE best_theta=%.2f best_f1=%.4f", round_number, cid, _best_theta, _best_f1)
+                        _c_plot = os.path.join("results", "plots", _f1_log_stem, f"client_{cid}.png")
+                        _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}")
+                        logger.info("Round %s | Client %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f",
+                            round_number, cid, _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"])
+                        _f1_curve_results.append((_best_pt, _min_cov_pt))
                         del _proba
                     round_metrics[cid] = m
                     logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
@@ -2301,6 +2318,17 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         f"{COLORS.OKGREEN}Round {round_number} {_avg_label.replace('_', ' ')} | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
                         f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
                     )
+                    if _f1_curve_results:
+                        _mk = ["Acc", "F1", "Precision", "Recall", "Coverage"]
+                        _avg_best = {k: float(np.mean([r[0][k] for r in _f1_curve_results])) for k in _mk}
+                        _avg_best_theta = float(np.mean([r[0]["theta"] for r in _f1_curve_results]))
+                        _avg_mc = {k: float(np.mean([r[1][k] for r in _f1_curve_results])) for k in _mk}
+                        _avg_mc_theta = float(np.mean([r[1]["theta"] for r in _f1_curve_results]))
+                        logger.info("Round %s | %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f",
+                            round_number, _avg_label,
+                            _avg_best_theta, _avg_best["Acc"], _avg_best["F1"], _avg_best["Precision"], _avg_best["Recall"], _avg_best["Coverage"],
+                            _avg_mc_theta, _avg_mc["Acc"], _avg_mc["F1"], _avg_mc["Precision"], _avg_mc["Recall"], _avg_mc["Coverage"])
+                        print(f"{COLORS.OKGREEN}  Best θ={_avg_best_theta:.2f}: Acc={_avg_best['Acc']:.4f} F1={_avg_best['F1']:.4f} P={_avg_best['Precision']:.4f} R={_avg_best['Recall']:.4f} Cov={_avg_best['Coverage']:.4f} | MinCov θ={_avg_mc_theta:.2f}: Acc={_avg_mc['Acc']:.4f} F1={_avg_mc['F1']:.4f} P={_avg_mc['Precision']:.4f} R={_avg_mc['Recall']:.4f} Cov={_avg_mc['Coverage']:.4f}{COLORS.ENDC}")
                 if context.poisoned_clients and not _skip_synthetic_byzantine_eval:
                     _benign_cids = [c for c in round_metrics if c >= 0 and c not in context.poisoned_clients]
                     if _benign_cids:
@@ -2338,7 +2366,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     )
 
     if getattr(config, 'f1_curve', False) and global_model_eval:
-        plot_path = os.path.join("results", "plots", f"{_f1_log_stem}_f1_curve.png")
+        plot_path = os.path.join("results", "plots", _f1_log_stem, "global_model.png")
         label = getattr(config, 'algorithm', 'model')
         weight_path = os.path.join(record_base, f"round_{config.rounds}", "global_weight.bin")
         if os.path.exists(weight_path):
@@ -2350,8 +2378,11 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
             eval_model.set_weights(weights)
             del weights
             proba = get_model_proba(eval_model, X_test, config.batch_size)
-            _best_theta, _best_f1 = plot_f1_threshold_curve(test_labels, proba, plot_path, label=label)
-            logger.info("F1_CURVE | GLOBAL | best_theta=%.2f best_f1=%.4f", _best_theta, _best_f1)
+            _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, proba, plot_path, label=label)
+            logger.info("F1_CURVE | GLOBAL | Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f",
+                _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"],
+                _min_cov_pt["theta"], _min_cov_pt["Acc"], _min_cov_pt["F1"], _min_cov_pt["Precision"], _min_cov_pt["Recall"], _min_cov_pt["Coverage"])
+            print(f"{COLORS.OKGREEN}F1_CURVE Global | Best θ={_best_pt['theta']:.2f}: Acc={_best_pt['Acc']:.4f} F1={_best_pt['F1']:.4f} P={_best_pt['Precision']:.4f} R={_best_pt['Recall']:.4f} Cov={_best_pt['Coverage']:.4f} | MinCov θ={_min_cov_pt['theta']:.2f}: Acc={_min_cov_pt['Acc']:.4f} F1={_min_cov_pt['F1']:.4f} P={_min_cov_pt['Precision']:.4f} R={_min_cov_pt['Recall']:.4f} Cov={_min_cov_pt['Coverage']:.4f}{COLORS.ENDC}")
             del proba
 
     del eval_model, X_test, y_test, test_labels
