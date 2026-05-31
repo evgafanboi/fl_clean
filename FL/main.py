@@ -40,7 +40,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     # robust filter
     parser.add_argument("--robust_epsilon", type=float, default=0.2, help="RobustFilter epsilon (threshold sensitivity, not budget)")
     parser.add_argument("--robust_rm_budget", type=int, default=None, help="RobustFilter max removals (default: n_clients//2 - 1)")
-    parser.add_argument("--robust_threshold", type=float, default=0.3, help="AdaptiveRobustFilter tail score threshold")
+    parser.add_argument("--robust_threshold", type=float, default=0.7, help="AdaptiveRobustFilter tail score threshold")
     parser.add_argument("--robust_workers", type=int, default=8, help="Ours robust filter row-block worker threads")
     parser.add_argument("--robust_filter_v1", action="store_true", help="Ours: use one-shot contiguous-tail filter (AdaptiveRobustFilter, old default)")
     parser.add_argument("--robust_filter_v2", action="store_true", help="Ours: use one-removal-per-pass iterative robust filter")

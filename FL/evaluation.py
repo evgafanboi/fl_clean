@@ -213,6 +213,28 @@ def evaluate_model_streaming(
     return avg_loss, accuracy, f1_macro, precision_macro, recall_macro, (f1_per_class, precision_per_class, recall_per_class), cm, y_true, y_pred
 
 
+def compute_aurc(
+    y_true: np.ndarray,
+    y_pred_proba: np.ndarray,
+    n_steps: int = 20,
+) -> float:
+    thresholds = np.linspace(0.0, 0.95, n_steps)
+    max_conf = y_pred_proba.max(axis=1)
+    risks, coverages = [], []
+    for theta in thresholds:
+        mask = max_conf >= theta
+        if mask.sum() == 0:
+            continue
+        preds = y_pred_proba[mask].argmax(axis=1)
+        risks.append(1.0 - float(f1_score(y_true[mask], preds, average="macro", zero_division=0)))
+        coverages.append(float(mask.mean()))
+    if len(coverages) < 2:
+        return float(risks[0]) if risks else 1.0
+    pairs = sorted(zip(coverages, risks))
+    covs, rks = zip(*pairs)
+    return float(np.trapz(rks, covs))
+
+
 def evaluate_model_with_metrics(
     model,
     test_dataset: Iterable,
@@ -223,6 +245,7 @@ def evaluate_model_with_metrics(
     partition_type: Optional[str] = None,
     collect_details: bool = True,
     y_true_cache: Optional[np.ndarray] = None,
+    compute_aurc_curve: bool = False,
 ):
     base_model = model
     if hasattr(model, 'base_model') and hasattr(model.base_model, 'predict'):
@@ -246,6 +269,7 @@ def evaluate_model_with_metrics(
         del y_true_parts
 
     y_pred, test_loss, auprc, ece = summarize_prob_predictions(y_true, y_pred_proba, num_classes)
+    aurc_score = compute_aurc(y_true, y_pred_proba) if compute_aurc_curve else None
 
     accuracy = float(np.mean(y_true == y_pred))
 
@@ -289,6 +313,7 @@ def evaluate_model_with_metrics(
         class_report,
         auprc,
         ece,
+        aurc_score,
     )
 
 

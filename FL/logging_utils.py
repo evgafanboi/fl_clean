@@ -71,13 +71,30 @@ def _truncate_after_checkpoint_client(filepath: str, round_number: int, client_i
     return False
 
 
+def _truncate_at_evaluation(filepath: str) -> bool:
+    p = Path(filepath)
+    if not p.exists():
+        return False
+    data = p.read_bytes()
+    marker = b"=== EVALUATION ==="
+    idx = data.rfind(marker)
+    if idx == -1:
+        return False
+    line_start = data.rfind(b"\n", 0, idx)
+    cut = line_start + 1 if line_start >= 0 else 0
+    p.write_bytes(data[:cut])
+    return True
+
+
 def _truncate_for_resume(filepath: str) -> None:
     info = _load_checkpoint_info_for_log(filepath)
     if not info:
-        _truncate_after_last_round(filepath)
+        if not _truncate_at_evaluation(filepath):
+            _truncate_after_last_round(filepath)
         return
     if info.get("round_complete", "true") == "true":
-        _truncate_after_last_round(filepath)
+        if not _truncate_at_evaluation(filepath):
+            _truncate_after_last_round(filepath)
         return
     try:
         round_number = int(info.get("round", "0"))
