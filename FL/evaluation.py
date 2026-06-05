@@ -32,6 +32,7 @@ def plot_f1_threshold_curve(
 
     thresholds = np.linspace(0.0, 0.95, n_steps)
     max_conf = y_pred_proba.max(axis=1)
+    labels = np.arange(y_pred_proba.shape[1])
     f1_vals, coverage_vals, acc_vals, precision_vals, recall_vals = [], [], [], [], []
     for theta in thresholds:
         mask = max_conf >= theta
@@ -44,11 +45,11 @@ def plot_f1_threshold_curve(
             continue
         preds = y_pred_proba[mask].argmax(axis=1)
         true = y_true[mask]
-        f1_vals.append(float(f1_score(true, preds, average="macro", zero_division=0)))
+        f1_vals.append(float(f1_score(true, preds, labels=labels, average="macro", zero_division=0)))
         coverage_vals.append(float(mask.mean()))
         acc_vals.append(float(np.mean(preds == true)))
-        precision_vals.append(float(precision_score(true, preds, average="macro", zero_division=0)))
-        recall_vals.append(float(recall_score(true, preds, average="macro", zero_division=0)))
+        precision_vals.append(float(precision_score(true, preds, labels=labels, average="macro", zero_division=0)))
+        recall_vals.append(float(recall_score(true, preds, labels=labels, average="macro", zero_division=0)))
 
     best_idx = int(np.argmax(f1_vals))
     best_theta = float(thresholds[best_idx])
@@ -220,16 +221,15 @@ def compute_aurc(
 ) -> float:
     thresholds = np.linspace(0.0, 0.95, n_steps)
     max_conf = y_pred_proba.max(axis=1)
-    risks, coverages = [], []
+    labels = np.arange(y_pred_proba.shape[1])
+    risks, coverages = [0.0], [0.0]
     for theta in thresholds:
         mask = max_conf >= theta
         if mask.sum() == 0:
             continue
         preds = y_pred_proba[mask].argmax(axis=1)
-        risks.append(1.0 - float(f1_score(y_true[mask], preds, average="macro", zero_division=0)))
+        risks.append(1.0 - float(f1_score(y_true[mask], preds, labels=labels, average="macro", zero_division=0)))
         coverages.append(float(mask.mean()))
-    if len(coverages) < 2:
-        return float(risks[0]) if risks else 1.0
     pairs = sorted(zip(coverages, risks))
     covs, rks = zip(*pairs)
     return float(np.trapz(rks, covs))
