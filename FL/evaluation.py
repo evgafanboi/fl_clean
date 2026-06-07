@@ -33,54 +33,71 @@ def plot_f1_threshold_curve(
     thresholds = np.linspace(0.0, 0.95, n_steps)
     max_conf = y_pred_proba.max(axis=1)
     labels = np.arange(y_pred_proba.shape[1])
-    f1_vals, coverage_vals, acc_vals, precision_vals, recall_vals = [], [], [], [], []
+    f1_vals, effective_f1_vals, coverage_vals, acc_vals, precision_vals, recall_vals = [], [], [], [], [], []
+    missing_classes, missing_counts = [], []
     for theta in thresholds:
         mask = max_conf >= theta
+        coverage = float(mask.mean())
         if mask.sum() == 0:
+            missing = labels.tolist()
             f1_vals.append(0.0)
+            effective_f1_vals.append(0.0)
             coverage_vals.append(0.0)
             acc_vals.append(0.0)
             precision_vals.append(0.0)
             recall_vals.append(0.0)
+            missing_classes.append(missing)
+            missing_counts.append(len(missing))
             continue
         preds = y_pred_proba[mask].argmax(axis=1)
         true = y_true[mask]
-        f1_vals.append(float(f1_score(true, preds, labels=labels, average="macro", zero_division=0)))
-        coverage_vals.append(float(mask.mean()))
+        present = np.unique(true)
+        missing = np.setdiff1d(labels, present, assume_unique=True).astype(int).tolist()
+        f1 = float(f1_score(true, preds, labels=labels, average="macro", zero_division=0))
+        effective_f1 = float(f1_score(true, preds, labels=present, average="macro", zero_division=0)) if len(present) else 0.0
+        f1_vals.append(f1)
+        effective_f1_vals.append(effective_f1)
+        coverage_vals.append(coverage)
         acc_vals.append(float(np.mean(preds == true)))
-        precision_vals.append(float(precision_score(true, preds, labels=labels, average="macro", zero_division=0)))
-        recall_vals.append(float(recall_score(true, preds, labels=labels, average="macro", zero_division=0)))
+        precision_vals.append(float(precision_score(true, preds, labels=present, average="macro", zero_division=0)))
+        recall_vals.append(float(recall_score(true, preds, labels=present, average="macro", zero_division=0)))
+        missing_classes.append(missing)
+        missing_counts.append(len(missing))
 
-    best_idx = int(np.argmax(f1_vals))
+    best_idx = int(np.argmax(effective_f1_vals))
     best_theta = float(thresholds[best_idx])
     best_f1 = float(f1_vals[best_idx])
+    best_effective_f1 = float(effective_f1_vals[best_idx])
     min_cov_idx = int(np.argmin(coverage_vals))
     min_cov_theta = float(thresholds[min_cov_idx])
     min_cov = float(coverage_vals[min_cov_idx])
 
     best_point = {
         "theta": best_theta, "Acc": acc_vals[best_idx], "F1": best_f1,
-        "Precision": precision_vals[best_idx], "Recall": recall_vals[best_idx],
-        "Coverage": coverage_vals[best_idx],
+        "Effective_F1": best_effective_f1, "Missing_Count": missing_counts[best_idx],
+        "Missing_Classes": missing_classes[best_idx], "Precision": precision_vals[best_idx],
+        "Recall": recall_vals[best_idx], "Coverage": coverage_vals[best_idx],
     }
     min_cov_point = {
         "theta": min_cov_theta, "Acc": acc_vals[min_cov_idx], "F1": f1_vals[min_cov_idx],
-        "Precision": precision_vals[min_cov_idx], "Recall": recall_vals[min_cov_idx],
-        "Coverage": min_cov,
+        "Effective_F1": effective_f1_vals[min_cov_idx], "Missing_Count": missing_counts[min_cov_idx],
+        "Missing_Classes": missing_classes[min_cov_idx], "Precision": precision_vals[min_cov_idx],
+        "Recall": recall_vals[min_cov_idx], "Coverage": min_cov,
     }
 
     fig, ax1 = plt.subplots(figsize=(8, 5))
-    ax1.plot(thresholds, f1_vals, "b-o", markersize=4, label=f"{label} F1")
-    ax1.axvline(best_theta, color="b", linestyle=":", alpha=0.6, label=f"best θ={best_theta:.2f} F1={best_f1:.4f}")
+    ax1.plot(thresholds, effective_f1_vals, "b-o", markersize=4, label=f"{label} effective F1")
+    ax1.axvline(best_theta, color="b", linestyle=":", alpha=0.6, label=f"best θ={best_theta:.2f} effF1={best_effective_f1:.4f}")
     ax1.set_xlabel("Confidence Threshold θ")
     ax1.set_ylabel("Macro F1", color="b")
     ax1.tick_params(axis="y", labelcolor="b")
     ax1.set_ylim(0, 1)
     ax2 = ax1.twinx()
     ax2.plot(thresholds, coverage_vals, "r--s", markersize=4, label="Coverage")
-    ax2.set_ylabel("Coverage (fraction retained)", color="r")
+    ax2.bar(thresholds, missing_counts, width=0.95 / max(n_steps, 1) * 0.65, alpha=0.22, color="gray", label="Missing classes")
+    ax2.set_ylabel("Coverage / missing class count", color="r")
     ax2.tick_params(axis="y", labelcolor="r")
-    ax2.set_ylim(0, 1)
+    ax2.set_ylim(0, max(1.0, max(missing_counts) * 1.15))
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="lower left")
@@ -88,7 +105,12 @@ def plot_f1_threshold_curve(
     os.makedirs(os.path.dirname(plot_path), exist_ok=True)
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
-    print(f"F1-threshold curve saved → {plot_path} | Best θ={best_theta:.2f}: Acc={best_point['Acc']:.4f} F1={best_f1:.4f} P={best_point['Precision']:.4f} R={best_point['Recall']:.4f} Cov={best_point['Coverage']:.4f} | MinCov θ={min_cov_theta:.2f}: Acc={min_cov_point['Acc']:.4f} F1={min_cov_point['F1']:.4f} P={min_cov_point['Precision']:.4f} R={min_cov_point['Recall']:.4f} Cov={min_cov:.4f}")
+    missing_detail = "; ".join(
+        f"θ={theta:.2f}: missing={missing}"
+        for theta, missing in zip(thresholds, missing_classes)
+        if missing
+    ) or "none"
+    print(f"F1-threshold curve saved → {plot_path} | Best θ={best_theta:.2f}: Acc={best_point['Acc']:.4f} F1={best_f1:.4f} EffF1={best_effective_f1:.4f} P={best_point['Precision']:.4f} R={best_point['Recall']:.4f} Cov={best_point['Coverage']:.4f} Missing={best_point['Missing_Classes']} | MinCov θ={min_cov_theta:.2f}: Acc={min_cov_point['Acc']:.4f} F1={min_cov_point['F1']:.4f} EffF1={min_cov_point['Effective_F1']:.4f} P={min_cov_point['Precision']:.4f} R={min_cov_point['Recall']:.4f} Cov={min_cov:.4f} Missing={min_cov_point['Missing_Classes']} | Missing detail: {missing_detail}")
     return best_point, min_cov_point
 
 
@@ -232,7 +254,8 @@ def compute_aurc(
         coverages.append(float(mask.mean()))
     pairs = sorted(zip(coverages, risks))
     covs, rks = zip(*pairs)
-    return float(np.trapz(rks, covs))
+    trapz = getattr(np, "trapezoid", None) or np.trapz
+    return float(trapz(rks, covs))
 
 
 def evaluate_model_with_metrics(
@@ -277,6 +300,13 @@ def evaluate_model_with_metrics(
     precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
     recall_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
 
+    is_attack_true = y_true != 0
+    is_attack_pred = y_pred != 0
+    n_attack = int(is_attack_true.sum())
+    n_benign = int((~is_attack_true).sum())
+    tpr = float((is_attack_true & is_attack_pred).sum() / n_attack) if n_attack > 0 else 0.0
+    fpr = float(((~is_attack_true) & is_attack_pred).sum() / n_benign) if n_benign > 0 else 0.0
+
     per_class_metrics = None
     cm = None
     class_report = ""
@@ -314,6 +344,8 @@ def evaluate_model_with_metrics(
         auprc,
         ece,
         aurc_score,
+        tpr,
+        fpr,
     )
 
 
