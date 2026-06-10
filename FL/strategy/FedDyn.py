@@ -13,22 +13,26 @@ def _train_client_pt(model, dataset, epochs, alpha, grad_L, global_weights):
     net = model.nn
     net.to(dev)
     net.train()
-    dyn_opt = torch.optim.SGD(net.parameters(), lr=0.01)
+    optimizer = model.optimizer
     sd_keys = list(net.state_dict().keys())
     gw_map = {k: torch.from_numpy(np.array(global_weights[i], dtype=np.float32)).to(dev)
               for i, k in enumerate(sd_keys) if i < len(global_weights)}
     gl_map = {k: torch.from_numpy(np.array(grad_L[i], dtype=np.float32)).to(dev)
               for i, k in enumerate(sd_keys) if i < len(grad_L)}
+    criterion = model.criterion
     total_loss, n_batches = 0.0, 0
-    for _ in range(epochs):
+    for epoch in range(epochs):
+        lr = model._lr_for_epoch(epoch)
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
         for X, y in dataset:
             X = X.to(dev, non_blocking=True)
             y = y.to(dev, non_blocking=True)
             if y.ndim > 1:
                 y = y.argmax(dim=1)
-            dyn_opt.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
             logits = net(X, return_logits=True)
-            ce = F.cross_entropy(logits, y)
+            ce = criterion(logits, y)
             lin = torch.tensor(0.0, device=dev)
             quad = torch.tensor(0.0, device=dev)
             for name, param in net.named_parameters():
@@ -40,7 +44,7 @@ def _train_client_pt(model, dataset, epochs, alpha, grad_L, global_weights):
             loss = ce - lin + (alpha / 2.0) * quad
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-            dyn_opt.step()
+            optimizer.step()
             total_loss += loss.item()
             n_batches += 1
     return total_loss / max(n_batches, 1)

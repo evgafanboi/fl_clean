@@ -17,7 +17,7 @@ from ..context import PipelineContext
 from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
-from .robust_filter import AdaptiveRobustFilter, CronusRobustFilter, IterativeRobustFilter, RobustFilterV3, RobustFilterV4
+from .robust_filter import CronusRobustFilter, RobustFilterV3
 from .common import (
     create_model,
     create_private_dataset,
@@ -270,7 +270,7 @@ def compute_robust_consensus_from_files(
     samplewise_cronus = isinstance(robust_filter, CronusRobustFilter)
     eig_chunks = [] if samplewise_cronus else None
 
-    if isinstance(robust_filter, (RobustFilterV3, RobustFilterV4)):
+    if isinstance(robust_filter, RobustFilterV3):
         total_counts = np.zeros(n_clients, dtype=np.int64)
         total_rows = 0
         chunk_masks = []
@@ -328,63 +328,6 @@ def compute_robust_consensus_from_files(
         for h in handles:
             h.close()
         return consensus, max_eig, max_ratio, removal_counts, eig_report, v3_supported
-    elif type(robust_filter) is AdaptiveRobustFilter:
-        active = np.ones(n_clients, dtype=bool)
-        removed_total = 0
-        g_max_eig = None
-        while removed_total < robust_filter.budget:
-            K_act = int(active.sum())
-            if K_act < 2:
-                break
-            total_counts = np.zeros(K_act, dtype=np.int64)
-            total_rows = 0
-            pass_max = None
-            handles = [open(fpath, "rb") for fpath in logit_files]
-            pbar = tqdm(total=n_samples, desc=f"Scoring ({removed_total+1}/{robust_filter.budget})", unit="sample")
-            for offset in range(0, n_samples, chunk_rows):
-                rows = min(chunk_rows, n_samples - offset)
-                client_chunks = [
-                    _sanitize_logits(np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes))
-                    for h in handles
-                ]
-                S_act = np.stack(client_chunks, axis=1)[:, active, :]
-                chunk_counts, chunk_max = robust_filter._count_tails(S_act)
-                total_counts += chunk_counts
-                total_rows += rows
-                if chunk_max is not None and (pass_max is None or chunk_max > pass_max):
-                    pass_max = chunk_max
-                pbar.update(rows)
-                del client_chunks, S_act
-            pbar.close()
-            for h in handles:
-                h.close()
-            if pass_max is not None and (g_max_eig is None or pass_max > g_max_eig):
-                g_max_eig = pass_max
-            global_scores = total_counts.astype(np.float64) / max(total_rows, 1)
-            flagged = robust_filter._select_flagged(global_scores, robust_filter.budget - removed_total)
-            if len(flagged) == 0:
-                break
-            global_flagged = np.where(active)[0][flagged]
-            active[global_flagged] = False
-            for c in global_flagged:
-                removal_counts[c] = n_samples
-            removed_total += len(flagged)
-        max_eig = g_max_eig
-        handles = [open(fpath, "rb") for fpath in logit_files]
-        pbar = tqdm(total=n_samples, desc="Mean pass", unit="sample")
-        for offset in range(0, n_samples, chunk_rows):
-            rows = min(chunk_rows, n_samples - offset)
-            client_chunks = [
-                _sanitize_logits(np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes))
-                for h in handles
-            ]
-            S_batch = np.stack(client_chunks, axis=1)
-            consensus[offset : offset + rows] = S_batch[:, active, :].mean(axis=1).astype(np.float32)
-            pbar.update(rows)
-            del client_chunks, S_batch
-        pbar.close()
-        for h in handles:
-            h.close()
     else:
         handles = [open(fpath, "rb") for fpath in logit_files]
         pbar = tqdm(total=n_samples, desc="Robust consensus", unit="sample")
@@ -470,8 +413,7 @@ def compute_supported_consensus_from_files(
     eig_chunks = [] if samplewise_cronus else None
 
     budget = getattr(robust_filter, "budget", 0) if robust_filter is not None else 0
-    global_v3 = isinstance(robust_filter, (RobustFilterV3, RobustFilterV4)) if robust_filter is not None else False
-    global_adaptive = type(robust_filter) is AdaptiveRobustFilter if robust_filter is not None else False
+    global_v3 = isinstance(robust_filter, RobustFilterV3) if robust_filter is not None else False
     if global_v3:
         total_counts = np.zeros(n_clients, dtype=np.int64)
         total_rows_v3 = 0
@@ -536,84 +478,6 @@ def compute_supported_consensus_from_files(
                 supported_mask[offset:offset + rows] = valid
                 del weighted_sum
             del Q_survivors, support_mass, valid, per_sample_alive
-            mean_pbar.update(rows)
-            del client_chunks, support_chunks, S_batch, Q_batch
-        mean_pbar.close()
-        for handle in log_handles:
-            handle.close()
-        for handle in support_handles:
-            handle.close()
-    elif global_adaptive:
-        active = np.ones(n_clients, dtype=bool)
-        removed_total = 0
-        g_max_eig = None
-        while removed_total < budget:
-            K_act = int(active.sum())
-            if K_act < 2:
-                break
-            total_counts = np.zeros(K_act, dtype=np.int64)
-            total_rows = 0
-            pass_max = None
-            handles = [open(fpath, "rb") for fpath in logit_files]
-            score_pbar = tqdm(total=n_samples, desc=f"Scoring ({removed_total+1}/{budget})", unit="sample")
-            for offset in range(0, n_samples, chunk_rows):
-                rows = min(chunk_rows, n_samples - offset)
-                client_chunks = [
-                    _sanitize_logits(np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes))
-                    for h in handles
-                ]
-                S_act = np.stack(client_chunks, axis=1)[:, active, :]
-                chunk_counts, chunk_max = robust_filter._count_tails(S_act)
-                total_counts += chunk_counts
-                total_rows += rows
-                if chunk_max is not None and (pass_max is None or chunk_max > pass_max):
-                    pass_max = chunk_max
-                score_pbar.update(rows)
-                del client_chunks, S_act
-            score_pbar.close()
-            for h in handles:
-                h.close()
-            if pass_max is not None and (g_max_eig is None or pass_max > g_max_eig):
-                g_max_eig = pass_max
-            global_scores = total_counts.astype(np.float64) / max(total_rows, 1)
-            flagged = robust_filter._select_flagged(global_scores, budget - removed_total)
-            if len(flagged) == 0:
-                break
-            global_flagged = np.where(active)[0][flagged]
-            active[global_flagged] = False
-            for c in global_flagged:
-                removal_counts[c] = n_samples
-            removed_total += len(flagged)
-        max_eig = g_max_eig
-        survivor_weights = active.astype(np.float32)
-        log_handles = [open(fpath, "rb") for fpath in logit_files]
-        support_handles = [open(fpath, "rb") for fpath in support_files]
-        mean_pbar = tqdm(total=n_samples, desc="Mean pass", unit="sample")
-        for offset in range(0, n_samples, chunk_rows):
-            rows = min(chunk_rows, n_samples - offset)
-            client_chunks = [
-                _sanitize_logits(np.frombuffer(h.read(rows * row_bytes), dtype=np.float32).reshape(rows, n_classes))
-                for h in log_handles
-            ]
-            support_chunks = [
-                np.frombuffer(h.read(rows * support_bytes), dtype=np.float32)
-                for h in support_handles
-            ]
-            S_batch = np.stack(client_chunks, axis=1)
-            Q_batch = np.stack(support_chunks, axis=1).astype(np.float32)
-            chunk_consensus = consensus[offset:offset + rows]
-            if mode == "eva" or mode == "eva2":
-                Q_survivors = (Q_batch > 0.0).astype(np.float32) * survivor_weights
-            else:
-                Q_survivors = Q_batch * survivor_weights
-            support_mass = Q_survivors.sum(axis=1)
-            valid = support_mass > 0.0
-            if valid.any():
-                weighted_sum = np.einsum("rk,rkc->rc", Q_survivors[valid], S_batch[valid], optimize=True)
-                chunk_consensus[valid] = (weighted_sum / support_mass[valid, np.newaxis]).astype(np.float32)
-                supported_mask[offset:offset + rows] = valid
-                del weighted_sum
-            del Q_survivors, support_mass, valid
             mean_pbar.update(rows)
             del client_chunks, support_chunks, S_batch, Q_batch
         mean_pbar.close()
@@ -1030,27 +894,11 @@ class Ours(DistillationStrategy):
                 budget=getattr(config, "robust_rm_budget", None) or 0,
                 workers=getattr(config, "robust_workers", 8),
             )
-        elif getattr(config, "robust_filter_v4", False):
-            self.robust_filter = RobustFilterV4(
-                robust_threshold=getattr(config, "robust_threshold", 0.3),
-                t_df=getattr(config, "robust_v", 4.0),
-                workers=getattr(config, "robust_workers", 8),
-            )
-        elif getattr(config, "robust_filter_v2", False):
-            self.robust_filter = IterativeRobustFilter(
-                budget=getattr(config, "robust_rm_budget", None) or 0,
-                tail_threshold=getattr(config, "robust_threshold", 0.75),
-                workers=getattr(config, "robust_workers", 8),
-            )
-        elif getattr(config, "robust_filter_v1", False):
-            self.robust_filter = AdaptiveRobustFilter(
-                budget=getattr(config, "robust_rm_budget", None) or 0,
-                tail_threshold=getattr(config, "robust_threshold", 0.75),
-                workers=getattr(config, "robust_workers", 8),
-            )
         else:
             self.robust_filter = RobustFilterV3(
                 robust_threshold=getattr(config, "robust_threshold", 0.3),
+                reference=getattr(config, "robust_filter_reference", "Blom"),
+                t_df=getattr(config, "robust_v", 4.0),
                 workers=getattr(config, "robust_workers", 8),
             )
 
@@ -1061,17 +909,12 @@ class Ours(DistillationStrategy):
             tokens["eva_mode"] = self.eva_mode
         if getattr(self.config, "robust_filter_cronus", False):
             tokens["robust_filter"] = "cronus"
-        if getattr(self.config, "robust_filter_v4", False):
-            tokens["robust_filter"] = "v4"
-            tokens["robust_threshold"] = getattr(self.config, "robust_threshold", 0.3)
-            tokens["robust_v"] = getattr(self.config, "robust_v", 4.0)
-        elif getattr(self.config, "robust_filter_v2", False):
-            tokens["robust_filter"] = "v2"
-        elif getattr(self.config, "robust_filter_v1", False):
-            tokens["robust_filter"] = "v1"
         else:
-            tokens["robust_filter"] = "v3"
+            ref = getattr(self.config, "robust_filter_reference", "Blom").lower()
+            tokens["robust_filter"] = "v3" if ref == "blom" else ref
             tokens["robust_threshold"] = getattr(self.config, "robust_threshold", 0.3)
+            if ref == "t":
+                tokens["robust_v"] = getattr(self.config, "robust_v", 4.0)
         if self.config.ours_kd == "abkd":
             tokens.update({"ab_alpha": self.config.ab_alpha, "ab_beta": self.config.ab_beta, "temperature": self.config.ours_temperature})
         return tokens
@@ -1443,7 +1286,7 @@ class Ours(DistillationStrategy):
         config = context.config
         public_features = np.load(context.shared_state["public_features_path"], mmap_mode="r")
         eva_mode = self.eva_mode
-        no_filter = not isinstance(self.robust_filter, (RobustFilterV3, RobustFilterV4)) and getattr(config, "robust_rm_budget", 0) == 0 and eva_mode is None
+        no_filter = not isinstance(self.robust_filter, RobustFilterV3) and getattr(config, "robust_rm_budget", 0) == 0 and eva_mode is None
         _pfl = getattr(context, 'poisoned_fl_state', None)
 
         os.makedirs(LOGITS_CACHE_DIR, exist_ok=True)

@@ -24,6 +24,7 @@ def plot_f1_threshold_curve(
     plot_path: str,
     label: str = "model",
     n_steps: int = 20,
+    logger=None,
 ) -> None:
     import os
     import matplotlib
@@ -110,7 +111,19 @@ def plot_f1_threshold_curve(
         for theta, missing in zip(thresholds, missing_classes)
         if missing
     ) or "none"
-    print(f"F1-threshold curve saved → {plot_path} | Best θ={best_theta:.2f}: Acc={best_point['Acc']:.4f} F1={best_f1:.4f} EffF1={best_effective_f1:.4f} P={best_point['Precision']:.4f} R={best_point['Recall']:.4f} Cov={best_point['Coverage']:.4f} Missing={best_point['Missing_Classes']} | MinCov θ={min_cov_theta:.2f}: Acc={min_cov_point['Acc']:.4f} F1={min_cov_point['F1']:.4f} EffF1={min_cov_point['Effective_F1']:.4f} P={min_cov_point['Precision']:.4f} R={min_cov_point['Recall']:.4f} Cov={min_cov:.4f} Missing={min_cov_point['Missing_Classes']} | Missing detail: {missing_detail}")
+    summary = (
+        f"F1-threshold curve saved → {plot_path} | "
+        f"Best θ={best_theta:.2f}: Acc={best_point['Acc']:.4f} F1={best_f1:.4f} EffF1={best_effective_f1:.4f} "
+        f"P={best_point['Precision']:.4f} R={best_point['Recall']:.4f} Cov={best_point['Coverage']:.4f} "
+        f"Missing={best_point['Missing_Classes']} | "
+        f"MinCov θ={min_cov_theta:.2f}: Acc={min_cov_point['Acc']:.4f} F1={min_cov_point['F1']:.4f} "
+        f"EffF1={min_cov_point['Effective_F1']:.4f} P={min_cov_point['Precision']:.4f} "
+        f"R={min_cov_point['Recall']:.4f} Cov={min_cov:.4f} Missing={min_cov_point['Missing_Classes']} | "
+        f"Missing detail: {missing_detail}"
+    )
+    print(summary)
+    if logger is not None:
+        logger.info("F1_CURVE | %s | %s", label, summary)
     return best_point, min_cov_point
 
 

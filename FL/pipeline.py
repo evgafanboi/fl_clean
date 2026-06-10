@@ -27,7 +27,7 @@ from .data_utils import (
     restore_full_partition,
     setup_paths,
 )
-from .evaluation import compute_aurc, create_enhanced_excel_report, evaluate_model_with_metrics
+from .evaluation import compute_aurc, create_enhanced_excel_report, evaluate_model_with_metrics, plot_f1_threshold_curve
 from .gpu import configure_gpu_memory, configure_gpu
 from .logging_utils import log_timestamp, setup_logger
 from .memory import aggressive_memory_cleanup, clear_session
@@ -102,6 +102,23 @@ def _config_fingerprint(config) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def _config_fingerprint_candidates(config):
+    import hashlib
+    d = dataclasses.asdict(config)
+    for key in ('checkpoint', 'rounds', 'skip_eval', 'fresh_run', 'robust_workers', 'f1_curve', 'cache_test_set'):
+        d.pop(key, None)
+    candidates = {hashlib.sha256(str(sorted(d.items())).encode()).hexdigest()[:16]}
+    if d.get('algorithm') == 'Ours' and str(d.get('robust_filter_reference', 'Blom')).lower() == 'blom':
+        legacy = dict(d)
+        legacy.pop('robust_filter_reference', None)
+        legacy['robust_filter_v1'] = False
+        legacy['robust_filter_v2'] = False
+        legacy['robust_filter_v3'] = True
+        legacy['robust_filter_v4'] = False
+        candidates.add(hashlib.sha256(str(sorted(legacy.items())).encode()).hexdigest()[:16])
+    return candidates
+
+
 def _allow_eval_shortcut_from_records(ckpt_info_path: str, config) -> tuple[bool, Dict[str, str]]:
     if not os.path.exists(ckpt_info_path):
         return True, {}
@@ -112,8 +129,8 @@ def _allow_eval_shortcut_from_records(ckpt_info_path: str, config) -> tuple[bool
             if key:
                 info[key] = val
     saved_hash = info.get("config_hash", "")
-    current_hash = _config_fingerprint(config)
-    if saved_hash and saved_hash != current_hash:
+    current_hashes = _config_fingerprint_candidates(config)
+    if saved_hash and saved_hash not in current_hashes:
         return False, info
     saved_backend = info.get("backend", "")
     current_backend = "tensorflow" if _use_tf() else "pytorch"
@@ -600,8 +617,8 @@ class FederatedLearningPipeline:
                 info[key] = val
 
         saved_hash = info.get("config_hash", "")
-        current_hash = _config_fingerprint(self.config)
-        if saved_hash and saved_hash != current_hash:
+        current_hashes = _config_fingerprint_candidates(self.config)
+        if saved_hash and saved_hash not in current_hashes:
             print(f"{COLORS.WARNING}No checkpoint found, starting fresh{COLORS.ENDC}")
             return None
 
@@ -1117,16 +1134,6 @@ class FederatedLearningPipeline:
                         "targeted_flip", num_classes,
                         dominant_class=dominant, target_label=target_label,
                     )
-            elif attack_type == "targeted_flip":
-                target_label = int(poison_value)
-                for cid in self.poisoned_clients:
-                    y = np.load(paths_list[cid]['train_y'], mmap_mode='r').astype(np.int32)
-                    dominant = int(np.argmax(np.bincount(y, minlength=num_classes)))
-                    del y
-                    self.per_client_loaders[cid] = PoisonedDataLoader(
-                        "targeted_flip", num_classes,
-                        dominant_class=dominant, target_label=target_label,
-                    )
             elif attack_type == "poisonedfl":
                 self.poisoned_fl_state = PoisonedFLState(c0=poison_value)
             log_timestamp(self.logger, f"Poisoned clients: {self.poisoned_clients}")
@@ -1172,19 +1179,18 @@ class FederatedLearningPipeline:
         # Check if final weight records already exist — skip training entirely
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
         record_base = os.path.join("temp_weights", f"{stem}_weight_record")
-        ckpt_info_path = os.path.join(self._checkpoint_dir(), "info.txt")
+        final_round_dir = os.path.join(record_base, f"round_{self.config.rounds}")
+        ckpt_info_path = os.path.join("checkpoint", stem, "info.txt")
         _allow_final_record_shortcut, _shortcut_info = _allow_eval_shortcut_from_records(ckpt_info_path, self.config)
-        _final_record_exists = os.path.exists(
-            os.path.join(record_base, f"round_{self.config.rounds}", "global_weight.bin")
-        )
-        if _final_record_exists and _allow_final_record_shortcut:
-            log_timestamp(self.logger, f"Weight records found (round {self.config.rounds}), skipping to evaluation")
-            print(f"{COLORS.OKGREEN}Weight records found for round {self.config.rounds} — skipping to evaluation{COLORS.ENDC}")
+        _final_exists = os.path.exists(os.path.join(final_round_dir, "global_weight.bin"))
+        if _final_exists and _allow_final_record_shortcut:
+            log_timestamp(self.logger, f"Weight records found (round {self.config.rounds}), skipping training")
+            print(f"{COLORS.OKGREEN}Weight records found up to round {self.config.rounds} — skipping to evaluation{COLORS.ENDC}")
             self._run_eval_from_records(
                 input_dim, num_classes, class_names, partition_label, excel_filename, record_base,
             )
             return
-        if _final_record_exists and not _allow_final_record_shortcut:
+        if _final_exists and not _allow_final_record_shortcut:
             _stage = _shortcut_info.get("stage", "?")
             print(f"{COLORS.WARNING}Final-round weight records exist, but checkpoint is not fully complete (stage={_stage}) — resuming training{COLORS.ENDC}")
 
@@ -1570,13 +1576,12 @@ class FederatedLearningPipeline:
             del weights
 
             collect_details = (round_num == self.config.rounds)
-            _do_aurc = collect_details and getattr(self.config, 'f1_curve', False)
             result = evaluate_model_with_metrics(
                 eval_model, test_dataset, num_classes,
                 class_names, round_num, self.config.strategy,
                 partition_label, collect_details=collect_details,
                 y_true_cache=y_true_cache,
-                compute_aurc_curve=_do_aurc,
+                compute_aurc_curve=collect_details,
             )
             test_loss, accuracy, f1_value, precision, recall = result[:5]
             per_class_metrics = result[5]
@@ -1585,15 +1590,17 @@ class FederatedLearningPipeline:
             auprc = result[8] if len(result) > 8 else 0.0
             ece = result[9] if len(result) > 9 else 0.0
             aurc = result[10]
+            tpr = result[11] if len(result) > 11 else 0.0
+            fpr = result[12] if len(result) > 12 else 0.0
 
             _aurc_str = f" | AURC: {aurc:.4f}" if aurc is not None else ""
             self.logger.info(
                 f"Round {round_num} | GLOBAL | Acc: {accuracy:.4f} | F1: {f1_value:.4f} | "
-                f"Precision: {precision:.4f} | Recall: {recall:.4f} | AUPRC: {auprc:.4f} | ECE: {ece:.4f} | Loss: {test_loss:.4f}{_aurc_str}"
+                f"Precision: {precision:.4f} | Recall: {recall:.4f} | TPR: {tpr:.4f} | FPR: {fpr:.4f} | AUPRC: {auprc:.4f} | ECE: {ece:.4f} | Loss: {test_loss:.4f}{_aurc_str}"
             )
             print(
                 f"{COLORS.OKGREEN}Round {round_num} | Acc={accuracy:.4f}, F1={f1_value:.4f}, "
-                f"Precision={precision:.4f}, Recall={recall:.4f}, AUPRC={auprc:.4f}, ECE={ece:.4f}, Loss={test_loss:.4f}{_aurc_str}{COLORS.ENDC}"
+                f"Precision={precision:.4f}, Recall={recall:.4f}, TPR={tpr:.4f}, FPR={fpr:.4f}, AUPRC={auprc:.4f}, ECE={ece:.4f}, Loss={test_loss:.4f}{_aurc_str}{COLORS.ENDC}"
             )
             if class_report and self.detailed_logger is not None:
                 self.detailed_logger.info(f"Round {round_num}\n{class_report}")
@@ -1603,7 +1610,7 @@ class FederatedLearningPipeline:
             new_row = pd.DataFrame({
                 'Round': [round_num], 'Loss': [test_loss], 'Accuracy': [accuracy],
                 'F1_Score': [f1_value], 'Precision': [precision], 'Recall': [recall],
-                'AUPRC': [auprc], 'ECE': [ece], 'AURC': [aurc],
+                'AUPRC': [auprc], 'ECE': [ece], 'AURC': [aurc], 'TPR': [tpr], 'FPR': [fpr],
             })
             self.results_df = pd.concat([self.results_df, new_row], ignore_index=True)
 
@@ -1612,6 +1619,35 @@ class FederatedLearningPipeline:
                 final_confusion_mat = confusion_mat
 
             self.results_df.to_pickle(progress_path)
+
+        if getattr(self.config, 'f1_curve', False):
+            _f1_log_stem = os.path.splitext(os.path.basename(self.log_filename))[0]
+            plot_path = os.path.join("results", "plots", _f1_log_stem, "global_model.png")
+            weight_path = os.path.join(record_base, f"round_{self.config.rounds}", "global_weight.bin")
+            if os.path.exists(weight_path):
+                from .context import get_model_proba
+                X_test_np = np.load("data/X_test.npy").astype(np.float32)
+                with open(weight_path, "rb") as _f:
+                    weights = pickle.load(_f)
+                eval_model.set_weights(weights)
+                del weights
+                proba = get_model_proba(eval_model, X_test_np, self.config.batch_size)
+                del X_test_np
+                _best_pt, _min_cov_pt = plot_f1_threshold_curve(y_true_cache, proba, plot_path, label=self.config.strategy, logger=self.logger)
+                _global_aurc = compute_aurc(y_true_cache, proba)
+                del proba
+                self.logger.info(
+                    "F1_CURVE | GLOBAL | Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
+                    _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"],
+                    _min_cov_pt["theta"], _min_cov_pt["Acc"], _min_cov_pt["F1"], _min_cov_pt["Precision"], _min_cov_pt["Recall"], _min_cov_pt["Coverage"],
+                    _global_aurc,
+                )
+                print(
+                    f"{COLORS.OKGREEN}F1_CURVE Global | Best θ={_best_pt['theta']:.2f}: Acc={_best_pt['Acc']:.4f} F1={_best_pt['F1']:.4f} "
+                    f"P={_best_pt['Precision']:.4f} R={_best_pt['Recall']:.4f} Cov={_best_pt['Coverage']:.4f} | "
+                    f"MinCov θ={_min_cov_pt['theta']:.2f}: Acc={_min_cov_pt['Acc']:.4f} F1={_min_cov_pt['F1']:.4f} "
+                    f"P={_min_cov_pt['Precision']:.4f} R={_min_cov_pt['Recall']:.4f} Cov={_min_cov_pt['Coverage']:.4f} | AURC={_global_aurc:.4f}{COLORS.ENDC}"
+                )
 
         if not self.results_df.empty:
             if final_per_class_metrics is not None:
@@ -1871,14 +1907,14 @@ def run_distillation_pipeline(config, strategy) -> None:
                     key, _, val = line.strip().partition(": ")
                     ckpt_info[key] = val
             saved_hash = ckpt_info.get("config_hash", "")
-            current_hash = _config_fingerprint(config)
+            current_hashes = _config_fingerprint_candidates(config)
             saved_backend = ckpt_info.get("backend", "")
             current_backend = "tensorflow" if _use_tf() else "pytorch"
             if saved_backend and saved_backend != current_backend:
                 print(f"{COLORS.WARNING}Checkpoint backend mismatch (saved={saved_backend}, current={current_backend}) "
                       f"— weight arrays are incompatible across backends. Starting fresh{COLORS.ENDC}")
-            elif saved_hash and saved_hash != current_hash:
-                print(f"{COLORS.WARNING}Checkpoint config mismatch (saved={saved_hash}, current={current_hash}) \u2014 starting fresh{COLORS.ENDC}")
+            elif saved_hash and saved_hash not in current_hashes:
+                print(f"{COLORS.WARNING}Checkpoint config mismatch (saved={saved_hash}, current={next(iter(current_hashes))}) \u2014 starting fresh{COLORS.ENDC}")
             else:
                 _ckpt_round = int(ckpt_info["round"])
                 _round_done = ckpt_info.get("round_complete", "true") == "true"
@@ -2125,13 +2161,13 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
             _record_metrics(context, round_number, round_metrics, excel_filename)
 
             logger.info(
-                "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
+                "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | TPR: %.4f | FPR: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
                 round_number, metrics["Acc"], metrics["F1"],
-                metrics["Precision"], metrics["Recall"], metrics["AUPRC"], metrics["ECE"], metrics["Loss"],
+                metrics["Precision"], metrics["Recall"], metrics["TPR"], metrics["FPR"], metrics["AUPRC"], metrics["ECE"], metrics["Loss"],
             )
             print(
                 f"{COLORS.OKGREEN}Round {round_number} | Acc={metrics['Acc']:.4f}, F1={metrics['F1']:.4f}, "
-                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, AUPRC={metrics['AUPRC']:.4f}, ECE={metrics['ECE']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
+                f"Precision={metrics['Precision']:.4f}, Recall={metrics['Recall']:.4f}, TPR={metrics['TPR']:.4f}, FPR={metrics['FPR']:.4f}, AUPRC={metrics['AUPRC']:.4f}, ECE={metrics['ECE']:.4f}, Loss={metrics['Loss']:.4f}{COLORS.ENDC}"
             )
         else:
             global_weight_path = os.path.join(round_dir, "global_weight.bin")
@@ -2174,7 +2210,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         m, _proba = result if _cap else (result, None)
                         if _cap:
                             _c_plot = os.path.join("results", "plots", _f1_log_stem, f"client_{cid}.png")
-                            _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}")
+                            _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}", logger=logger)
                             _aurc_val = compute_aurc(test_labels, _proba)
                             logger.info("Round %s | Client %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
                                 round_number, cid, _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"], _aurc_val)
@@ -2182,18 +2218,18 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                             _aurc_results.append(_aurc_val)
                             del _proba
                         round_metrics[cid] = m
-                        logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
-                                    round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["ECE"], m["Loss"])
-                        print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, ECE={m['ECE']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
+                        logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | TPR: %.4f | FPR: %.4f | ECE: %.4f | Loss: %.4f",
+                                    round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["TPR"], m["FPR"], m["ECE"], m["Loss"])
+                        print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, TPR={m['TPR']:.4f}, FPR={m['FPR']:.4f}, ECE={m['ECE']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
                     if round_metrics:
                         _record_metrics(context, round_number, round_metrics, excel_filename)
                         avg = {k: float(np.mean([v[k] for v in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
                         _record_metrics(context, round_number, {(-3 if _skip_synthetic_byzantine_eval else -1): avg}, excel_filename)
                         _avg_label = "BENIGN_AVG" if _skip_synthetic_byzantine_eval else "AVG"
-                        logger.info("Round %s | %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
-                            round_number, _avg_label, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["ECE"], avg["Loss"])
+                        logger.info("Round %s | %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | TPR: %.4f | FPR: %.4f | ECE: %.4f | Loss: %.4f",
+                            round_number, _avg_label, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["TPR"], avg["FPR"], avg["ECE"], avg["Loss"])
                         print(f"{COLORS.OKGREEN}Round {round_number} {_avg_label.replace('_', ' ')} | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
-                              f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
+                              f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, TPR={avg['TPR']:.4f}, FPR={avg['FPR']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
                         if _f1_curve_results:
                             _mk = ["Acc", "F1", "Precision", "Recall", "Coverage"]
                             _avg_best = {k: float(np.mean([r[0][k] for r in _f1_curve_results])) for k in _mk}
@@ -2205,6 +2241,14 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                                 _avg_best_theta, _avg_best["Acc"], _avg_best["F1"], _avg_best["Precision"], _avg_best["Recall"], _avg_best["Coverage"],
                                 _avg_mc_theta, _avg_mc["Acc"], _avg_mc["F1"], _avg_mc["Precision"], _avg_mc["Recall"], _avg_mc["Coverage"])
                             print(f"{COLORS.OKGREEN}  Best θ={_avg_best_theta:.2f}: Acc={_avg_best['Acc']:.4f} F1={_avg_best['F1']:.4f} P={_avg_best['Precision']:.4f} R={_avg_best['Recall']:.4f} Cov={_avg_best['Coverage']:.4f} | MinCov θ={_avg_mc_theta:.2f}: Acc={_avg_mc['Acc']:.4f} F1={_avg_mc['F1']:.4f} P={_avg_mc['Precision']:.4f} R={_avg_mc['Recall']:.4f} Cov={_avg_mc['Coverage']:.4f}{COLORS.ENDC}")
+                            _missing_counts = {}
+                            for _best, _ in _f1_curve_results:
+                                for _cls in _best.get("Missing_Classes", []):
+                                    _missing_counts[int(_cls)] = _missing_counts.get(int(_cls), 0) + 1
+                            if _missing_counts:
+                                _missing_msg = " | ".join(f"Class {_cls}: ({100.0 * _count / len(_f1_curve_results):.1f} %)" for _cls, _count in sorted(_missing_counts.items()))
+                                logger.info("Round %s | %s | F1_CURVE Best missing classes: %s", round_number, _avg_label, _missing_msg)
+                                print(f"{COLORS.WARNING}  Best missing classes | {_missing_msg}{COLORS.ENDC}")
                         if _aurc_results:
                             _avg_aurc = float(np.mean(_aurc_results))
                             logger.info("Round %s | %s | AURC: %.4f", round_number, _avg_label, _avg_aurc)
@@ -2214,10 +2258,10 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         if _benign_cids:
                             _b_avg = {k: float(np.mean([round_metrics[c][k] for c in _benign_cids])) for k in avg}
                             _record_metrics(context, round_number, {-3: _b_avg}, excel_filename)
-                            logger.info("Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
-                                        round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["ECE"], _b_avg["Loss"])
+                            logger.info("Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | TPR: %.4f | FPR: %.4f | ECE: %.4f | Loss: %.4f",
+                                        round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["TPR"], _b_avg["FPR"], _b_avg["ECE"], _b_avg["Loss"])
                             print(f"{COLORS.OKGREEN}Round {round_number} Benign Avg | Acc={_b_avg['Acc']:.4f}, F1={_b_avg['F1']:.4f}, "
-                                    f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, ECE={_b_avg['ECE']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}")
+                                    f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, TPR={_b_avg['TPR']:.4f}, FPR={_b_avg['FPR']:.4f}, ECE={_b_avg['ECE']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}")
                     if ghost_bin_path is not None:
                         if _mixed:
                             from models.mixed_models import get_model_type_for_client
@@ -2232,10 +2276,10 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         del ghost_weights
                         ghost_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes, compute_auprc=False)
                         _record_metrics(context, round_number, {-1: ghost_metrics}, excel_filename)
-                        logger.info("Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
-                                round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["ECE"], ghost_metrics["Loss"])
+                        logger.info("Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | TPR: %.4f | FPR: %.4f | ECE: %.4f | Loss: %.4f",
+                                round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["TPR"], ghost_metrics["FPR"], ghost_metrics["ECE"], ghost_metrics["Loss"])
                         print(f"{COLORS.OKGREEN}Round {round_number} PoisonedFL ghost | Acc={ghost_metrics['Acc']:.4f}, F1={ghost_metrics['F1']:.4f}, "
-                            f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, ECE={ghost_metrics['ECE']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}")
+                            f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, TPR={ghost_metrics['TPR']:.4f}, FPR={ghost_metrics['FPR']:.4f}, ECE={ghost_metrics['ECE']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}")
                 if os.path.exists(global_weight_path):
                     if _eval_model_arch != model_type:
                         del eval_model
@@ -2247,11 +2291,11 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     del g_weights
                     g_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
                     _record_metrics(context, round_number, {-2: g_metrics}, excel_filename)
-                    logger.info("Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
+                    logger.info("Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | TPR: %.4f | FPR: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
                                 round_number, g_metrics["Acc"], g_metrics["F1"],
-                                g_metrics["Precision"], g_metrics["Recall"], g_metrics["AUPRC"], g_metrics["ECE"], g_metrics["Loss"])
+                                g_metrics["Precision"], g_metrics["Recall"], g_metrics["TPR"], g_metrics["FPR"], g_metrics["AUPRC"], g_metrics["ECE"], g_metrics["Loss"])
                     print(f"{COLORS.OKGREEN}Round {round_number} Global | Acc={g_metrics['Acc']:.4f}, F1={g_metrics['F1']:.4f}, "
-                          f"Precision={g_metrics['Precision']:.4f}, Recall={g_metrics['Recall']:.4f}, AUPRC={g_metrics['AUPRC']:.4f}, ECE={g_metrics['ECE']:.4f}, Loss={g_metrics['Loss']:.4f}{COLORS.ENDC}")
+                          f"Precision={g_metrics['Precision']:.4f}, Recall={g_metrics['Recall']:.4f}, TPR={g_metrics['TPR']:.4f}, FPR={g_metrics['FPR']:.4f}, AUPRC={g_metrics['AUPRC']:.4f}, ECE={g_metrics['ECE']:.4f}, Loss={g_metrics['Loss']:.4f}{COLORS.ENDC}")
             elif os.path.exists(global_weight_path):
                 if _eval_model_arch != model_type:
                     del eval_model
@@ -2264,13 +2308,13 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                 g_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes)
                 _record_metrics(context, round_number, {-2: g_metrics}, excel_filename)
                 logger.info(
-                    "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
+                    "Round %s | GLOBAL | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | TPR: %.4f | FPR: %.4f | AUPRC: %.4f | ECE: %.4f | Loss: %.4f",
                     round_number, g_metrics["Acc"], g_metrics["F1"],
-                    g_metrics["Precision"], g_metrics["Recall"], g_metrics["AUPRC"], g_metrics["ECE"], g_metrics["Loss"],
+                    g_metrics["Precision"], g_metrics["Recall"], g_metrics["TPR"], g_metrics["FPR"], g_metrics["AUPRC"], g_metrics["ECE"], g_metrics["Loss"],
                 )
                 print(
                     f"{COLORS.OKGREEN}Round {round_number} Global | Acc={g_metrics['Acc']:.4f}, F1={g_metrics['F1']:.4f}, "
-                    f"Precision={g_metrics['Precision']:.4f}, Recall={g_metrics['Recall']:.4f}, AUPRC={g_metrics['AUPRC']:.4f}, ECE={g_metrics['ECE']:.4f}, Loss={g_metrics['Loss']:.4f}{COLORS.ENDC}"
+                    f"Precision={g_metrics['Precision']:.4f}, Recall={g_metrics['Recall']:.4f}, TPR={g_metrics['TPR']:.4f}, FPR={g_metrics['FPR']:.4f}, AUPRC={g_metrics['AUPRC']:.4f}, ECE={g_metrics['ECE']:.4f}, Loss={g_metrics['Loss']:.4f}{COLORS.ENDC}"
                 )
             else:
                 client_bins = sorted(glob.glob(os.path.join(round_dir, "client_*_weight.bin")), key=lambda p: int(os.path.basename(p).split("_")[1]))
@@ -2308,7 +2352,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     m, _proba = result if _cap else (result, None)
                     if _cap:
                         _c_plot = os.path.join("results", "plots", _f1_log_stem, f"client_{cid}.png")
-                        _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}")
+                        _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}", logger=logger)
                         _aurc_val = compute_aurc(test_labels, _proba)
                         logger.info("Round %s | Client %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
                             round_number, cid, _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"], _aurc_val)
@@ -2316,21 +2360,21 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         _aurc_results.append(_aurc_val)
                         del _proba
                     round_metrics[cid] = m
-                    logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
-                                round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["ECE"], m["Loss"])
-                    print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, ECE={m['ECE']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
+                    logger.info("Round %s | Client %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | TPR: %.4f | FPR: %.4f | ECE: %.4f | Loss: %.4f",
+                                round_number, cid, m["Acc"], m["F1"], m["Precision"], m["Recall"], m["TPR"], m["FPR"], m["ECE"], m["Loss"])
+                    print(f"{COLORS.OKBLUE}Client {cid}: Acc={m['Acc']:.4f}, F1={m['F1']:.4f}, Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, TPR={m['TPR']:.4f}, FPR={m['FPR']:.4f}, ECE={m['ECE']:.4f}, Loss={m['Loss']:.4f}{COLORS.ENDC}")
                 if round_metrics:
                     _record_metrics(context, round_number, round_metrics, excel_filename)
                     avg = {k: float(np.mean([m[k] for m in round_metrics.values()])) for k in next(iter(round_metrics.values()))}
                     _record_metrics(context, round_number, {(-3 if _skip_synthetic_byzantine_eval else -1): avg}, excel_filename)
                     _avg_label = "BENIGN_AVG" if _skip_synthetic_byzantine_eval else "AVG"
                     logger.info(
-                        "Round %s | %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
-                        round_number, _avg_label, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["ECE"], avg["Loss"],
+                        "Round %s | %s | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | TPR: %.4f | FPR: %.4f | ECE: %.4f | Loss: %.4f",
+                        round_number, _avg_label, avg["Acc"], avg["F1"], avg["Precision"], avg["Recall"], avg["TPR"], avg["FPR"], avg["ECE"], avg["Loss"],
                     )
                     print(
                         f"{COLORS.OKGREEN}Round {round_number} {_avg_label.replace('_', ' ')} | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
-                        f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
+                        f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, TPR={avg['TPR']:.4f}, FPR={avg['FPR']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
                     )
                     if _f1_curve_results:
                         _mk = ["Acc", "F1", "Precision", "Recall", "Coverage"]
@@ -2343,6 +2387,14 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                             _avg_best_theta, _avg_best["Acc"], _avg_best["F1"], _avg_best["Precision"], _avg_best["Recall"], _avg_best["Coverage"],
                             _avg_mc_theta, _avg_mc["Acc"], _avg_mc["F1"], _avg_mc["Precision"], _avg_mc["Recall"], _avg_mc["Coverage"])
                         print(f"{COLORS.OKGREEN}  Best θ={_avg_best_theta:.2f}: Acc={_avg_best['Acc']:.4f} F1={_avg_best['F1']:.4f} P={_avg_best['Precision']:.4f} R={_avg_best['Recall']:.4f} Cov={_avg_best['Coverage']:.4f} | MinCov θ={_avg_mc_theta:.2f}: Acc={_avg_mc['Acc']:.4f} F1={_avg_mc['F1']:.4f} P={_avg_mc['Precision']:.4f} R={_avg_mc['Recall']:.4f} Cov={_avg_mc['Coverage']:.4f}{COLORS.ENDC}")
+                        _missing_counts = {}
+                        for _best, _ in _f1_curve_results:
+                            for _cls in _best.get("Missing_Classes", []):
+                                _missing_counts[int(_cls)] = _missing_counts.get(int(_cls), 0) + 1
+                        if _missing_counts:
+                            _missing_msg = " | ".join(f"Class {_cls}: ({100.0 * _count / len(_f1_curve_results):.1f} %)" for _cls, _count in sorted(_missing_counts.items()))
+                            logger.info("Round %s | %s | F1_CURVE Best missing classes: %s", round_number, _avg_label, _missing_msg)
+                            print(f"{COLORS.WARNING}  Best missing classes | {_missing_msg}{COLORS.ENDC}")
                     if _aurc_results:
                         _avg_aurc = float(np.mean(_aurc_results))
                         logger.info("Round %s | %s | AURC: %.4f", round_number, _avg_label, _avg_aurc)
@@ -2353,12 +2405,12 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         _b_avg = {k: float(np.mean([round_metrics[c][k] for c in _benign_cids])) for k in avg}
                         _record_metrics(context, round_number, {-3: _b_avg}, excel_filename)
                         logger.info(
-                            "Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
-                            round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["ECE"], _b_avg["Loss"],
+                            "Round %s | BENIGN_AVG | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | TPR: %.4f | FPR: %.4f | ECE: %.4f | Loss: %.4f",
+                            round_number, _b_avg["Acc"], _b_avg["F1"], _b_avg["Precision"], _b_avg["Recall"], _b_avg["TPR"], _b_avg["FPR"], _b_avg["ECE"], _b_avg["Loss"],
                         )
                         print(
                             f"{COLORS.OKGREEN}Round {round_number} Benign Avg | Acc={_b_avg['Acc']:.4f}, F1={_b_avg['F1']:.4f}, "
-                            f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, ECE={_b_avg['ECE']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}"
+                            f"Precision={_b_avg['Precision']:.4f}, Recall={_b_avg['Recall']:.4f}, TPR={_b_avg['TPR']:.4f}, FPR={_b_avg['FPR']:.4f}, ECE={_b_avg['ECE']:.4f}, Loss={_b_avg['Loss']:.4f}{COLORS.ENDC}"
                         )
                 if ghost_bin_path is not None:
                     if _mixed:
@@ -2375,12 +2427,12 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                     ghost_metrics = evaluate_model(eval_model, X_test, test_labels, config.batch_size, num_classes, compute_auprc=False)
                     _record_metrics(context, round_number, {-1: ghost_metrics}, excel_filename)
                     logger.info(
-                        "Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | ECE: %.4f | Loss: %.4f",
-                        round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["ECE"], ghost_metrics["Loss"],
+                        "Round %s | Client -1 [POISONEDFL_GHOST] | Acc: %.4f | F1: %.4f | Precision: %.4f | Recall: %.4f | TPR: %.4f | FPR: %.4f | ECE: %.4f | Loss: %.4f",
+                        round_number, ghost_metrics["Acc"], ghost_metrics["F1"], ghost_metrics["Precision"], ghost_metrics["Recall"], ghost_metrics["TPR"], ghost_metrics["FPR"], ghost_metrics["ECE"], ghost_metrics["Loss"],
                     )
                     print(
                         f"{COLORS.OKGREEN}Round {round_number} PoisonedFL ghost | Acc={ghost_metrics['Acc']:.4f}, F1={ghost_metrics['F1']:.4f}, "
-                        f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, ECE={ghost_metrics['ECE']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}"
+                        f"Precision={ghost_metrics['Precision']:.4f}, Recall={ghost_metrics['Recall']:.4f}, TPR={ghost_metrics['TPR']:.4f}, FPR={ghost_metrics['FPR']:.4f}, ECE={ghost_metrics['ECE']:.4f}, Loss={ghost_metrics['Loss']:.4f}{COLORS.ENDC}"
                     )
 
     if getattr(config, 'f1_curve', False) and global_model_eval:
@@ -2396,7 +2448,7 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
             eval_model.set_weights(weights)
             del weights
             proba = get_model_proba(eval_model, X_test, config.batch_size)
-            _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, proba, plot_path, label=label)
+            _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, proba, plot_path, label=label, logger=logger)
             _global_aurc = compute_aurc(test_labels, proba)
             logger.info("F1_CURVE | GLOBAL | Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
                 _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"],

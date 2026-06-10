@@ -210,11 +210,20 @@ def evaluate_model(model: Any, X_test: np.ndarray, y_labels: np.ndarray,
     precision = float(precision_score(y_labels, pred_labels, average="macro", zero_division=0))
     recall = float(recall_score(y_labels, pred_labels, average="macro", zero_division=0))
 
+    is_attack_true = y_labels != 0
+    is_attack_pred = pred_labels != 0
+    n_attack = int(is_attack_true.sum())
+    n_benign = int((~is_attack_true).sum())
+    tpr = float((is_attack_true & is_attack_pred).sum() / n_attack) if n_attack > 0 else 0.0
+    fpr = float(((~is_attack_true) & is_attack_pred).sum() / n_benign) if n_benign > 0 else 0.0
+
     metrics = {
         "Acc": accuracy,
         "F1": f1,
         "Precision": precision,
         "Recall": recall,
+        "TPR": tpr,
+        "FPR": fpr,
         "ECE": ece,
         "Loss": loss,
     }
