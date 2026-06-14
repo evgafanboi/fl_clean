@@ -1,14 +1,18 @@
 """Incremental Classifier and Representation Learning (iCaRL)"""
 
 import gc
+import math
 import numpy as np
-import tensorflow as tf
 from pathlib import Path
+from ..backend import use_tf as _use_tf
 from .base import CILMethod
+tf = __import__('tensorflow') if _use_tf() else None
 
 PRED_BATCH = 4096
 
 def _batched_predict(model, X, batch_size=PRED_BATCH):
+    if not _use_tf() and hasattr(model, 'predict'):
+        return model.predict(X, batch_size=batch_size)
     parts = []
     for i in range(0, X.shape[0], batch_size):
         parts.append(model(X[i:i+batch_size], training=False).numpy())
@@ -20,6 +24,7 @@ class ICaRL(CILMethod):
         super().__init__(num_classes)
         self.name = "ICaRL"
         self.memory = memory
+        self.memory_percent = float(memory)
         self.use_bce = use_bce
         self.class_order = []
         self.label_map = {}
@@ -28,6 +33,8 @@ class ICaRL(CILMethod):
         self.exemplars = {}
         self.client_means = {}
         self.client_counts = {}
+        self.client_memory_budget = {}
+        self.client_budget_tasks = set()
         self.old_num_classes = 0
         self.old_targets = None
         self.global_means = None
@@ -44,6 +51,8 @@ class ICaRL(CILMethod):
             self.client_means[client_id] = {}
         if client_id not in self.client_counts:
             self.client_counts[client_id] = {}
+        if client_id not in self.client_memory_budget:
+            self.client_memory_budget[client_id] = 0
 
     def before_task(self, task_id: int, task_classes: list):
         super().before_task(task_id, task_classes)
@@ -55,14 +64,15 @@ class ICaRL(CILMethod):
 
     def map_labels_np(self, y):
         labels = y if len(y.shape) == 1 else np.argmax(y, axis=1)
-        mapped = np.vectorize(self.label_map.get)(labels)
+        mapped = np.vectorize(self.label_map.get, otypes=[int])(labels)
         return mapped
 
     def _get_m_per_class(self, client_id):
         classes = sorted(self.client_seen.get(client_id, []))
         t = len(classes)
-        base = self.memory // t if t > 0 else 0
-        remainder = self.memory - base * t
+        budget = int(self.client_memory_budget.get(client_id, 0))
+        base = budget // t if t > 0 else 0
+        remainder = budget - base * t
         sizes = {c: base for c in classes}
         for c in classes[:remainder]:
             sizes[c] += 1
@@ -106,6 +116,10 @@ class ICaRL(CILMethod):
             return
         X_new = np.load(X_path, mmap_mode='r')
         y_new = np.load(y_path, mmap_mode='r')
+        key = (self.client_id, self.current_task)
+        if key not in self.client_budget_tasks:
+            self.client_memory_budget[self.client_id] = self.client_memory_budget.get(self.client_id, 0) + int(math.ceil(X_new.shape[0] * self.memory_percent / 100.0))
+            self.client_budget_tasks.add(key)
         labels = np.array(y_new if len(y_new.shape) == 1 else np.argmax(y_new, axis=1))
         present = []
         for c in task_classes:
@@ -159,6 +173,8 @@ class ICaRL(CILMethod):
         self.global_mean_labels = labels
 
     def build_dataset(self, X_path, y_path, model, batch_size):
+        if not _use_tf():
+            return self._build_dataset_pt(X_path, y_path, model, batch_size)
         old_tgt_file = Path("temp_weights/icarl_old_targets.npy")
         if old_tgt_file.exists():
             old_tgt_file.unlink(missing_ok=True)
@@ -169,6 +185,13 @@ class ICaRL(CILMethod):
         input_dim = X_new.shape[1]
         client_exemplars = list(self.exemplars.get(self.client_id, {}).items())
         label_map = dict(self.label_map)
+        total_check = X_new.shape[0]
+        for _, _ex_path in client_exemplars:
+            _X_ex = np.load(_ex_path, mmap_mode='r')
+            total_check += _X_ex.shape[0]
+            del _X_ex
+        if total_check == 0:
+            return None, 0
 
         # Pre-compute old logits on disk to avoid calling model inside generator
         old_targets_path = None
@@ -220,7 +243,7 @@ class ICaRL(CILMethod):
                 X_b = np.array(X_n[i:i+batch_size], dtype=np.float32)
                 lab = np.array(y_n[i:i+batch_size])
                 lab = lab if len(lab.shape) == 1 else np.argmax(lab, axis=1)
-                lab = np.vectorize(label_map.get)(lab)
+                lab = np.vectorize(label_map.get, otypes=[int])(lab)
                 y_b = tf.keras.utils.to_categorical(lab, num_classes).astype(np.float32)
                 if old_tgt is not None:
                     o_b = np.array(old_tgt[row:row+X_b.shape[0]], dtype=np.float32)
@@ -260,6 +283,48 @@ class ICaRL(CILMethod):
         dataset = dataset.prefetch(1)
         return dataset, total
 
+    def _build_dataset_pt(self, X_path, y_path, model, batch_size):
+        import torch
+        from torch.utils.data import TensorDataset, DataLoader
+        X_new = np.load(X_path)
+        y_new = np.load(y_path)
+        num_classes = len(self.class_order)
+        old_nc = self.old_num_classes
+        label_map = dict(self.label_map)
+        labels = y_new if len(y_new.shape) == 1 else np.argmax(y_new, axis=1)
+        mapped = np.vectorize(label_map.get, otypes=[int])(labels)
+        y_oh = np.zeros((len(mapped), num_classes), dtype=np.float32)
+        y_oh[np.arange(len(mapped)), mapped] = 1.0
+        X_parts = [X_new.astype(np.float32)]
+        y_parts = [y_oh]
+        client_exemplars = list(self.exemplars.get(self.client_id, {}).items())
+        for c, path in client_exemplars:
+            X_ex = np.load(path)
+            y_ex = np.zeros((len(X_ex), num_classes), dtype=np.float32)
+            y_ex[:, label_map[c]] = 1.0
+            X_parts.append(X_ex.astype(np.float32))
+            y_parts.append(y_ex)
+        X_all = np.concatenate(X_parts)
+        y_all = np.concatenate(y_parts)
+        total = X_all.shape[0]
+        del X_parts, y_parts
+        if total == 0:
+            return None, 0
+        if old_nc > 0:
+            logits_model = model.get_logits_model()
+            logits_np = logits_model.predict(X_all, batch_size=PRED_BATCH)
+            old_tgt = 1.0 / (1.0 + np.exp(-logits_np[:, :old_nc])).astype(np.float32)
+            dataset = TensorDataset(
+                torch.from_numpy(X_all),
+                torch.from_numpy(y_all),
+                torch.from_numpy(old_tgt))
+        else:
+            dataset = TensorDataset(torch.from_numpy(X_all), torch.from_numpy(y_all))
+        del X_all, y_all
+        gc.collect()
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        return loader, total
+
     def cleanup_temp(self):
         if self.exemplar_dir.exists():
             for f in self.exemplar_dir.glob("*.npy"):
@@ -269,6 +334,39 @@ class ICaRL(CILMethod):
             old_tgt.unlink(missing_ok=True)
 
     def get_train_step(self, model, optimizer, loss_fn):
+        if not _use_tf():
+            import torch
+            import torch.nn.functional as F
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model.nn.to(dev)
+            use_bce = self.use_bce
+            old_nc = self.old_num_classes
+
+            def step_pt(X_b, y_b, old_b=None):
+                X_b = X_b.to(dev); y_b = y_b.to(dev)
+                y_cls = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
+                model.nn.train()
+                optimizer.zero_grad()
+                logits = model.nn(X_b, return_logits=True)
+                if use_bce:
+                    probs = torch.sigmoid(logits)
+                    ce_loss = F.binary_cross_entropy(probs, y_b)
+                else:
+                    ce_loss = F.cross_entropy(logits, y_cls, label_smoothing=0.05)
+                distill = torch.tensor(0.0, device=dev)
+                if old_b is not None and old_nc > 0:
+                    probs_old = torch.sigmoid(logits[:, :old_nc])
+                    distill = F.binary_cross_entropy(probs_old, old_b.to(dev))
+                total = ce_loss + distill
+                total.backward()
+                torch.nn.utils.clip_grad_norm_(model.nn.parameters(), 0.5)
+                optimizer.step()
+                return ce_loss.item(), distill.item(), total.item()
+
+            if self.old_num_classes > 0:
+                return step_pt
+            return lambda X_b, y_b: step_pt(X_b, y_b, None)
+
         keras_model = model.model if hasattr(model, 'model') else model
         logits_model = model.get_logits_model() if hasattr(model, "get_logits_model") else None
         bce = tf.keras.losses.BinaryCrossentropy(from_logits=False)
@@ -312,8 +410,13 @@ class ICaRL(CILMethod):
         all_preds_logits = []
         for i in range(0, n, PRED_BATCH):
             x_chunk = np.array(X[i:i+PRED_BATCH], dtype=np.float32)
-            y_chunk = tf.keras.utils.to_categorical(y_mapped[i:i+PRED_BATCH], num_classes)
-            log_chunk = logits_model(x_chunk, training=False).numpy()
+            y_idx = y_mapped[i:i+PRED_BATCH].astype(int)
+            y_chunk = np.zeros((len(y_idx), num_classes), dtype=np.float32)
+            y_chunk[np.arange(len(y_idx)), y_idx] = 1.0
+            if _use_tf():
+                log_chunk = logits_model(x_chunk, training=False).numpy()
+            else:
+                log_chunk = logits_model.predict(x_chunk, batch_size=len(x_chunk))
             if self.use_bce:
                 p = 1.0 / (1.0 + np.exp(-log_chunk))
                 p = np.clip(p, 1e-7, 1.0 - 1e-7)

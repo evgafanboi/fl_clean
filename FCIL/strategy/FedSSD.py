@@ -10,32 +10,44 @@ L_SSD = mean( sum( (M * (global_logits - local_logits))^2 ) )
 """
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
 
 PRED_BATCH = 4096
 
 
 def compute_class_metrics(model_wrapper, X, y, num_classes, label_map=None):
-    """Compute M_class from confusion matrix on labeled data.
-    Mirrors FL/strategy/FedSSD.py compute_class_metrics exactly."""
-    keras_model = model_wrapper.model if hasattr(model_wrapper, 'model') else model_wrapper
-
-    all_preds, all_labels = [], []
     y_raw = y if len(y.shape) == 1 else np.argmax(y, axis=1)
+    all_preds, all_labels = [], []
 
-    for i in range(0, X.shape[0], PRED_BATCH):
-        chunk = np.array(X[i:i + PRED_BATCH], dtype=np.float32)
-        preds = keras_model(chunk, training=False)
-        all_preds.extend(tf.argmax(preds, axis=1).numpy())
-        if label_map:
-            all_labels.extend(np.vectorize(label_map.get)(y_raw[i:i + PRED_BATCH]))
-        else:
-            all_labels.extend(y_raw[i:i + PRED_BATCH])
-        del chunk, preds
+    if not _use_tf():
+        for i in range(0, X.shape[0], PRED_BATCH):
+            chunk = np.array(X[i:i + PRED_BATCH], dtype=np.float32)
+            preds = model_wrapper.predict(chunk, batch_size=PRED_BATCH)
+            all_preds.extend(np.argmax(preds, axis=1))
+            if label_map:
+                all_labels.extend(np.vectorize(label_map.get)(y_raw[i:i + PRED_BATCH]))
+            else:
+                all_labels.extend(y_raw[i:i + PRED_BATCH])
+            del chunk, preds
+    else:
+        keras_model = model_wrapper.model if hasattr(model_wrapper, 'model') else model_wrapper
+        for i in range(0, X.shape[0], PRED_BATCH):
+            chunk = np.array(X[i:i + PRED_BATCH], dtype=np.float32)
+            preds = keras_model(chunk, training=False)
+            all_preds.extend(tf.argmax(preds, axis=1).numpy())
+            if label_map:
+                all_labels.extend(np.vectorize(label_map.get)(y_raw[i:i + PRED_BATCH]))
+            else:
+                all_labels.extend(y_raw[i:i + PRED_BATCH])
+            del chunk, preds
 
-    confusion = tf.math.confusion_matrix(all_labels, all_preds, num_classes=num_classes).numpy()
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for p, t in zip(all_preds, all_labels):
+        confusion[int(t), int(p)] += 1
+
     M_class = np.zeros(num_classes, dtype=np.float32)
-
     for k in range(num_classes):
         class_total = confusion[k, :].sum()
         if class_total == 0:
@@ -55,15 +67,20 @@ def compute_class_metrics(model_wrapper, X, y, num_classes, label_map=None):
 
 
 def build_ssd_components(model, global_model, M_class, m_max):
-    """Build frozen global logits model and TF constants for SSD loss.
-    Returns (global_logits_model, M_class_tf, m_max_tf)."""
+    if not _use_tf():
+        import copy
+        frozen = copy.deepcopy(global_model)
+        for p in frozen.nn.parameters():
+            p.requires_grad_(False)
+        frozen.nn.eval()
+        return frozen.get_logits_model(), np.expand_dims(M_class, 0), float(m_max)
+
     global_keras = global_model.model if hasattr(global_model, 'model') else global_model
+    import tensorflow as tf
     frozen = tf.keras.models.clone_model(global_keras)
     frozen.set_weights(global_keras.get_weights())
     frozen.trainable = False
-    global_logits_model = tf.keras.Model(
-        frozen.input, frozen.get_layer('logits').output)
-
+    global_logits_model = tf.keras.Model(frozen.input, frozen.get_layer('logits').output)
     M_class_tf = tf.constant(tf.expand_dims(M_class, axis=0), dtype=tf.float32)
     m_max_tf = tf.constant(m_max, dtype=tf.float32)
     return global_logits_model, M_class_tf, m_max_tf

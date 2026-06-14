@@ -4,14 +4,21 @@ Monolithic FCIL method: includes its own FedAvg aggregation + proxy server."""
 import gc
 import copy
 import numpy as np
-import tensorflow as tf
 from pathlib import Path
+from ..backend import use_tf as _use_tf
 from .base import CILMethod
+tf = __import__('tensorflow') if _use_tf() else None
+if not _use_tf():
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
 
 PRED_BATCH = 4096
 
 
 def _batched_predict(model, X, batch_size=PRED_BATCH):
+    if not _use_tf() and hasattr(model, 'predict'):
+        return model.predict(X, batch_size=batch_size)
     parts = []
     for i in range(0, X.shape[0], batch_size):
         parts.append(model(X[i:i+batch_size], training=False).numpy())
@@ -56,6 +63,53 @@ class GradientEncoder:
         self.model = tf.keras.Model(inputs, outputs)
         _uniform_init(self.model)
 
+if not _use_tf():
+    class _PTDenseGradientEncoderNet(nn.Module):
+        def __init__(self, input_dim, num_classes, grad_enc):
+            super().__init__()
+            widths = {"small": (64, 64), "medium": (128, 128)}.get(grad_enc, (128, 128, 64))
+            layers = []
+            last = input_dim
+            for w in widths:
+                layers += [nn.Linear(last, w), nn.Sigmoid() if grad_enc in ("small", "medium") else nn.SiLU()]
+                last = w
+            self.net = nn.Sequential(*layers)
+            self.enc_out = nn.Linear(last, num_classes)
+
+        def forward(self, x):
+            return self.enc_out(self.net(x))
+
+    class _PTGRUGradientEncoderNet(nn.Module):
+        def __init__(self, input_dim, num_classes):
+            super().__init__()
+            self.gru1 = nn.GRU(1, 64, batch_first=True)
+            self.ln1 = nn.LayerNorm(64)
+            self.drop1 = nn.Dropout(0.10)
+            self.gru2 = nn.GRU(64, 48, batch_first=True)
+            self.ln2 = nn.LayerNorm(48)
+            self.drop2 = nn.Dropout(0.10)
+            self.head = nn.Linear(48, 32)
+            self.ln_head = nn.LayerNorm(32)
+            self.enc_out = nn.Linear(32, num_classes)
+
+        def forward(self, x):
+            x = x.unsqueeze(-1)
+            x, _ = self.gru1(x)
+            x = self.drop1(self.ln1(x))
+            x, _ = self.gru2(x)
+            x = self.drop2(self.ln2(x[:, -1, :]))
+            x = self.ln_head(F.relu(self.head(x)))
+            return self.enc_out(x)
+
+class PTGradientEncoder:
+    def __init__(self, input_dim, num_classes, grad_enc="main", model_name="dense"):
+        self.model = _PTGRUGradientEncoderNet(input_dim, num_classes) if model_name == "gru" else _PTDenseGradientEncoderNet(input_dim, num_classes, grad_enc)
+        for p in self.model.parameters():
+            if p.ndim > 1:
+                nn.init.uniform_(p, -0.5, 0.5)
+            else:
+                nn.init.uniform_(p, -0.5, 0.5)
+
 
 class ProxyServer:
     """Relay: reconstructs proto samples from gradient sets via DLG,
@@ -65,24 +119,46 @@ class ProxyServer:
         self.input_dim = input_dim
         self.num_classes = num_classes
         self.encoder = encoder
-        self.reconstruction_iters = 100
-        self.num_augmentations = 10
+        self.cache_dir = Path("temp_weights/glfc_cache")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.reconstruction_iters = 20
+        self.num_augmentations = 2
+        self.max_gradients_per_round = 20
+        self.max_gradients_per_class = 2
         self.proto_data = np.empty((0, input_dim), dtype=np.float32)
         self.proto_labels = np.empty(0, dtype=np.int64)
         self.best_model_weights = None
         self.best_perf = 0.0
 
+    def _ensure_runtime_defaults(self):
+        self.cache_dir = Path(getattr(self, "cache_dir", "temp_weights/glfc_cache"))
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.reconstruction_iters = getattr(self, "reconstruction_iters", 20)
+        self.num_augmentations = getattr(self, "num_augmentations", 2)
+        self.max_gradients_per_round = getattr(self, "max_gradients_per_round", 20)
+        self.max_gradients_per_class = getattr(self, "max_gradients_per_class", 2)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._ensure_runtime_defaults()
+
     def gradient2label(self, grad_set):
         fc_weight_grad = grad_set[-2]
-        return int(np.argmin(np.sum(fc_weight_grad, axis=0)))
+        return int(np.argmin(np.sum(fc_weight_grad, axis=1 if fc_weight_grad.shape[0] == self.num_classes else 0)))
 
     def reconstruct(self, pool_grad):
+        self._ensure_runtime_defaults()
+        if len(pool_grad) > self.max_gradients_per_round:
+            idx = np.linspace(0, len(pool_grad) - 1, self.max_gradients_per_round).astype(int)
+            pool_grad = [pool_grad[i] for i in idx]
+        if not _use_tf():
+            return self._reconstruct_pt(pool_grad)
         labels = np.array([self.gradient2label(g) for g in pool_grad])
         unique_labels = np.unique(labels)
         new_data, new_labels = [], []
 
         for label_i in unique_labels:
-            grad_indices = np.where(labels == label_i)[0]
+            grad_indices = np.where(labels == label_i)[0][:self.max_gradients_per_class]
             augmentations = []
             for j in range(len(grad_indices)):
                 grad_truth = [tf.constant(g, dtype=tf.float32) for g in pool_grad[grad_indices[j]]]
@@ -117,9 +193,63 @@ class ProxyServer:
                 [self.proto_labels, np.array(new_labels, dtype=np.int64)], axis=0)
         gc.collect()
 
+    def _reconstruct_pt(self, pool_grad):
+        import torch
+        import torch.nn.functional as F
+        labels = np.array([self.gradient2label(g) for g in pool_grad])
+        unique_labels = np.unique(labels)
+        dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        new_data, new_labels = [], []
+
+        for label_i in unique_labels:
+            grad_indices = np.where(labels == label_i)[0][:self.max_gradients_per_class]
+            augmentations = []
+            for j in range(len(grad_indices)):
+                grad_truth = [torch.tensor(g, dtype=torch.float32, device=dev) for g in pool_grad[grad_indices[j]]]
+                recon_enc = copy.deepcopy(self.encoder.model).to(dev)
+                dummy = torch.randn((1, self.input_dim), device=dev, requires_grad=True)
+                label_tensor = torch.tensor([label_i], dtype=torch.long, device=dev)
+                opt = torch.optim.Adam([dummy], lr=0.1)
+                params = [p for p in recon_enc.parameters() if p.requires_grad]
+
+                for it in range(self.reconstruction_iters):
+                    opt.zero_grad(set_to_none=True)
+                    with torch.backends.cudnn.flags(enabled=False):
+                        pred = recon_enc(dummy)
+                        loss = F.cross_entropy(pred, label_tensor)
+                        dummy_grads = torch.autograd.grad(loss, params, create_graph=True)
+                        grad_diff = sum(torch.sum((gx - gy) ** 2) for gx, gy in zip(dummy_grads, grad_truth))
+                        grad_diff.backward()
+                    opt.step()
+                    if it >= self.reconstruction_iters - self.num_augmentations:
+                        augmentations.append(dummy.detach().cpu().numpy().squeeze(0).copy())
+                del recon_enc, grad_truth, dummy
+            new_data.extend(augmentations)
+            new_labels.extend([label_i] * len(augmentations))
+
+        if new_data:
+            self.proto_data = np.concatenate([self.proto_data, np.array(new_data, dtype=np.float32)], axis=0)
+            self.proto_labels = np.concatenate([self.proto_labels, np.array(new_labels, dtype=np.int64)], axis=0)
+            np.save(self.cache_dir / "proto_data.npy", self.proto_data)
+            np.save(self.cache_dir / "proto_labels.npy", self.proto_labels)
+        gc.collect()
+
     def evaluate_model(self, model):
         if self.proto_data.shape[0] == 0:
             return 0.0
+        if not _use_tf():
+            import torch
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model.nn.to(dev).eval()
+            correct, total = 0, 0
+            with torch.no_grad():
+                for i in range(0, self.proto_data.shape[0], PRED_BATCH):
+                    chunk = torch.from_numpy(self.proto_data[i:i+PRED_BATCH]).to(dev)
+                    labs = self.proto_labels[i:i+PRED_BATCH]
+                    preds = model.nn(chunk, return_logits=True).argmax(dim=1).cpu().numpy()
+                    correct += np.sum(preds == labs)
+                    total += len(labs)
+            return correct / total if total > 0 else 0.0
         keras_model = model.model if hasattr(model, 'model') else model
         correct, total = 0, 0
         for i in range(0, self.proto_data.shape[0], PRED_BATCH):
@@ -131,12 +261,16 @@ class ProxyServer:
         return correct / total if total > 0 else 0.0
 
     def update(self, global_model, pool_grad):
+        self._ensure_runtime_defaults()
         if pool_grad:
             self.reconstruct(pool_grad)
         perf = self.evaluate_model(global_model)
         if perf >= self.best_perf:
             self.best_perf = perf
             self.best_model_weights = [w.copy() for w in global_model.get_weights()]
+            np.save(self.cache_dir / "best_model_weights.npy", np.array(self.best_model_weights, dtype=object), allow_pickle=True)
+            np.save(self.cache_dir / "proto_data.npy", self.proto_data)
+            np.save(self.cache_dir / "proto_labels.npy", self.proto_labels)
         return perf
 
     def reset_for_new_task(self):
@@ -153,13 +287,14 @@ class GLFC(CILMethod):
 
     def __init__(self, num_classes: int, memory: int = 2000,
                  encoder_epochs: int = 50, model_selection: bool = True,
-                 grad_enc: str = "main", **kwargs):
+                 grad_enc: str = "main", model_name: str = "dense", **kwargs):
         super().__init__(num_classes)
         self.name = "GLFC"
         self.memory = memory
         self.encoder_epochs = encoder_epochs
         self.model_selection = model_selection
         self.grad_enc = grad_enc
+        self.model_name = model_name
         self.class_order = []
         self.label_map = {}
         self.current_task_classes = []
@@ -173,6 +308,7 @@ class GLFC(CILMethod):
         self.proxy_server = None
         self.proto_grad_pool = []
         self.exemplar_dir = Path("temp_weights/glfc_exemplars")
+        self.cache_dir = Path("temp_weights/glfc_cache")
 
     def set_client(self, client_id: int):
         self.client_id = client_id
@@ -191,6 +327,21 @@ class GLFC(CILMethod):
         self.old_num_classes = len(self.class_order) - len(task_classes)
 
     def set_old_model(self, model):
+        if not _use_tf():
+            old_model = copy.deepcopy(model.nn)
+            if self.model_selection and self.proxy_server and self.proxy_server.best_model_weights is not None:
+                current_weights = model.get_weights()
+                model.set_weights(self.proxy_server.best_model_weights)
+                old_model = copy.deepcopy(model.nn)
+                model.set_weights(current_weights)
+            old_model.eval()
+            for p in old_model.parameters():
+                p.requires_grad_(False)
+            self.old_logits_model = old_model
+            self.old_num_classes = model.num_classes
+            if self.proxy_server:
+                self.proxy_server.reset_for_new_task()
+            return
         keras_model = model.model if hasattr(model, 'model') else model
         old_model = tf.keras.models.clone_model(keras_model)
         if self.model_selection and self.proxy_server and self.proxy_server.best_model_weights is not None:
@@ -208,12 +359,13 @@ class GLFC(CILMethod):
         if not self.model_selection or self.encoder is not None:
             return
         self.input_dim = input_dim
-        self.encoder = GradientEncoder(input_dim, self.num_classes, self.grad_enc)
+        self.encoder = (GradientEncoder(input_dim, self.num_classes, self.grad_enc)
+                        if _use_tf() else PTGradientEncoder(input_dim, self.num_classes, self.grad_enc, self.model_name))
         self.proxy_server = ProxyServer(input_dim, self.num_classes, self.encoder)
 
     def map_labels_np(self, y):
         labels = y if len(y.shape) == 1 else np.argmax(y, axis=1)
-        return np.vectorize(self.label_map.get)(labels)
+        return np.vectorize(self.label_map.get, otypes=[int])(labels)
 
     # ── exemplar management (iCaRL herding) ──
 
@@ -285,6 +437,10 @@ class GLFC(CILMethod):
     def collect_proto_gradients(self, client_model, client_id, X_path, y_path):
         if not self.model_selection or self.encoder is None or self.current_task == 0:
             return
+        if self.proxy_server and len(self.proto_grad_pool) >= self.proxy_server.max_gradients_per_round:
+            return
+        if not _use_tf():
+            return self._collect_proto_gradients_pt(client_model, X_path, y_path)
 
         X = np.load(X_path, mmap_mode='r')
         y = np.load(y_path, mmap_mode='r')
@@ -311,7 +467,7 @@ class GLFC(CILMethod):
             proto_var = tf.Variable(proto + np.random.normal(0, 0.01, proto.shape).astype(np.float32))
             target_oh = tf.one_hot([mapped_c], keras_model.output_shape[-1])
             opt_p = tf.keras.optimizers.SGD(learning_rate=0.01)
-            for _ in range(self.encoder_epochs):
+            for _ in range(min(self.encoder_epochs, 5)):
                 with tf.GradientTape() as tape:
                     tape.watch(proto_var)
                     loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
@@ -326,8 +482,66 @@ class GLFC(CILMethod):
                 enc_loss = criterion(tf.constant([mapped_c], dtype=tf.int64), enc_model(proto_final, training=True))
             enc_grads = tape.gradient(enc_loss, enc_model.trainable_variables)
             self.proto_grad_pool.append([g.numpy() for g in enc_grads])
+            if self.proxy_server and len(self.proto_grad_pool) >= self.proxy_server.max_gradients_per_round:
+                break
             del X_c, proto, proto_var, proto_final
 
+        del X, y, labels, feature_model
+        gc.collect()
+
+    def _collect_proto_gradients_pt(self, client_model, X_path, y_path):
+        import torch
+        import torch.nn.functional as F
+        X = np.load(X_path, mmap_mode='r')
+        y = np.load(y_path, mmap_mode='r')
+        labels = np.array(y if len(y.shape) == 1 else np.argmax(y, axis=1))
+        feature_model = client_model.get_feature_model() if hasattr(client_model, "get_feature_model") else None
+        dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        client_model.nn.to(dev).train()
+        for p in client_model.nn.parameters():
+            p.requires_grad_(False)
+        self.encoder.model.to(dev).train()
+
+        for c in self.current_task_classes:
+            if self.proxy_server and len(self.proto_grad_pool) >= self.proxy_server.max_gradients_per_round:
+                break
+            if not np.any(labels == c):
+                continue
+            mapped_c = self.label_map[c]
+            X_c = np.array(X[labels == c], dtype=np.float32)
+            if feature_model is not None:
+                feats = _batched_predict(feature_model, X_c)
+                feats = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-12)
+                proto_idx = int(np.argmin(np.linalg.norm(feats - np.mean(feats, axis=0), axis=1)))
+                del feats
+            else:
+                proto_idx = 0
+            proto = X_c[proto_idx:proto_idx+1].copy()
+            proto_t = torch.tensor(proto + np.random.normal(0, 0.01, proto.shape).astype(np.float32), device=dev, requires_grad=True)
+            opt_p = torch.optim.SGD([proto_t], lr=0.01)
+            target = torch.zeros((1, client_model.num_classes), device=dev)
+            target[:, mapped_c] = 1.0
+            for _ in range(min(self.encoder_epochs, 5)):
+                opt_p.zero_grad(set_to_none=True)
+                with torch.backends.cudnn.flags(enabled=False):
+                    logits = client_model.nn(proto_t, return_logits=True)
+                    loss = F.binary_cross_entropy_with_logits(logits, target)
+                    loss.backward()
+                opt_p.step()
+
+            enc_logits = self.encoder.model(proto_t.detach())
+            enc_loss = F.cross_entropy(enc_logits, torch.tensor([mapped_c], device=dev))
+            grads = torch.autograd.grad(enc_loss, [p for p in self.encoder.model.parameters() if p.requires_grad])
+            masked = []
+            for g in grads:
+                arr = g.detach().cpu().numpy()
+                masked.append(np.where(np.abs(arr) >= np.percentile(np.abs(arr), 30), arr, 0.0).astype(np.float32))
+            self.proto_grad_pool.append(masked)
+            del X_c, proto, proto_t, target, enc_logits, grads
+
+        for p in client_model.nn.parameters():
+            p.requires_grad_(True)
+        client_model.nn.eval()
         del X, y, labels, feature_model
         gc.collect()
 
@@ -342,6 +556,8 @@ class GLFC(CILMethod):
     # ── dataset: new data + exemplars + old targets ──
 
     def build_dataset(self, X_path, y_path, model, batch_size):
+        if not _use_tf():
+            return self._build_dataset_pt(X_path, y_path, model, batch_size)
         X_new = np.load(X_path, mmap_mode='r')
         y_new = np.load(y_path, mmap_mode='r')
         num_classes = len(self.class_order)
@@ -385,6 +601,8 @@ class GLFC(CILMethod):
             X_ex = np.load(path, mmap_mode='r')
             total += X_ex.shape[0]
             del X_ex
+        if total == 0:
+            return None, 0
 
         x_path_str = X_path
         y_path_str = y_path
@@ -400,7 +618,7 @@ class GLFC(CILMethod):
                 X_b = np.array(X_n[i:i+batch_size], dtype=np.float32)
                 lab = np.array(y_n[i:i+batch_size])
                 lab = lab if len(lab.shape) == 1 else np.argmax(lab, axis=1)
-                lab = np.vectorize(label_map.get)(lab)
+                lab = np.vectorize(label_map.get, otypes=[int])(lab)
                 y_b = tf.keras.utils.to_categorical(lab, num_classes).astype(np.float32)
                 if old_tgt is not None:
                     o_b = np.array(old_tgt[row:row+X_b.shape[0]], dtype=np.float32)
@@ -440,9 +658,102 @@ class GLFC(CILMethod):
         dataset = dataset.prefetch(1)
         return dataset, total
 
+    def _build_dataset_pt(self, X_path, y_path, model, batch_size):
+        from torch.utils.data import DataLoader, TensorDataset
+        X_new = np.load(X_path)
+        y_new = np.load(y_path)
+        num_classes = len(self.class_order)
+        old_nc = self.old_num_classes
+        input_dim = X_new.shape[1]
+        if self.input_dim is None:
+            self.input_dim = input_dim
+        if self.model_selection:
+            self._init_encoder(input_dim)
+
+        label_map = dict(self.label_map)
+        labels = y_new if len(y_new.shape) == 1 else np.argmax(y_new, axis=1)
+        mapped = np.vectorize(label_map.get, otypes=[int])(labels)
+        y_oh = np.zeros((len(mapped), num_classes), dtype=np.float32)
+        y_oh[np.arange(len(mapped)), mapped] = 1.0
+        X_parts = [X_new.astype(np.float32)]
+        y_parts = [y_oh]
+        for c, path in self.exemplars.get(self.client_id, {}).items():
+            X_ex = np.load(path)
+            if X_ex.shape[0] == 0:
+                continue
+            y_ex = np.zeros((len(X_ex), num_classes), dtype=np.float32)
+            y_ex[:, label_map[c]] = 1.0
+            X_parts.append(X_ex.astype(np.float32))
+            y_parts.append(y_ex)
+        X_all = np.concatenate(X_parts, axis=0)
+        y_all = np.concatenate(y_parts, axis=0)
+        total = int(X_all.shape[0])
+        del X_parts, y_parts
+        if total == 0:
+            return None, 0
+        if old_nc > 0 and self.old_logits_model is not None:
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.old_logits_model.to(dev).eval()
+            old_parts = []
+            with torch.no_grad():
+                for i in range(0, X_all.shape[0], PRED_BATCH):
+                    chunk = torch.from_numpy(X_all[i:i + PRED_BATCH]).to(dev)
+                    logits = self.old_logits_model(chunk, return_logits=True)[:, :old_nc]
+                    old_parts.append(torch.sigmoid(logits).cpu())
+            old_tgt = torch.cat(old_parts, dim=0)
+            dataset = TensorDataset(torch.from_numpy(X_all), torch.from_numpy(y_all), old_tgt)
+        else:
+            dataset = TensorDataset(torch.from_numpy(X_all), torch.from_numpy(y_all))
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+        del X_all, y_all
+        gc.collect()
+        return loader, total
+
     # ── train step: 0.5 * L_GC + 0.5 * L_RD ──
 
     def get_train_step(self, model, optimizer, loss_fn):
+        if not _use_tf():
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model.nn.to(dev)
+            old_nc = self.old_num_classes
+
+            def train_step_glfc_pt(batch_X, batch_y, batch_old=None):
+                batch_X = batch_X.to(dev, non_blocking=True)
+                batch_y = batch_y.to(dev, non_blocking=True)
+                labels = batch_y.argmax(dim=1)
+                model.nn.train()
+                optimizer.zero_grad(set_to_none=True)
+                logits = model.nn(batch_X, return_logits=True)
+                pred = torch.sigmoid(logits).detach()
+                g = torch.abs(pred.gather(1, labels.view(-1, 1)) - 1.0)
+                if old_nc > 0:
+                    is_old = (labels < old_nc).float().view(-1, 1)
+                    is_new = 1.0 - is_old
+                    n_old = is_old.sum()
+                    n_new = is_new.sum()
+                    g_old = g * is_old
+                    g_new = g * is_new
+                    mean_old = g_old.sum() / n_old.clamp_min(1.0)
+                    mean_new = g_new.sum() / n_new.clamp_min(1.0)
+                    w = g_old / (mean_old + 1e-12) + g_new / (mean_new + 1e-12)
+                else:
+                    w = torch.ones_like(g)
+                loss_gc = torch.mean(w * torch.nn.functional.binary_cross_entropy_with_logits(logits, batch_y, reduction='none'))
+                if batch_old is not None and old_nc > 0:
+                    batch_old = batch_old.to(dev, non_blocking=True)
+                    distill_target = torch.cat([batch_old, batch_y[:, old_nc:]], dim=1)
+                    loss_rd = torch.nn.functional.binary_cross_entropy_with_logits(logits, distill_target)
+                    total_loss = 0.5 * loss_gc + 0.5 * loss_rd
+                else:
+                    loss_rd = torch.tensor(0.0, device=dev)
+                    total_loss = loss_gc
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.nn.parameters(), 0.5)
+                optimizer.step()
+                return loss_gc.item(), loss_rd.item(), total_loss.item()
+
+            return train_step_glfc_pt if old_nc > 0 else lambda batch_X, batch_y: train_step_glfc_pt(batch_X, batch_y, None)
+
         keras_model = model.model if hasattr(model, 'model') else model
         logits_model = model.get_logits_model() if hasattr(model, "get_logits_model") else None
         old_nc = self.old_num_classes
@@ -503,6 +814,24 @@ class GLFC(CILMethod):
     def evaluate(self, model, X, y, num_classes, logger=None):
         logits_model = model.get_logits_model() if hasattr(model, "get_logits_model") else None
         y_mapped = self.map_labels_np(y if len(y.shape) == 1 else np.argmax(y, axis=1))
+        if not _use_tf():
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model.nn.to(dev).eval()
+            loss_sum = 0.0
+            n = X.shape[0]
+            all_preds = []
+            with torch.no_grad():
+                for i in range(0, n, PRED_BATCH):
+                    x_chunk = torch.from_numpy(np.array(X[i:i+PRED_BATCH], dtype=np.float32)).to(dev)
+                    y_idx = y_mapped[i:i+PRED_BATCH].astype(int)
+                    log_np = model.nn(x_chunk, return_logits=True).cpu().numpy()
+                    all_preds.append(np.argmax(log_np, axis=1))
+                    y_chunk = np.zeros((len(y_idx), num_classes), dtype=np.float32)
+                    y_chunk[np.arange(len(y_idx)), y_idx] = 1.0
+                    e = np.exp(log_np - log_np.max(axis=1, keepdims=True))
+                    p = np.clip(e / e.sum(axis=1, keepdims=True), 1e-7, 1.0)
+                    loss_sum += float(-np.sum(y_chunk * np.log(p)))
+            return {"acc": float(np.mean(np.concatenate(all_preds) == y_mapped)), "loss": loss_sum / n}
         loss_sum = 0.0
         n = X.shape[0]
         all_preds = []

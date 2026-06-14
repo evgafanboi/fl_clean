@@ -10,7 +10,7 @@ class FCILConfig:
     # FL settings
     strategy: str = "FedAvg"
     n_clients: int = 10
-    rounds_per_task: int = 10
+    rounds_per_task: int = 5
     
     # CIL settings
     cil_method: str = "finetune"
@@ -18,7 +18,7 @@ class FCILConfig:
     mas_lambda: float = 1.0
     lwf_alpha: float = 0.5
     lwf_temperature: float = 2.0
-    icarl_memory: int = 2000
+    icarl_memory: float = 1.0
     icarl_bce: bool = False
     foster_beta1: float = 0.97
     foster_beta2: float = 0.97
@@ -55,5 +55,21 @@ class FCILConfig:
     # PASS settings (reuses cbkd_lambda, cbkd_proto_size)
     pass_gamma: float = 10.0
 
+    # FEAT/EXP settings
+    feat_lambda: float = 1.0
+    feat_rho: float = 0.9
+    feat_temp: float = 0.5
+    ours_ekd_epochs: int = 2
+    ours_ekd_lambda: float = 1.0
+    robust_threshold: float = 0.3
+    robust_workers: int = 8
+
     # SSD settings
     m_max: float = 1.0
+
+    # Backend
+    use_tf: bool = False
+
+    # Checkpointing
+    checkpoint: int = 0
+    fresh_run: bool = False

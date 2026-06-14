@@ -5,12 +5,14 @@ Stage 2: Learn linear bias correction layer (alpha, beta) on balanced validation
 
 import gc
 import numpy as np
-import tensorflow as tf
 from pathlib import Path
+from ..backend import use_tf as _use_tf
 from .base import CILMethod
 
 PRED_BATCH = 4096
 def _batched_predict(model, X, batch_size=PRED_BATCH):
+    if not _use_tf() and hasattr(model, 'predict'):
+        return model.predict(X, batch_size=batch_size)
     parts = []
     for i in range(0, X.shape[0], batch_size):
         parts.append(model(X[i:i + batch_size], training=False).numpy())
@@ -62,6 +64,17 @@ class BiC(CILMethod):
         self.old_num_classes = len(self.class_order) - len(task_classes)
 
     def set_old_model(self, model):
+        if not _use_tf():
+            import copy
+            old = copy.deepcopy(model.nn)
+            old.eval()
+            for p in old.parameters():
+                p.requires_grad_(False)
+            self.old_model = old
+            self.old_logits_model = old
+            self.old_num_classes = model.num_classes
+            return
+        import tensorflow as tf
         keras_model = model.model if hasattr(model, 'model') else model
         self.old_model = tf.keras.models.clone_model(keras_model)
         self.old_model.set_weights(keras_model.get_weights())
@@ -71,7 +84,7 @@ class BiC(CILMethod):
 
     def map_labels_np(self, y):
         labels = y if len(y.shape) == 1 else np.argmax(y, axis=1)
-        return np.vectorize(self.label_map.get)(labels)
+        return np.vectorize(self.label_map.get, otypes=[int])(labels)
 
     # exemplar management (iCaRL herding)
 
@@ -161,6 +174,9 @@ class BiC(CILMethod):
     # ── Stage 1 dataset: current task data + train-split exemplars ──
 
     def build_dataset(self, X_path, y_path, model, batch_size):
+        if not _use_tf():
+            return self._build_dataset_pt(X_path, y_path, model, batch_size)
+        import tensorflow as tf
         old_tgt_file = Path("temp_weights/bic_old_targets.npy")
         if old_tgt_file.exists():
             old_tgt_file.unlink(missing_ok=True)
@@ -224,6 +240,8 @@ class BiC(CILMethod):
             X_ex = np.load(path, mmap_mode='r')
             total += X_ex.shape[0]
             del X_ex
+        if total == 0:
+            return None, 0
 
         x_path_str = X_path
         y_path_str = y_path
@@ -241,7 +259,7 @@ class BiC(CILMethod):
                 X_b = np.array(X_n[idx], dtype=np.float32)
                 lab = np.array(y_n[idx])
                 lab = lab if len(lab.shape) == 1 else np.argmax(lab, axis=1)
-                lab = np.vectorize(label_map.get)(lab)
+                lab = np.vectorize(label_map.get, otypes=[int])(lab)
                 y_b = tf.keras.utils.to_categorical(lab, num_classes).astype(np.float32)
                 if old_tgt is not None:
                     o_b = np.array(old_tgt[row:row + X_b.shape[0]], dtype=np.float32)
@@ -281,9 +299,109 @@ class BiC(CILMethod):
         dataset = dataset.prefetch(1)
         return dataset, total
 
+    def _build_dataset_pt(self, X_path, y_path, model, batch_size):
+        import torch
+        from torch.utils.data import TensorDataset, DataLoader
+        X_new = np.load(X_path)
+        y_new = np.load(y_path)
+        num_classes = len(self.class_order)
+        old_nc = self.old_num_classes
+        label_map = dict(self.label_map)
+        # split val same as TF path
+        labels_full = np.array(y_new if len(y_new.shape) == 1 else np.argmax(y_new, axis=1))
+        old_nc_classes = list(self.class_order[:old_nc])
+        task_classes = list(self.class_order[old_nc:])
+        train_mask = np.ones(X_new.shape[0], dtype=bool)
+        new_val = {}
+        for c in task_classes:
+            c_idx = np.where(labels_full == c)[0]
+            val_n = int(len(c_idx) * self.val_ratio)
+            if val_n == 0:
+                continue
+            val_idx = c_idx[-val_n:]
+            train_mask[val_idx] = False
+            new_val[c] = np.array(X_new[val_idx], dtype=np.float32)
+        self.client_val_X[self.client_id] = new_val
+        train_indices = np.where(train_mask)[0]
+
+        client_exemplars = list(self.exemplars.get(self.client_id, {}).items())
+        X_parts = [np.array(X_new[train_indices], dtype=np.float32)]
+        y_parts = []
+        lab = labels_full[train_indices]
+        mapped = np.vectorize(label_map.get, otypes=[int])(lab)
+        y_oh = np.zeros((len(mapped), num_classes), dtype=np.float32)
+        y_oh[np.arange(len(mapped)), mapped.astype(int)] = 1.0
+        y_parts.append(y_oh)
+        for c, path in client_exemplars:
+            X_ex = np.load(path).astype(np.float32)
+            X_parts.append(X_ex)
+            y_ex = np.zeros((len(X_ex), num_classes), dtype=np.float32)
+            y_ex[:, label_map[c]] = 1.0
+            y_parts.append(y_ex)
+        X_all = np.concatenate(X_parts)
+        y_all = np.concatenate(y_parts)
+        total = X_all.shape[0]
+        del X_parts, y_parts
+
+        if total == 0:
+            return None, 0
+
+        if old_nc > 0 and self.old_logits_model is not None:
+            import torch
+            T = self.temperature
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.old_logits_model.to(dev)
+            logits_np = []
+            for i in range(0, len(X_all), PRED_BATCH):
+                chunk = torch.from_numpy(X_all[i:i + PRED_BATCH]).to(dev)
+                with torch.no_grad():
+                    logits_np.append(self.old_logits_model(chunk, return_logits=True).cpu().numpy())
+            old_targets = np.concatenate(logits_np, axis=0)[:, :old_nc].astype(np.float32) / T
+            dataset = TensorDataset(
+                torch.from_numpy(X_all),
+                torch.from_numpy(y_all),
+                torch.from_numpy(old_targets))
+        else:
+            dataset = TensorDataset(torch.from_numpy(X_all), torch.from_numpy(y_all))
+        del X_all, y_all
+        gc.collect()
+        return DataLoader(dataset, batch_size=batch_size, shuffle=True), total
+
     # Stage 1 train step: LwF distillation + CE
 
     def get_train_step(self, model, optimizer, loss_fn):
+        if not _use_tf():
+            if self.old_logits_model is None or self.old_num_classes == 0:
+                return None
+            import torch
+            import torch.nn.functional as F
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model.nn.to(dev)
+            self.old_logits_model.to(dev)
+            T = self.temperature
+            lam = self.lwf_alpha
+            old_nc = self.old_num_classes
+
+            def step_pt(X_b, y_b, old_b=None):
+                X_b = X_b.to(dev); y_b = y_b.to(dev)
+                y_cls = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
+                model.nn.train()
+                optimizer.zero_grad()
+                logits = model.nn(X_b, return_logits=True)
+                ce_loss = F.cross_entropy(logits, y_cls, label_smoothing=0.05)
+                if old_b is not None and old_nc > 0:
+                    old_probs = F.softmax(old_b.to(dev), dim=1)
+                    new_probs = F.log_softmax(logits[:, :old_nc] / T, dim=1)
+                    distill = F.kl_div(new_probs, old_probs, reduction='batchmean') * (T * T)
+                else:
+                    distill = torch.tensor(0.0, device=dev)
+                total = lam * distill + (1.0 - lam) * ce_loss
+                total.backward()
+                torch.nn.utils.clip_grad_norm_(model.nn.parameters(), 0.5)
+                optimizer.step()
+                return ce_loss.item(), distill.item(), total.item()
+
+            return step_pt
         keras_model = model.model if hasattr(model, 'model') else model
         new_logits_model = model.get_logits_model() if hasattr(model, 'get_logits_model') else None
         T = self.temperature
@@ -314,10 +432,46 @@ class BiC(CILMethod):
                            M_class_tf, m_max_tf):
         if self.old_logits_model is None or self.old_num_classes == 0:
             from .finetune import Finetune
-            ft = Finetune(num_classes=self.num_classes)
-            return ft.get_ssd_train_step(model, optimizer, loss_fn,
-                                         global_logits_model, local_logits_model,
-                                         M_class_tf, m_max_tf)
+            return Finetune(num_classes=self.num_classes).get_ssd_train_step(
+                model, optimizer, loss_fn, global_logits_model, local_logits_model, M_class_tf, m_max_tf)
+
+        if not _use_tf():
+            import torch
+            import torch.nn.functional as F
+            from .finetune import _pt_ssd_loss
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model.nn.to(dev)
+            T = self.temperature
+            lam = self.lwf_alpha
+            old_nc = self.old_num_classes
+            m_max = float(m_max_tf)
+            old_model = self.old_logits_model
+
+            def step_pt(X_b, y_b, old_logits_b=None):
+                X_b = X_b.to(dev); y_b = y_b.to(dev)
+                y_cls = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
+                model.nn.train()
+                optimizer.zero_grad()
+                local_logits = model.nn(X_b, return_logits=True)
+                ce_loss = F.cross_entropy(local_logits, y_cls, label_smoothing=0.05)
+                if old_logits_b is not None:
+                    old_probs = F.softmax(old_logits_b.to(dev), dim=1)
+                    new_probs = F.log_softmax(local_logits[:, :old_nc] / T, dim=1)
+                    distill = F.kl_div(new_probs, old_probs, reduction='batchmean') * (T * T)
+                else:
+                    distill = torch.tensor(0.0, device=dev)
+                with torch.no_grad():
+                    global_log = torch.from_numpy(
+                        global_logits_model.predict(X_b.cpu().numpy(), batch_size=len(X_b))).to(dev)
+                ssd_loss = _pt_ssd_loss(local_logits, global_log, y_b, M_class_tf, m_max)
+                total = lam * distill + (1.0 - lam) * ce_loss + ssd_loss
+                total.backward()
+                torch.nn.utils.clip_grad_norm_(model.nn.parameters(), 0.5)
+                optimizer.step()
+                return ce_loss.item(), ssd_loss.item(), total.item()
+
+            return step_pt
+
         keras_model = model.model if hasattr(model, 'model') else model
         T = self.temperature
         lam = self.lwf_alpha
@@ -389,9 +543,31 @@ class BiC(CILMethod):
             y_parts.append(np.full(min_n, mapped_c, dtype=np.int32))
         X_val = np.concatenate(X_parts, axis=0)
         y_val = np.concatenate(y_parts, axis=0)
-        y_onehot = tf.keras.utils.to_categorical(y_val, num_classes).astype(np.float32)
         del per_class, X_parts, y_parts
 
+        if not _use_tf():
+            import torch
+            import torch.nn.functional as F
+            logits_all = logits_model.predict(X_val, batch_size=PRED_BATCH)
+            del X_val
+            logits_t = torch.from_numpy(logits_all)
+            y_t = torch.from_numpy(y_val.astype(np.int64))
+            alpha_p = torch.tensor(1.0, requires_grad=True)
+            beta_p = torch.tensor(0.0, requires_grad=True)
+            opt_pt = torch.optim.Adam([alpha_p, beta_p], lr=lr)
+            for _ in range(n_epochs):
+                opt_pt.zero_grad()
+                corrected = torch.cat([logits_t[:, :old_nc], logits_t[:, old_nc:] * alpha_p + beta_p], dim=1)
+                loss = F.cross_entropy(corrected, y_t)
+                loss.backward()
+                opt_pt.step()
+            result = (float(alpha_p.detach()), float(beta_p.detach()))
+            del logits_all, logits_t, y_t, alpha_p, beta_p, opt_pt
+            gc.collect()
+            return result
+
+        import tensorflow as tf
+        y_onehot = tf.keras.utils.to_categorical(y_val, num_classes).astype(np.float32)
         logits_all = _batched_predict(logits_model, X_val)
         del X_val
 
@@ -426,10 +602,21 @@ class BiC(CILMethod):
     def apply_bias_correction(self, model):
         if self.bias_alpha is None or self.old_num_classes == 0:
             return
+        old_nc = self.old_num_classes
+        if not _use_tf():
+            import torch
+            sd = model.nn.state_dict()
+            self._saved_logits_weights = {k: v.clone() for k, v in sd.items() if 'logits' in k}
+            for k in list(sd.keys()):
+                if 'logits.weight' in k:
+                    sd[k][:, old_nc:] *= self.bias_alpha
+                elif 'logits.bias' in k:
+                    sd[k][old_nc:] = sd[k][old_nc:] * self.bias_alpha + self.bias_beta
+            model.nn.load_state_dict(sd)
+            return
         logits_layer = model.model.get_layer('logits')
         self._saved_logits_weights = logits_layer.get_weights()
         kernel, bias = [w.copy() for w in self._saved_logits_weights]
-        old_nc = self.old_num_classes
         kernel[:, old_nc:] *= self.bias_alpha
         bias[old_nc:] = bias[old_nc:] * self.bias_alpha + self.bias_beta
         logits_layer.set_weights([kernel, bias])
@@ -437,6 +624,14 @@ class BiC(CILMethod):
         model._feature_model = None
 
     def undo_bias_correction(self, model):
+        if not _use_tf():
+            if not hasattr(self, '_saved_logits_weights') or self._saved_logits_weights is None:
+                return
+            sd = model.nn.state_dict()
+            sd.update(self._saved_logits_weights)
+            model.nn.load_state_dict(sd)
+            self._saved_logits_weights = None
+            return
         logits_layer = model.model.get_layer('logits')
         logits_layer.set_weights(self._saved_logits_weights)
         model._logits_model = None
@@ -454,18 +649,21 @@ class BiC(CILMethod):
         all_preds = []
         for i in range(0, n, PRED_BATCH):
             x_chunk = np.array(X[i:i + PRED_BATCH], dtype=np.float32)
-            y_chunk = tf.keras.utils.to_categorical(y_mapped[i:i + PRED_BATCH], num_classes)
-            log_chunk = logits_model(x_chunk, training=False).numpy()
+            y_idx = y_mapped[i:i + PRED_BATCH].astype(int)
+            y_chunk = np.zeros((len(y_idx), num_classes), dtype=np.float32)
+            y_chunk[np.arange(len(y_idx)), y_idx] = 1.0
+            if _use_tf():
+                log_chunk = logits_model(x_chunk, training=False).numpy()
+            else:
+                log_chunk = logits_model.predict(x_chunk, batch_size=len(x_chunk))
             all_preds.append(np.argmax(log_chunk, axis=1))
             e = np.exp(log_chunk - log_chunk.max(axis=1, keepdims=True))
             p = e / e.sum(axis=1, keepdims=True)
             p = np.clip(p, 1e-7, 1.0)
             loss_sum += float(-np.sum(y_chunk * np.log(p)))
             del x_chunk, y_chunk, log_chunk, p
-        loss = loss_sum / n
         preds = np.concatenate(all_preds)
-        acc = float(np.mean(preds == y_mapped))
-        return {"acc": acc, "loss": loss}
+        return {"acc": float(np.mean(preds == y_mapped)), "loss": loss_sum / n}
 
     # Cleanup
 

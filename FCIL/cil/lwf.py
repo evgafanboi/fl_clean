@@ -1,7 +1,7 @@
 """Learning without Forgetting (LwF) for continual learning"""
 
 import numpy as np
-import tensorflow as tf
+from ..backend import use_tf as _use_tf
 from .base import CILMethod
 
 
@@ -25,6 +25,17 @@ class LwF(CILMethod):
                 self.class_order.append(c)
 
     def set_old_model(self, model):
+        if not _use_tf():
+            import copy
+            old = copy.deepcopy(model.nn)
+            old.eval()
+            for p in old.parameters():
+                p.requires_grad_(False)
+            self.old_model = old
+            self.old_logits_model = old
+            self.old_num_classes = model.num_classes
+            return
+        import tensorflow as tf
         keras_model = model.model if hasattr(model, 'model') else model
         self.old_model = tf.keras.models.clone_model(keras_model)
         self.old_model.set_weights(keras_model.get_weights())
@@ -35,12 +46,45 @@ class LwF(CILMethod):
 
     def map_labels_np(self, y):
         labels = y if len(y.shape) == 1 else np.argmax(y, axis=1)
-        mapped = np.vectorize(self.label_map.get)(labels)
+        mapped = np.vectorize(self.label_map.get, otypes=[int])(labels)
         return mapped
 
     def get_train_step(self, model, optimizer, loss_fn):
         if self.old_logits_model is None:
             return None
+
+        if not _use_tf():
+            import torch
+            import torch.nn.functional as F
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model.nn.to(dev)
+            self.old_model.to(dev)
+            T = self.temperature
+            alpha = self.alpha
+            old_model = self.old_model
+            old_nc = self.old_num_classes
+
+            def step_pt(X_b, y_b):
+                X_b = X_b.to(dev); y_b = y_b.to(dev)
+                y_cls = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
+                model.nn.train()
+                optimizer.zero_grad()
+                logits = model.nn(X_b, return_logits=True)
+                ce_loss = F.cross_entropy(logits, y_cls, label_smoothing=0.05)
+                with torch.no_grad():
+                    old_logits = old_model(X_b, return_logits=True)
+                    old_probs = F.softmax(old_logits / T, dim=1)
+                new_probs = F.log_softmax(logits[:, :old_nc] / T, dim=1)
+                distill = F.kl_div(new_probs, old_probs, reduction='batchmean') * (T * T)
+                total = alpha * distill + (1.0 - alpha) * ce_loss
+                total.backward()
+                torch.nn.utils.clip_grad_norm_(model.nn.parameters(), 0.5)
+                optimizer.step()
+                return ce_loss.item(), distill.item(), total.item()
+
+            return step_pt
+
+        import tensorflow as tf
         keras_model = model.model if hasattr(model, 'model') else model
         new_logits_model = model.get_logits_model() if hasattr(model, 'get_logits_model') else tf.keras.Model(keras_model.input, keras_model.get_layer('logits').output)
         T = self.temperature
@@ -74,10 +118,46 @@ class LwF(CILMethod):
                            M_class_tf, m_max_tf):
         if self.old_logits_model is None:
             from .finetune import Finetune
-            ft = Finetune(num_classes=self.num_classes)
-            return ft.get_ssd_train_step(model, optimizer, loss_fn,
-                                         global_logits_model, local_logits_model,
-                                         M_class_tf, m_max_tf)
+            return Finetune(num_classes=self.num_classes).get_ssd_train_step(
+                model, optimizer, loss_fn, global_logits_model, local_logits_model, M_class_tf, m_max_tf)
+
+        if not _use_tf():
+            import torch
+            import torch.nn.functional as F
+            from .finetune import _pt_ssd_loss
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model.nn.to(dev)
+            self.old_model.to(dev)
+            T = self.temperature
+            alpha = self.alpha
+            old_model = self.old_model
+            old_nc = self.old_num_classes
+            m_max = float(m_max_tf)
+
+            def step_pt(X_b, y_b):
+                X_b = X_b.to(dev); y_b = y_b.to(dev)
+                y_cls = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
+                model.nn.train()
+                optimizer.zero_grad()
+                local_logits = model.nn(X_b, return_logits=True)
+                ce_loss = F.cross_entropy(local_logits, y_cls, label_smoothing=0.05)
+                with torch.no_grad():
+                    old_logits = old_model(X_b, return_logits=True)
+                    old_probs = F.softmax(old_logits / T, dim=1)
+                    global_logits_np = global_logits_model.predict(X_b.cpu().numpy(), batch_size=len(X_b))
+                    global_logits = torch.from_numpy(global_logits_np).to(dev)
+                new_probs = F.log_softmax(local_logits[:, :old_nc] / T, dim=1)
+                lwf_loss = F.kl_div(new_probs, old_probs, reduction='batchmean') * (T * T)
+                ssd_loss = _pt_ssd_loss(local_logits, global_logits, y_b, M_class_tf, m_max)
+                total = (1.0 - alpha) * ce_loss + alpha * lwf_loss + ssd_loss
+                total.backward()
+                torch.nn.utils.clip_grad_norm_(model.nn.parameters(), 0.5)
+                optimizer.step()
+                return ce_loss.item(), ssd_loss.item(), total.item()
+
+            return step_pt
+
+        import tensorflow as tf
         keras_model = model.model if hasattr(model, 'model') else model
         T = self.temperature
         alpha = self.alpha

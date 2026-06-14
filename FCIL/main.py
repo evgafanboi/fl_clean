@@ -7,7 +7,7 @@ import glob
 from pathlib import Path
 
 from .config import FCILConfig
-from .pipeline import run_fcil_pipeline
+from .pipeline import run_fcil_pipeline, run_no_global_pipeline
 
 
 def find_task_order_file(partition_type: str, n_clients: int) -> str:
@@ -42,12 +42,12 @@ def main():
                         help='FL aggregation strategy')
     parser.add_argument('--n_clients', type=int, default=10,
                         help='Number of clients')
-    parser.add_argument('--rounds', type=int, default=3,
+    parser.add_argument('--rounds', type=int, default=5,
                         help='Rounds per task')
     
     # CIL settings
     parser.add_argument('--cil', type=str, default='finetune',
-                        choices=['finetune', 'ewc', 'mas', 'lwf', 'icarl', 'bic', 'foster', 'glfc', 'cbkd', 'pass'],
+                        choices=['finetune', 'ewc', 'mas', 'lwf', 'icarl', 'bic', 'foster', 'glfc', 'cbkd', 'pass', 'feat', 'exp', 'ours'],
                         help='CIL method')
     parser.add_argument('--ewc_lambda', type=float, default=10.0,
                         help='EWC regularization strength (normalized, typical range: 0.1-10)')
@@ -57,8 +57,8 @@ def main():
                         help='LwF distillation weight')
     parser.add_argument('--lwf_temperature', type=float, default=2.0,
                         help='LwF distillation temperature')
-    parser.add_argument('--memory', type=int, default=200,
-                        help='iCaRL/BiC/FOSTER total memory budget K')
+    parser.add_argument('--memory', type=float, default=1.0,
+                        help='iCaRL-style exemplar memory percentage added per client per task')
     parser.add_argument('--bce', action='store_true',
                         help='Use iCaRL BCE loss (paper default)')
     parser.add_argument('--beta1', type=float, default=0.97,
@@ -80,7 +80,23 @@ def main():
     parser.add_argument('--proto_size', type=int, default=50,
                         help='CBKD/PASS augmented prototypes per class')
     parser.add_argument('--pass_gamma', type=float, default=10.0,
-                        help='PASS feature KD weight (gamma)')
+                        help='PASS: feature distillation weight')
+    parser.add_argument('--feat_lambda', type=float, default=0.1,
+                        help='FEAT/EXP: geometric structural alignment weight (FEAT default 0.1, EXP default 1.0)')
+    parser.add_argument('--feat_rho', type=float, default=0.9,
+                        help='FEAT: replay-energy EMA coefficient')
+    parser.add_argument('--feat_temp', type=float, default=0.5,
+                        help='FEAT: softmax temperature for ETF feature similarity')
+    parser.add_argument('--ours_ekd_epochs', type=int, default=2,
+                        help='Ours: per-task EKD epochs')
+    parser.add_argument('--ours_ekd_lambda', type=float, default=1.0,
+                        help='Ours: per-task EKD loss weight')
+    parser.add_argument('--robust_threshold', type=float, default=0.3,
+                        help='Ours: Blom robust-filter discard threshold')
+    parser.add_argument('--robust_workers', type=int, default=8,
+                        help='Ours: Blom robust-filter workers')
+    parser.add_argument('--m_max', type=float, default=1.0,
+                        help='FedSSD: maximum SSD distillation weight')
     parser.add_argument('--encoder_epochs', type=int, default=50,
                         help='GLFC: perturbation optimisation epochs for proto samples')
     parser.add_argument('--model_selection', action='store_true',
@@ -102,10 +118,16 @@ def main():
                         help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=5,
                         help='Epochs per round')
-    parser.add_argument('--m_max', type=float, default=1.0,
-                        help='SSD maximum distillation weight (only used with --strategy FedSSD)')
+    parser.add_argument('--use_tf', action='store_true',
+                        help='Use TensorFlow backend (default: PyTorch)')
+    parser.add_argument('--checkpoint', type=int, default=0,
+                        help='Save checkpoint every N clients (0 = disabled)')
+    parser.add_argument('--fresh_run', action='store_true',
+                        help='Clear checkpoint and restart from scratch')
     
     args = parser.parse_args()
+    if args.feat_lambda is None:
+        args.feat_lambda = 1.0 if args.cil == 'exp' else 0.1
 
     # GLFC is monolithic: warn and override incompatible strategies
     if args.cil == 'glfc' and args.strategy != 'FedAvg':
@@ -129,7 +151,7 @@ def main():
     # Extract task size from task_order filename for logging
     task_size_token = Path(task_order_file).stem.split('_')[-2]  # e.g., "5.0" from "..._5.0_task"
     
-    parts = [args.strategy, args.cil, f"{args.n_clients}client", args.partition_type, task_size_token]
+    parts = [args.strategy, args.cil, f"{args.n_clients}client", args.partition_type, task_size_token, args.model]
     if args.cil == 'ewc':
         parts.append(f"lambda{args.ewc_lambda}")
     if args.cil == 'mas':
@@ -166,6 +188,15 @@ def main():
         parts.append(f"lam{args.cbkd_lambda}")
         parts.append(f"g{args.pass_gamma}")
         parts.append(f"ps{args.proto_size}")
+    if args.cil in ('feat', 'exp', 'ours'):
+        parts.append(f"mem{args.memory}")
+        parts.append(f"lam{args.feat_lambda}")
+        parts.append(f"rho{args.feat_rho}")
+        parts.append(f"temp{args.feat_temp}")
+    if args.cil == 'ours':
+        parts.append(f"ekd{args.ours_ekd_epochs}")
+        parts.append(f"ekdl{args.ours_ekd_lambda}")
+        parts.append(f"blom{args.robust_threshold}")
     if args.strategy == 'FedSSD':
         parts.append(f"ssd{args.m_max}")
     log_file = f"results_cil/{'_'.join(parts)}.log"
@@ -193,6 +224,13 @@ def main():
         cbkd_beta=args.cbkd_beta,
         cbkd_proto_size=args.proto_size,
         pass_gamma=args.pass_gamma,
+        feat_lambda=args.feat_lambda,
+        feat_rho=args.feat_rho,
+        feat_temp=args.feat_temp,
+        ours_ekd_epochs=args.ours_ekd_epochs,
+        ours_ekd_lambda=args.ours_ekd_lambda,
+        robust_threshold=args.robust_threshold,
+        robust_workers=args.robust_workers,
         partition_type=args.partition_type,
         partition_root=partition_root,
         task_order_file=task_order_file,
@@ -202,6 +240,9 @@ def main():
         log_file=log_file,
         bic_val_split=args.bic_val_split,
         m_max=args.m_max,
+        use_tf=args.use_tf,
+        checkpoint=args.checkpoint,
+        fresh_run=args.fresh_run,
     )
     
     run_fcil_pipeline(config)

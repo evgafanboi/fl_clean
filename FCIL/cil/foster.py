@@ -5,15 +5,67 @@ Uses iCaRL herding for exemplar management.
 """
 
 import gc
+import copy
 import numpy as np
-import tensorflow as tf
 from pathlib import Path
+from ..backend import use_tf as _use_tf
 from .base import CILMethod
+tf = __import__('tensorflow') if _use_tf() else None
+
+def _logits_feature_model(keras_model):
+    logits_layer = keras_model.get_layer('logits')
+    return tf.keras.Model(keras_model.input, logits_layer.input)
+
+def _new_student_like(model, config, total_nc):
+    if not _use_tf():
+        if config.model == "gru":
+            from models.pt_gru import PTGRUModel
+            return PTGRUModel(model.input_dim, total_nc, config.batch_size)
+        from models.pt_dense import PTDenseModel
+        return PTDenseModel(model.input_dim, total_nc, config.batch_size)
+    if config.model == "gru":
+        from models.gru import GRUModel
+        return GRUModel(input_dim=model.input_dim, num_classes=total_nc, batch_size=config.batch_size)
+    from models.dense import DenseModel
+    return DenseModel(input_dim=model.input_dim, num_classes=total_nc, batch_size=config.batch_size)
+
+def _copy_backbone_and_old_head(student_model, old_model, old_nc):
+    old_layers = {layer.name: layer for layer in old_model.layers}
+    for layer in student_model.layers:
+        if layer.name == 'logits':
+            old_kernel, old_bias = old_layers['logits'].get_weights()
+            new_kernel, new_bias = layer.get_weights()
+            new_kernel[:, :old_nc] = old_kernel
+            new_bias[:old_nc] = old_bias
+            layer.set_weights([new_kernel, new_bias])
+        elif layer.name in old_layers and layer.get_weights():
+            layer.set_weights(old_layers[layer.name].get_weights())
+
+def _copy_pt_backbone_and_old_head(student_nn, old_nn, old_nc):
+    old_sd = old_nn.state_dict()
+    new_sd = student_nn.state_dict()
+    for k in new_sd:
+        if k not in old_sd:
+            continue
+        if k == 'logits.weight':
+            new_sd[k][:old_nc].copy_(old_sd[k])
+        elif k == 'logits.bias':
+            new_sd[k][:old_nc].copy_(old_sd[k])
+        elif new_sd[k].shape == old_sd[k].shape:
+            new_sd[k].copy_(old_sd[k])
+    student_nn.load_state_dict(new_sd)
+
+def _pt_feature_hook(model):
+    box = {}
+    hook = model.nn.logits.register_forward_pre_hook(lambda module, inp: box.__setitem__('features', inp[0]))
+    return hook, box
 
 PRED_BATCH = 4096
 
 
 def _batched_predict(model, X, batch_size=PRED_BATCH):
+    if not _use_tf() and hasattr(model, 'predict'):
+        return model.predict(X, batch_size=batch_size)
     parts = []
     for i in range(0, X.shape[0], batch_size):
         parts.append(model(X[i:i + batch_size], training=False).numpy())
@@ -86,6 +138,16 @@ class FOSTER(CILMethod):
         self.per_cls_weights_stage2 = None
 
     def set_old_model(self, model):
+        if not _use_tf():
+            self.old_model = copy.deepcopy(model.nn)
+            self.old_model.eval()
+            for p in self.old_model.parameters():
+                p.requires_grad_(False)
+            self.old_logits_model = self.old_model
+            self.old_feature_model = None
+            self.old_backbone_weights = model.get_weights()
+            self._in_boosting = True
+            return
         keras_model = model.model if hasattr(model, 'model') else model
         self.old_model = tf.keras.models.clone_model(keras_model)
         self.old_model.set_weights(keras_model.get_weights())
@@ -94,8 +156,7 @@ class FOSTER(CILMethod):
             layer.trainable = False
         logits_layer = self.old_model.get_layer('logits')
         self.old_logits_model = tf.keras.Model(self.old_model.input, logits_layer.output)
-        feature_layer = self.old_model.get_layer('dense_3')
-        self.old_feature_model = tf.keras.Model(self.old_model.input, feature_layer.output)
+        self.old_feature_model = _logits_feature_model(self.old_model)
         self.old_backbone_weights = keras_model.get_weights()
         self._in_boosting = True
 
@@ -103,6 +164,14 @@ class FOSTER(CILMethod):
         """Zero old-class logit weights so boosted residual starts at zero.
         Backbone is preserved (carries compressed knowledge from prior task).
         New-class logit weights stay random (from expand_classes)."""
+        if not _use_tf():
+            with __import__('torch').no_grad():
+                old_nc = self.old_num_classes
+                model.nn.logits.weight[:old_nc].zero_()
+                model.nn.logits.bias[:old_nc].zero_()
+            model._logits_model = None
+            model._feature_model = None
+            return
         logits_layer = (model.model if hasattr(model, 'model') else model).get_layer('logits')
         kernel, bias = logits_layer.get_weights()
         old_nc = self.old_num_classes
@@ -127,6 +196,9 @@ class FOSTER(CILMethod):
             for c in self.class_order[old_nc:]
         ]
         weights = self._compute_per_cls_weights(self.beta1, cls_num_list).astype(np.float32)
+        if not _use_tf():
+            self.per_cls_weights_stage1 = weights
+            return
         if self.per_cls_weights_stage1 is None:
             self.per_cls_weights_stage1 = tf.Variable(weights, trainable=False)
         else:
@@ -140,6 +212,9 @@ class FOSTER(CILMethod):
             for c in self.class_order[old_nc:]
         ]
         weights = self._compute_per_cls_weights(self.beta2, cls_num_list).astype(np.float32)
+        if not _use_tf():
+            self.per_cls_weights_stage2 = weights
+            return
         if self.per_cls_weights_stage2 is None:
             self.per_cls_weights_stage2 = tf.Variable(weights, trainable=False)
         else:
@@ -147,7 +222,7 @@ class FOSTER(CILMethod):
 
     def map_labels_np(self, y):
         labels = y if len(y.shape) == 1 else np.argmax(y, axis=1)
-        return np.vectorize(self.label_map.get)(labels)
+        return np.vectorize(self.label_map.get, otypes=[int])(labels)
 
     # ── Exemplar management (iCaRL herding) ──
 
@@ -220,6 +295,8 @@ class FOSTER(CILMethod):
     # ── Dataset: current task data + exemplars ──
 
     def build_dataset(self, X_path, y_path, model, batch_size):
+        if not _use_tf():
+            return self._build_dataset_pt(X_path, y_path, batch_size)
         X_new = np.load(X_path, mmap_mode='r')
         y_new = np.load(y_path, mmap_mode='r')
         num_classes = len(self.class_order)
@@ -242,6 +319,8 @@ class FOSTER(CILMethod):
             X_ex = np.load(path, mmap_mode='r')
             total += X_ex.shape[0]
             del X_ex
+        if total == 0:
+            return None, 0
 
         x_path_str = X_path
         y_path_str = y_path
@@ -254,7 +333,7 @@ class FOSTER(CILMethod):
                 X_b = np.array(X_n[i:i + batch_size], dtype=np.float32)
                 lab = np.array(y_n[i:i + batch_size])
                 lab = lab if len(lab.shape) == 1 else np.argmax(lab, axis=1)
-                lab = np.vectorize(label_map.get)(lab)
+                lab = np.vectorize(label_map.get, otypes=[int])(lab)
                 y_b = tf.keras.utils.to_categorical(lab, num_classes).astype(np.float32)
                 yield X_b, y_b
             del X_n, y_n
@@ -276,12 +355,101 @@ class FOSTER(CILMethod):
         dataset = dataset.prefetch(1)
         return dataset, total
 
+    def _build_dataset_pt(self, X_path, y_path, batch_size):
+        import torch
+        from torch.utils.data import DataLoader, TensorDataset
+        X_new = np.load(X_path)
+        y_new = np.load(y_path)
+        num_classes = len(self.class_order)
+        old_nc = self.old_num_classes
+        label_map = dict(self.label_map)
+        if old_nc > 0:
+            labels_all = np.array(y_new if len(y_new.shape) == 1 else np.argmax(y_new, axis=1))
+            for c in self.class_order[old_nc:]:
+                cnt = int(np.sum(labels_all == c))
+                mapped = self.label_map[c]
+                self._class_sample_counts[mapped] = self._class_sample_counts.get(mapped, 0) + cnt
+            self.compute_stage1_weights()
+            del labels_all
+        labels = y_new if len(y_new.shape) == 1 else np.argmax(y_new, axis=1)
+        mapped = np.vectorize(label_map.get, otypes=[int])(labels)
+        y_oh = np.zeros((len(mapped), num_classes), dtype=np.float32)
+        y_oh[np.arange(len(mapped)), mapped] = 1.0
+        X_parts = [X_new.astype(np.float32)]
+        y_parts = [y_oh]
+        for c, path in self.exemplars.get(self.client_id, {}).items():
+            X_ex = np.load(path)
+            if X_ex.shape[0] == 0:
+                continue
+            y_ex = np.zeros((len(X_ex), num_classes), dtype=np.float32)
+            y_ex[:, label_map[c]] = 1.0
+            X_parts.append(X_ex.astype(np.float32))
+            y_parts.append(y_ex)
+        X_all = np.concatenate(X_parts, axis=0)
+        y_all = np.concatenate(y_parts, axis=0)
+        total = int(X_all.shape[0])
+        del X_parts, y_parts
+        if total == 0:
+            return None, 0
+        loader = DataLoader(
+            TensorDataset(torch.from_numpy(X_all), torch.from_numpy(y_all)),
+            batch_size=batch_size, shuffle=True, drop_last=False)
+        del X_all, y_all
+        gc.collect()
+        return loader, total
+
     # ── Stage 1: Feature Boosting train step ──
 
     def get_train_step(self, model, optimizer, loss_fn):
         old_nc = self.old_num_classes
         if old_nc == 0 or self.old_logits_model is None:
             return None
+
+        if not _use_tf():
+            import torch
+            import torch.nn as nn
+            import torch.nn.functional as F
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model.nn.to(dev)
+            self.old_model.to(dev)
+            self.old_model.eval()
+            feat_box = {}
+            feat_dim = model.nn.logits.in_features
+            total_nc = len(self.class_order)
+            aux = nn.Linear(feat_dim, total_nc).to(dev)
+            optimizer.add_param_group({'params': aux.parameters(), 'weight_decay': 0.0})
+            self.compute_stage1_weights()
+            w = torch.from_numpy(np.array(self.per_cls_weights_stage1, dtype=np.float32)).to(dev)
+            T = self.temperature
+            lambda_okd = self.lambda_okd
+
+            def step_pt(X_b, y_b):
+                X_b = X_b.to(dev, non_blocking=True)
+                y_b = y_b.to(dev, non_blocking=True)
+                y_cls = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
+                model.nn.train()
+                aux.train()
+                optimizer.zero_grad(set_to_none=True)
+                with torch.no_grad():
+                    old_logits = self.old_model(X_b, return_logits=True)
+                hook = model.nn.logits.register_forward_pre_hook(lambda module, inp: feat_box.__setitem__('features', inp[0]))
+                new_logits = model.nn(X_b, return_logits=True)
+                hook.remove()
+                feats = feat_box['features']
+                boosted_old = old_logits + new_logits[:, :old_nc]
+                boosted_logits = torch.cat([boosted_old, new_logits[:, old_nc:]], dim=1)
+                loss_clf = F.cross_entropy(boosted_logits / w, y_cls, label_smoothing=0.05)
+                loss_fe = F.cross_entropy(aux(feats), y_cls, label_smoothing=0.05)
+                soft_prob = F.softmax(old_logits / T, dim=1)
+                pred_log = F.log_softmax(boosted_logits[:, :old_nc] / T, dim=1)
+                loss_kd = lambda_okd * (-(soft_prob * pred_log).sum(dim=1).mean())
+                total = loss_clf + loss_fe + loss_kd
+                total.backward()
+                torch.nn.utils.clip_grad_norm_(list(model.nn.parameters()) + list(aux.parameters()), 0.5)
+                optimizer.step()
+                return loss_clf.item(), loss_kd.item(), total.item()
+
+            return step_pt
 
         keras_model = model.model if hasattr(model, 'model') else model
         new_logits_model = model.get_logits_model()
@@ -332,6 +500,8 @@ class FOSTER(CILMethod):
     # ── Stage 2: Feature Compression ──
 
     def run_compression(self, global_model, config, task_data_paths=None):
+        if not _use_tf():
+            return self._run_compression_pt(global_model, config, task_data_paths)
         """Compress the boosted ensemble (old_model + global_model) into a single model.
         Called after all FL rounds for a task (task_id > 0)."""
         old_nc = self.old_num_classes
@@ -345,26 +515,9 @@ class FOSTER(CILMethod):
         boosted_logits_model = global_model.get_logits_model()
 
         from models.dense import DenseModel
-        student = DenseModel(
-            num_classes=total_nc,
-            input_dim=global_model.input_dim,
-            batch_size=config.batch_size
-        )
-        # Init student backbone from old model's weights (FOSTER paper)
-        if self.old_backbone_weights is not None:
-            old_w = self.old_backbone_weights
-            new_layers = {layer.name: layer for layer in student.model.layers}
-            old_model_layers = {layer.name: layer for layer in self.old_model.layers}
-            for name, layer in new_layers.items():
-                if name == 'logits':
-                    # Copy old fc portion
-                    old_kernel, old_bias = old_model_layers['logits'].get_weights()
-                    new_kernel, new_bias = layer.get_weights()
-                    new_kernel[:, :old_nc] = old_kernel
-                    new_bias[:old_nc] = old_bias
-                    layer.set_weights([new_kernel, new_bias])
-                elif name in old_model_layers and layer.get_weights():
-                    layer.set_weights(old_model_layers[name].get_weights())
+        student = _new_student_like(global_model, config, total_nc)
+        if self.old_model is not None:
+            _copy_backbone_and_old_head(student.model, self.old_model, old_nc)
 
         student_keras = student.model
         student_logits_model = student.get_logits_model()
@@ -378,7 +531,7 @@ class FOSTER(CILMethod):
                 y_d = np.load(paths['y'], mmap_mode='r')
                 labs = np.array(y_d if len(y_d.shape) == 1 else np.argmax(y_d, axis=1))
                 all_X.append(np.array(X_d, dtype=np.float32))
-                all_y.append(np.vectorize(self.label_map.get)(labs).astype(np.int32))
+                all_y.append(np.vectorize(self.label_map.get, otypes=[int])(labs).astype(np.int32))
                 del X_d, y_d, labs
         for client_id in self.exemplars:
             for c, path in self.exemplars[client_id].items():
@@ -449,6 +602,75 @@ class FOSTER(CILMethod):
         del student
         gc.collect()
 
+    def _run_compression_pt(self, global_model, config, task_data_paths=None):
+        import torch
+        import torch.nn.functional as F
+        from torch.utils.data import DataLoader, TensorDataset
+        old_nc = self.old_num_classes
+        total_nc = len(self.class_order)
+        T = self.temperature
+        self.compute_stage2_weights()
+        student = _new_student_like(global_model, config, total_nc)
+        if self.old_model is not None:
+            _copy_pt_backbone_and_old_head(student.nn, self.old_model, old_nc)
+        all_X = []
+        if task_data_paths:
+            for paths in task_data_paths:
+                X_d = np.load(paths['X'], mmap_mode='r')
+                all_X.append(np.array(X_d, dtype=np.float32))
+                del X_d
+        for client_id in self.exemplars:
+            for _, path in self.exemplars[client_id].items():
+                X_ex = np.load(path, mmap_mode='r')
+                if X_ex.shape[0] > 0:
+                    all_X.append(np.array(X_ex, dtype=np.float32))
+                del X_ex
+        if not all_X:
+            global_model.set_weights(student.get_weights())
+            global_model._logits_model = None
+            global_model._feature_model = None
+            return
+        X_comp = np.concatenate(all_X, axis=0)
+        del all_X
+        dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        global_model.nn.to(dev).eval()
+        self.old_model.to(dev).eval()
+        teacher_parts = []
+        with torch.no_grad():
+            for i in range(0, X_comp.shape[0], PRED_BATCH):
+                x = torch.from_numpy(X_comp[i:i + PRED_BATCH]).to(dev)
+                new_logits = global_model.nn(x, return_logits=True)
+                old_logits = self.old_model(x, return_logits=True)
+                teacher_parts.append(torch.cat([old_logits + new_logits[:, :old_nc], new_logits[:, old_nc:]], dim=1).cpu())
+        teacher = torch.cat(teacher_parts, dim=0)
+        loader = DataLoader(
+            TensorDataset(torch.from_numpy(X_comp), teacher),
+            batch_size=config.batch_size, shuffle=True, drop_last=False)
+        student.nn.to(dev)
+        opt = student.optimizer
+        w = torch.from_numpy(np.array(self.per_cls_weights_stage2, dtype=np.float32)).to(dev)
+        for _ in range(self.compression_epochs):
+            student.nn.train()
+            for X_b, t_b in loader:
+                X_b = X_b.to(dev, non_blocking=True)
+                t_b = t_b.to(dev, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                logits = student.nn(X_b, return_logits=True)
+                pred_log = F.log_softmax(logits / T, dim=1)
+                soft_prob = F.softmax(t_b / T, dim=1)
+                soft_weighted = soft_prob * w
+                soft_weighted = soft_weighted / soft_weighted.sum(dim=1, keepdim=True)
+                loss = -(soft_weighted * pred_log).sum(dim=1).mean()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(student.nn.parameters(), 0.5)
+                opt.step()
+        global_model.set_weights(student.get_weights())
+        global_model._logits_model = None
+        global_model._feature_model = None
+        self._in_boosting = False
+        del X_comp, teacher, loader, student
+        gc.collect()
+
     # ── Evaluation ──
 
     def evaluate(self, model, X, y, num_classes, logger=None):
@@ -457,6 +679,34 @@ class FOSTER(CILMethod):
         use_boosted = self._in_boosting and old_nc > 0 and self.old_logits_model is not None
         y_labels = y if len(y.shape) == 1 else np.argmax(y, axis=1)
         y_mapped = self.map_labels_np(y_labels)
+        if not _use_tf():
+            import torch
+            dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model.nn.to(dev).eval()
+            if self.old_model is not None:
+                self.old_model.to(dev).eval()
+            loss_sum = 0.0
+            n = X.shape[0]
+            all_preds = []
+            with torch.no_grad():
+                for i in range(0, n, PRED_BATCH):
+                    x_chunk = torch.from_numpy(np.array(X[i:i + PRED_BATCH], dtype=np.float32)).to(dev)
+                    y_idx = y_mapped[i:i + PRED_BATCH].astype(int)
+                    new_logits = model.nn(x_chunk, return_logits=True)
+                    if use_boosted:
+                        old_logits = self.old_model(x_chunk, return_logits=True)
+                        log_t = torch.cat([old_logits + new_logits[:, :old_nc], new_logits[:, old_nc:]], dim=1)
+                    else:
+                        log_t = new_logits
+                    log_np = log_t.cpu().numpy()
+                    all_preds.append(np.argmax(log_np, axis=1))
+                    y_chunk = np.zeros((len(y_idx), num_classes), dtype=np.float32)
+                    y_chunk[np.arange(len(y_idx)), y_idx] = 1.0
+                    e = np.exp(log_np - log_np.max(axis=1, keepdims=True))
+                    p = np.clip(e / e.sum(axis=1, keepdims=True), 1e-7, 1.0)
+                    loss_sum += float(-np.sum(y_chunk * np.log(p)))
+            preds = np.concatenate(all_preds)
+            return {"acc": float(np.mean(preds == y_mapped)), "loss": loss_sum / n}
         loss_sum = 0.0
         n = X.shape[0]
         all_preds = []
