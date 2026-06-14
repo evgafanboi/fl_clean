@@ -91,6 +91,14 @@ def main():
                         help='Ours: per-task EKD epochs')
     parser.add_argument('--ours_ekd_lambda', type=float, default=1.0,
                         help='Ours: per-task EKD loss weight')
+    parser.add_argument('--ours_proto_rel_lambda', type=float, default=1.0,
+                        help='Ours: prototype-prototype relation loss weight')
+    parser.add_argument('--ours_kd_gamma', type=float, default=1.0,
+                        help='Ours: old-feature KD weight')
+    parser.add_argument('--ours_encoder_lr_factor', type=float, default=0.5,
+                        help='Ours: gradient scale for non-classifier parameters')
+    parser.add_argument('--ours_drift_temp', type=float, default=0.5,
+                        help='Ours: cosine-softmax temperature for old-class drift compensation')
     parser.add_argument('--robust_threshold', type=float, default=0.3,
                         help='Ours: Blom robust-filter discard threshold')
     parser.add_argument('--robust_workers', type=int, default=8,
@@ -196,6 +204,9 @@ def main():
     if args.cil == 'ours':
         parts.append(f"ekd{args.ours_ekd_epochs}")
         parts.append(f"ekdl{args.ours_ekd_lambda}")
+        parts.append(f"kg{args.ours_kd_gamma}")
+        parts.append(f"rel{args.ours_proto_rel_lambda}")
+        parts.append(f"enc{args.ours_encoder_lr_factor}")
         parts.append(f"blom{args.robust_threshold}")
     if args.strategy == 'FedSSD':
         parts.append(f"ssd{args.m_max}")
@@ -229,6 +240,10 @@ def main():
         feat_temp=args.feat_temp,
         ours_ekd_epochs=args.ours_ekd_epochs,
         ours_ekd_lambda=args.ours_ekd_lambda,
+        ours_kd_gamma=args.ours_kd_gamma,
+        ours_proto_rel_lambda=args.ours_proto_rel_lambda,
+        ours_encoder_lr_factor=args.ours_encoder_lr_factor,
+        ours_drift_temp=args.ours_drift_temp,
         robust_threshold=args.robust_threshold,
         robust_workers=args.robust_workers,
         partition_type=args.partition_type,

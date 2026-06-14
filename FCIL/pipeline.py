@@ -595,6 +595,10 @@ def run_fcil_pipeline(config: FCILConfig):
                           temp=config.feat_temp,
                           ekd_epochs=config.ours_ekd_epochs,
                           ekd_lambda=config.ours_ekd_lambda,
+                          gamma=config.ours_kd_gamma,
+                          proto_rel_lambda=config.ours_proto_rel_lambda,
+                          encoder_lr_factor=config.ours_encoder_lr_factor,
+                          drift_temp=config.ours_drift_temp,
                           robust_threshold=config.robust_threshold,
                           robust_workers=config.robust_workers)
     
@@ -1116,15 +1120,18 @@ def run_no_global_pipeline(config: FCILConfig):
             y_full = test_data.iloc[:, -1].values
         return X_full, y_full
     
-    X_test_sample = np.load("data/X_test.npy", mmap_mode='r')
+    X_test_sample, y_test_sample = load_test_data()
     input_dim = X_test_sample.shape[1]
-    del X_test_sample
+    del X_test_sample, y_test_sample
     
     from .cil.ours import Ours
     cil_method = Ours(num_classes=num_classes, lam=config.cbkd_lambda,
-                      gamma=config.pass_gamma, proto_size=config.cbkd_proto_size,
+                      gamma=config.ours_kd_gamma, proto_size=config.cbkd_proto_size,
                       ekd_epochs=config.ours_ekd_epochs,
                       ekd_lambda=config.ours_ekd_lambda,
+                      proto_rel_lambda=config.ours_proto_rel_lambda,
+                      encoder_lr_factor=config.ours_encoder_lr_factor,
+                      drift_temp=config.ours_drift_temp,
                       robust_threshold=config.robust_threshold,
                       robust_workers=config.robust_workers)
     
@@ -1236,12 +1243,19 @@ def run_no_global_pipeline(config: FCILConfig):
                 if n_samples == 0:
                     continue
                 
-                # Stage 1: pure CE local training
+                if task_id > 0 and hasattr(cil_method, "capture_anchor_prototypes"):
+                    cil_method.capture_anchor_prototypes(client_models[client_id], paths['X'], paths['y'])
+
+                # Stage 1: CE on task 0; drift-calibrated PASS on later tasks
                 _opt, _loss_fn = _get_opt_loss(client_models[client_id])
                 train_step = cil_method.get_finetune_step(client_models[client_id], _opt, _loss_fn) if hasattr(cil_method, "get_finetune_step") else cil_method.get_train_step(client_models[client_id], _opt, _loss_fn)
-                epoch_losses = train_client_fast(client_models[client_id], dataset, train_step, local_epochs)
+                stage_epochs = config.epochs_per_round if task_id == 0 else local_epochs
+                epoch_losses = train_client_fast(client_models[client_id], dataset, train_step, stage_epochs)
                 loss = epoch_losses[-1] if epoch_losses else 0.0
                 round_losses.append(loss)
+
+                if hasattr(cil_method, "update_client_drift"):
+                    cil_method.update_client_drift(client_models[client_id], paths['X'], paths['y'])
                 
                 # Store client weights for consensus building
                 trained_client_ids.append(client_id)
@@ -1256,6 +1270,14 @@ def run_no_global_pipeline(config: FCILConfig):
                 log(f"{COLORS.WARNING}R{round_num + 1} T{task_id}: Avg loss={avg_loss:.4f} ({len(round_losses)} clients){COLORS.ENDC}",
                     f"LOSS | T{task_id} | R{round_num + 1} | Avg loss={avg_loss:.4f} ({len(round_losses)} clients)")
             
+            if trained_client_ids and hasattr(cil_method, "aggregate_prototypes"):
+                client_prototypes = [cil_method.prototypes.get(cid, {}) for cid in trained_client_ids]
+                client_counts = [cil_method.client_proto_counts.get(cid, {}) for cid in trained_client_ids]
+                if any(client_prototypes):
+                    cil_method.aggregate_prototypes(client_prototypes, client_counts)
+                    log(f"{COLORS.OKCYAN}Proto aggregation: {len(cil_method.global_prototypes)} classes from {len(trained_client_ids)} clients | var={cil_method.global_variance:.4f}{COLORS.ENDC}",
+                        f"Ours | T{task_id} | R{round_num + 1} | ProtoAgg classes={len(cil_method.global_prototypes)} clients={len(trained_client_ids)} var={cil_method.global_variance:.4f}")
+
             # Stage 2: EKD distillation on shared consensus (single scratch model)
             if client_weights:
                 scratch_model = create_model(current_classes, input_dim, config.batch_size, config.model)
@@ -1265,43 +1287,12 @@ def run_no_global_pipeline(config: FCILConfig):
                 avg_ekd = cil_method.distill_round(scratch_model, active_models, client_weights, config, task_id, active_n, num_tasks)
                 del scratch_model
                 gc.collect()
+                client_weights = [client_models[cid].get_weights() for cid in trained_client_ids]
 
-                client_prototypes = [cil_method.prototypes.get(cid, {}) for cid in trained_client_ids] if hasattr(cil_method, "prototypes") else None
-                if client_prototypes and any(client_prototypes):
-                    survivor_idx = cil_method._last_survivor_clients or list(range(len(trained_client_ids)))
-                    survivor_protos = [client_prototypes[c] for c in survivor_idx if c < len(client_prototypes)]
-                    cil_method.aggregate_prototypes(survivor_protos)
-                    log(f"{COLORS.OKCYAN}Proto aggregation: {len(cil_method.global_prototypes)} classes from {len(survivor_protos)}/{len(trained_client_ids)} survivor clients | var={cil_method.global_variance:.4f}{COLORS.ENDC}",
-                        f"Ours | T{task_id} | R{round_num + 1} | ProtoAgg classes={len(cil_method.global_prototypes)} survivors={len(survivor_protos)}/{len(trained_client_ids)} var={cil_method.global_variance:.4f}")
-
-                # Stage 3: PASS protoAug on global prototypes (task > 0 only)
-                avg_proto = 0.0
-                if task_id > 0 and hasattr(cil_method, "get_global_proto_step") and cil_method.global_prototypes:
-                    proto_losses = []
-                    for client_id in trained_client_ids:
-                        _po, _pl = _get_opt_loss(client_models[client_id])
-                        proto_step = cil_method.get_global_proto_step(client_models[client_id], _po, _pl)
-                        if proto_step is not None:
-                            for _ in range(local_epochs):
-                                _, _, _pl_loss = proto_step(None, None)
-                            proto_losses.append(float(_pl_loss))
-                    avg_proto = sum(proto_losses) / len(proto_losses) if proto_losses else 0.0
-                    client_weights = [client_models[cid].get_weights() for cid in trained_client_ids]
-
-                pass_total = (avg_loss if round_losses else 0.0) + avg_ekd + avg_proto
-                log(f"{COLORS.OKCYAN}Ours losses: CE={avg_loss if round_losses else 0.0:.4f} | head_KD(EKD)={avg_ekd:.4f} | protoAug={avg_proto:.4f} | PASS_total={pass_total:.4f} | survivors≈{cil_method._last_survivors}{COLORS.ENDC}",
-                    f"Ours | T{task_id} | R{round_num + 1} | CE={avg_loss if round_losses else 0.0:.4f} | head_KD={avg_ekd:.4f} | protoAug={avg_proto:.4f} | PASS_total={pass_total:.4f} | Survivors={cil_method._last_survivors}")
-            
-            # PASS prototype update once at task end
-            if round_num == config.rounds_per_task - 1 and hasattr(cil_method, "after_task") and trained_client_ids:
-                for client_id in trained_client_ids:
-                    if hasattr(cil_method, "set_client"):
-                        cil_method.set_client(client_id)
-                    paths = get_task_files(
-                        config.partition_root, config.partition_type,
-                        config.n_clients, client_id, task_id, config.strategy
-                    )
-                    cil_method.after_task(client_models[client_id], paths['X'], paths['y'])
+                pass_local = cil_method._last_ce + cil_method._last_kd + cil_method._last_proto + cil_method._last_rel
+                pass_total = pass_local + avg_ekd
+                log(f"{COLORS.OKCYAN}Ours losses: CE={cil_method._last_ce:.4f} | old_KD={cil_method._last_kd:.4f} | protoAug={cil_method._last_proto:.4f} | protoRel={cil_method._last_rel:.4f} | EKD={avg_ekd:.4f} | total={pass_total:.4f} | survivors≈{cil_method._last_survivors}{COLORS.ENDC}",
+                    f"Ours | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | old_KD={cil_method._last_kd:.4f} | protoAug={cil_method._last_proto:.4f} | protoRel={cil_method._last_rel:.4f} | EKD={avg_ekd:.4f} | total={pass_total:.4f} | Survivors={cil_method._last_survivors}")
             
             # Evaluation at scheduled rounds
             if round_num in eval_round_ids and client_weights:

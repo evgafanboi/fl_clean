@@ -36,7 +36,9 @@ class EWC(CILMethod):
             params = list(model.nn.parameters())
             fisher = [np.zeros_like(w) for w in old_weights]
             total_samples = 0
-            model.nn.eval()
+            # cuDNN RNN backward is only available in training mode; Fisher needs gradients.
+            was_training = model.nn.training
+            model.nn.train()
             for batch_X, batch_y in task_data:
                 X_b = batch_X.to(dev)
                 y_cls = (batch_y.argmax(dim=1) if batch_y.ndim > 1 else batch_y.long()).to(dev)
@@ -53,6 +55,7 @@ class EWC(CILMethod):
                 fisher[i] /= max(total_samples, 1)
             self.fisher[cid][self.current_task] = fisher
             self.optimal_weights[cid][self.current_task] = old_weights
+            model.nn.train(was_training)
             mean_val = sum(float(np.mean(f)) for f in fisher) / len(fisher)
             max_val = max(float(np.max(f)) for f in fisher)
             print(f"  EWC Client {cid} Task {self.current_task}: {total_samples} samples, "

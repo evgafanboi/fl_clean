@@ -4,6 +4,7 @@ Stage 2: Learn linear bias correction layer (alpha, beta) on balanced validation
 """
 
 import gc
+import math
 import numpy as np
 from pathlib import Path
 from ..backend import use_tf as _use_tf
@@ -26,6 +27,7 @@ class BiC(CILMethod):
         super().__init__(num_classes)
         self.name = "BiC"
         self.memory = memory
+        self.memory_percent = float(memory)
         self.lwf_alpha = alpha
         self.temperature = temperature
         self.val_ratio = val_split
@@ -43,6 +45,8 @@ class BiC(CILMethod):
         self.exemplar_dir = Path("temp_weights/bic_exemplars")
         self.val_dir = Path("temp_weights/bic_val")
         self.client_val_X = {}
+        self.client_memory_budget = {}
+        self.client_budget_tasks = set()
 
     def set_client(self, client_id: int):
         self.client_id = client_id
@@ -54,6 +58,8 @@ class BiC(CILMethod):
             self.val_exemplars[client_id] = {}
         if client_id not in self.client_val_X:
             self.client_val_X[client_id] = {}
+        if client_id not in self.client_memory_budget:
+            self.client_memory_budget[client_id] = 0
 
     def before_task(self, task_id: int, task_classes: list):
         super().before_task(task_id, task_classes)
@@ -91,8 +97,9 @@ class BiC(CILMethod):
     def _get_m_per_class(self, client_id):
         classes = sorted(self.client_seen.get(client_id, []))
         t = len(classes)
-        base = self.memory // t if t > 0 else 0
-        remainder = self.memory - base * t
+        budget = int(self.client_memory_budget.get(client_id, 0))
+        base = budget // t if t > 0 else 0
+        remainder = budget - base * t
         sizes = {c: base for c in classes}
         for c in classes[:remainder]:
             sizes[c] += 1
@@ -139,6 +146,10 @@ class BiC(CILMethod):
         feature_model = model.get_feature_model() if hasattr(model, "get_feature_model") else None
         X_new = np.load(X_path, mmap_mode='r')
         y_new = np.load(y_path, mmap_mode='r')
+        key = (self.client_id, self.current_task)
+        if key not in self.client_budget_tasks:
+            self.client_memory_budget[self.client_id] = self.client_memory_budget.get(self.client_id, 0) + int(math.ceil(X_new.shape[0] * self.memory_percent / 100.0))
+            self.client_budget_tasks.add(key)
         labels = np.array(y_new if len(y_new.shape) == 1 else np.argmax(y_new, axis=1))
         present = [c for c in task_classes if np.any(labels == c)]
         for c in present:
