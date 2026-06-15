@@ -123,13 +123,30 @@ def create_model(num_classes: int, input_dim: int, batch_size: int, model: str =
         if model == "gru":
             from models.gru import GRUModel
             return GRUModel(num_classes=num_classes, input_dim=input_dim, batch_size=batch_size)
+        if model == "dcblstm":
+            from models.dcblstm import DCBLSTMModel
+            return DCBLSTMModel(num_classes=num_classes, input_dim=input_dim, batch_size=batch_size)
         from models.dense import DenseModel
         return DenseModel(num_classes=num_classes, input_dim=input_dim, batch_size=batch_size)
     if model == "gru":
         from models.pt_gru import PTGRUModel
         return PTGRUModel(input_dim, num_classes, batch_size)
+    if model == "dcblstm":
+        from models.pt_dcblstm import PTDCBLSTMModel
+        return PTDCBLSTMModel(input_dim, num_classes, batch_size)
     from models.pt_dense import PTDenseModel
     return PTDenseModel(input_dim, num_classes, batch_size)
+
+def _active_class_count(cil_method, fallback: int) -> int:
+    return len(cil_method.class_order) if hasattr(cil_method, "class_order") else fallback
+
+def _prepare_active_model(cil_method, model, fallback_classes: int):
+    current_classes = _active_class_count(cil_method, fallback_classes)
+    if hasattr(model, "expand_classes"):
+        model.expand_classes(current_classes)
+    if hasattr(cil_method, "prepare_model"):
+        cil_method.prepare_model(model)
+    return current_classes
 
 
 def train_client(model, dataset, cil_method, epochs: int):
@@ -686,11 +703,9 @@ def run_fcil_pipeline(config: FCILConfig):
                 if _ckpt["round_meta"]:
                     _resume_cw = _ckpt["round_meta"]["client_weights"]
                     _resume_ss = _ckpt["round_meta"]["sample_sizes"]
-            if hasattr(global_model, "expand_classes") and hasattr(cil_method, "class_order"):
-                global_model.expand_classes(len(cil_method.class_order))
+            _prepare_active_model(cil_method, global_model, num_classes)
             global_model.set_weights(_ckpt["weights"])
-            if hasattr(cil_method, "prepare_model"):
-                cil_method.prepare_model(global_model)
+            _prepare_active_model(cil_method, global_model, num_classes)
             log(f"{COLORS.OKGREEN}Resuming from T{_resume_task} R{_resume_round + 1} C{_resume_client}{COLORS.ENDC}",
                 f"Resuming from T{_resume_task} R{_resume_round + 1} C{_resume_client}")
 
@@ -716,10 +731,7 @@ def run_fcil_pipeline(config: FCILConfig):
             cil_method.before_task(task_id, task_classes)
         if hasattr(cil_method, "set_old_model") and task_id > 0 and not _is_mid_task_resume:
             cil_method.set_old_model(global_model)
-        if hasattr(global_model, "expand_classes") and hasattr(cil_method, "class_order"):
-            global_model.expand_classes(len(cil_method.class_order))
-        if hasattr(cil_method, "prepare_model"):
-            cil_method.prepare_model(global_model)
+        current_classes = _prepare_active_model(cil_method, global_model, num_classes)
         
         # FOSTER: zero old-class logits so boosted residual starts at 0
         if config.cil_method == "foster" and task_id > 0:
@@ -728,11 +740,9 @@ def run_fcil_pipeline(config: FCILConfig):
         # Create one reusable client model per task
         n_clients = 1 if config.strategy == "Centralized" else config.n_clients
         active_n = _task_active_n(n_clients, num_tasks, task_id)
-        current_classes = len(cil_method.class_order) if hasattr(cil_method, "class_order") else num_classes
         label_map = cil_method.label_map if hasattr(cil_method, "label_map") else None
         client_model = create_model(current_classes, input_dim, config.batch_size, config.model)
-        if hasattr(cil_method, "prepare_model"):
-            cil_method.prepare_model(client_model)
+        _prepare_active_model(cil_method, client_model, num_classes)
         _opt, _loss_fn = _get_opt_loss(client_model)
         cached_train_step = cil_method.get_train_step(client_model, _opt, _loss_fn)
         
@@ -1176,7 +1186,7 @@ def run_no_global_pipeline(config: FCILConfig):
                 cil_method.set_old_model(client_models[0])
             cil_method.before_task(task_id, task_classes)
         
-        current_classes = len(cil_method.class_order)
+        current_classes = _active_class_count(cil_method, num_classes)
         active_n = _task_active_n(n_clients, num_tasks, task_id)
         saved_weights = _ckpt["weights"] if _has_ckpt and task_id == _resume_task else {}
         if hasattr(cil_method, "build_public_memory"):
@@ -1188,15 +1198,10 @@ def run_no_global_pipeline(config: FCILConfig):
         for client_id in range(active_n):
             if client_id not in client_models:
                 client_models[client_id] = create_model(current_classes, input_dim, config.batch_size, config.model)
-                if hasattr(cil_method, "prepare_model"):
-                    cil_method.prepare_model(client_models[client_id])
-            else:
-                if hasattr(client_models[client_id], "expand_classes"):
-                    client_models[client_id].expand_classes(current_classes)
-                if hasattr(cil_method, "prepare_model"):
-                    cil_method.prepare_model(client_models[client_id])
+            current_classes = _prepare_active_model(cil_method, client_models[client_id], num_classes)
             if client_id in saved_weights:
                 client_models[client_id].set_weights(saved_weights[client_id])
+                current_classes = _prepare_active_model(cil_method, client_models[client_id], num_classes)
         
         log(f"\n{COLORS.HEADER}TASK {task_id}: {len(task_classes)} classes - {task_classes}{COLORS.ENDC}",
             f"TASK {task_id}: {len(task_classes)} classes - {task_classes}")
@@ -1268,8 +1273,7 @@ def run_no_global_pipeline(config: FCILConfig):
             # Stage 2: EKD distillation on shared consensus (single scratch model)
             if client_weights:
                 scratch_model = create_model(current_classes, input_dim, config.batch_size, config.model)
-                if hasattr(cil_method, "prepare_model"):
-                    cil_method.prepare_model(scratch_model)
+                _prepare_active_model(cil_method, scratch_model, num_classes)
                 active_models = {cid: client_models[cid] for cid in trained_client_ids}
                 if hasattr(cil_method, "update_consensus"):
                     cil_method.update_consensus(scratch_model, client_weights, config)

@@ -256,6 +256,7 @@ class PASS(CILMethod):
         if not _use_tf():
             import torch
             import torch.nn.functional as F
+            from models.pt_common import _PTFeatureWrapper
             dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             model.nn.to(dev)
             self.old_feature_model.to(dev)
@@ -289,13 +290,15 @@ class PASS(CILMethod):
                 model.nn(X_b, return_logits=True)
                 new_feats = feat_wrapper._features
                 with torch.no_grad():
-                    _buf = []
-                    _h = old_model.logits.register_forward_pre_hook(
-                        lambda m, inp: _buf.append(inp[0].detach()))
+                    old_wrapper = type('OldFeatureWrapperHost', (), {'nn': old_model, 'batch_size': model.batch_size})()
+                    old_feat_wrapper = _PTFeatureWrapper(old_wrapper)
+                    old_chunks = []
                     for i in range(0, len(X_b), 4096):
                         old_model(X_b[i:i+4096], return_logits=True)
-                    _h.remove()
-                    old_feats = torch.cat(_buf)
+                        old_chunks.append(old_feat_wrapper._features.detach())
+                    old_feats = torch.cat(old_chunks)
+                    old_feat_wrapper._hook.remove()
+                    old_feat_wrapper._hook = None
                 kd_loss = ((new_feats - old_feats) ** 2).sum(dim=-1).mean()
                 total = ce_loss + gamma * kd_loss
                 total.backward()
@@ -371,6 +374,7 @@ class PASS(CILMethod):
             import torch
             import torch.nn.functional as F
             from .finetune import _pt_ssd_loss
+            from models.pt_common import _PTFeatureWrapper
             dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             model.nn.to(dev)
             self.old_feature_model.to(dev)
@@ -403,8 +407,12 @@ class PASS(CILMethod):
                 model.nn(X_b, return_logits=True)
                 new_feats = feat_wrapper._features
                 with torch.no_grad():
+                    old_wrapper = type('OldFeatureWrapperHost', (), {'nn': old_model, 'batch_size': model.batch_size})()
+                    old_feat_wrapper = _PTFeatureWrapper(old_wrapper)
                     old_model(X_b, return_logits=True)
-                    old_feats = feat_wrapper._features.detach()
+                    old_feats = old_feat_wrapper._features.detach()
+                    old_feat_wrapper._hook.remove()
+                    old_feat_wrapper._hook = None
                     global_log = torch.from_numpy(
                         global_logits_model.predict(X_b.cpu().numpy(), batch_size=len(X_b))).to(dev)
                 kd_loss = ((new_feats - old_feats) ** 2).sum(dim=-1).mean()

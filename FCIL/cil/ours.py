@@ -10,7 +10,7 @@ class Ours(PASS):
     def __init__(self, num_classes: int, lam: float = 10.0, gamma: float = 10.0, proto_size: int = 50,
                  ekd_epochs: int = 1, ekd_lambda: float = 1.0,
                  proto_rel_lambda: float = 1.0, encoder_lr_factor: float = 0.1, drift_temp: float = 0.5,
-                 robust_threshold: float = 0.3, robust_workers: int = 8, no_filter: bool = False, **kwargs):
+                 robust_threshold: float = 0.9, robust_workers: int = 8, no_filter: bool = False, **kwargs):
         super().__init__(num_classes=num_classes, lam=lam, gamma=gamma, proto_size=proto_size, **kwargs)
         self.name = 'Ours'
         self.ekd_epochs = ekd_epochs
@@ -246,6 +246,7 @@ class Ours(PASS):
         if not _use_tf():
             import torch
             import torch.nn.functional as F
+            from models.pt_common import _PTFeatureWrapper
             dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             model.nn.to(dev)
             if self.old_feature_model is not None:
@@ -295,11 +296,12 @@ class Ours(PASS):
                     model.nn(X_b, return_logits=True)
                     new_feats = feat_wrapper._features
                     with torch.no_grad():
-                        _buf = []
-                        _h = self.old_feature_model.logits.register_forward_pre_hook(lambda m, inp: _buf.append(inp[0].detach()))
+                        old_wrapper = type('OldFeatureWrapperHost', (), {'nn': self.old_feature_model, 'batch_size': model.batch_size})()
+                        old_feat_wrapper = _PTFeatureWrapper(old_wrapper)
                         self.old_feature_model(X_b, return_logits=True)
-                        _h.remove()
-                        old_feats = _buf[0]
+                        old_feats = old_feat_wrapper._features.detach()
+                        old_feat_wrapper._hook.remove()
+                        old_feat_wrapper._hook = None
                     kd_loss = F.mse_loss(new_feats, old_feats)
                 proto_loss = torch.tensor(0.0, device=dev)
                 rel_loss = torch.tensor(0.0, device=dev)
@@ -380,7 +382,7 @@ class Ours(PASS):
         if self.no_filter:
             self._last_survivor_clients = list(range(len(client_weights)))
             self._last_survivors = len(client_weights)
-            print(f"  Mean logits: robust filter disabled | 0/{len(client_weights)} clients failed")
+            print(f"  Mean logits ")
         else:
             discard_frac = total_counts.astype(np.float64) / max(total_rows, 1)
             survivor = discard_frac <= self.robust_filter.robust_threshold
