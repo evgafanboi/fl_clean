@@ -501,13 +501,14 @@ def _fcil_load_ckpt(ckpt_dir: str, config) -> dict | None:
     }
 
 
-def _nog_ckpt_save(ckpt_dir, task_id, round_num, client_weights, cil_method, config) -> None:
+def _nog_ckpt_save(ckpt_dir, task_id, round_num, client_weights, cil_method, config, task_complete=False) -> None:
     os.makedirs(ckpt_dir, exist_ok=True)
     _fcil_atomic_write(os.path.join(ckpt_dir, "client_models.bin"), dict(client_weights))
     _fcil_atomic_write(os.path.join(ckpt_dir, "cil_state.bin"), cil_method.get_ckpt_state())
     lines = [
         f"task_id: {task_id}",
         f"round_num: {round_num}",
+        f"task_complete: {str(task_complete).lower()}",
         f"config_hash: {_fcil_fingerprint(config)}",
         f"backend: {'tensorflow' if _use_tf() else 'pytorch'}",
     ]
@@ -539,6 +540,7 @@ def _nog_ckpt_load(ckpt_dir: str, config) -> dict | None:
     return {
         "task_id": int(info.get("task_id", 0)),
         "round_num": int(info.get("round_num", 0)),
+        "task_complete": info.get("task_complete", "false") == "true",
         "weights": weights,
         "cil_state": cil_state,
     }
@@ -682,7 +684,7 @@ def run_fcil_pipeline(config: FCILConfig):
     _resume_cw: list = []
     _resume_ss: list = []
     _has_ckpt = False
-    if _ckpt_enabled and ckpt_dir:
+    if _ckpt_enabled and ckpt_dir and not config.fresh_run:
         _ckpt = _fcil_load_ckpt(ckpt_dir, config)
         if _ckpt is not None:
             _has_ckpt = True
@@ -821,18 +823,6 @@ def run_fcil_pipeline(config: FCILConfig):
                 if hasattr(cil_method, "set_client"):
                     cil_method.set_client(client_id)
 
-                # EWC/MAS/CBKD/PASS/EXP: per-client state → rebuild train step each client
-                if config.cil_method in ("ewc", "mas", "cbkd", "pass", "exp"):
-                    _c_opt, _c_loss = _get_opt_loss(client_model)
-                    if ssd_train_step is not None:
-                        local_logits_model = client_model.get_logits_model()
-                        active_train_step = cil_method.get_ssd_train_step(
-                            client_model, _c_opt, _c_loss,
-                            global_logits_model, local_logits_model,
-                            M_class_tf, m_max_tf)
-                    else:
-                        active_train_step = cil_method.get_train_step(client_model, _c_opt, _c_loss)
-
                 # Load task data
                 paths = get_task_files(
                     config.partition_root, config.partition_type,
@@ -852,10 +842,20 @@ def run_fcil_pipeline(config: FCILConfig):
                     continue
                 
                 # Reuse client model, just reset weights
+                client_model.set_weights(global_model.get_weights())
                 current_classes = _prepare_active_model(cil_method, global_model, num_classes)
                 _prepare_active_model(cil_method, client_model, num_classes)
-                client_model.set_weights(global_model.get_weights())
-                _prepare_active_model(cil_method, client_model, num_classes)
+                active_train_step = ssd_train_step if ssd_train_step is not None else cached_train_step
+                if config.cil_method in ("ewc", "mas", "cbkd", "pass", "exp", "feat"):
+                    _c_opt, _c_loss = _get_opt_loss(client_model)
+                    if ssd_train_step is not None:
+                        local_logits_model = client_model.get_logits_model()
+                        active_train_step = cil_method.get_ssd_train_step(
+                            client_model, _c_opt, _c_loss,
+                            global_logits_model, local_logits_model,
+                            M_class_tf, m_max_tf)
+                    else:
+                        active_train_step = cil_method.get_train_step(client_model, _c_opt, _c_loss)
                 
                 # Train using active train step (SSD or cached CIL)
                 epoch_losses = train_client_fast(client_model, dataset, active_train_step, config.epochs_per_round)
@@ -1123,8 +1123,7 @@ def run_no_global_pipeline(config: FCILConfig):
         cil_method = Ours2(num_classes=num_classes, memory=config.icarl_memory,
                            kd_gamma=config.ours_kd_gamma,
                            robust_threshold=config.robust_threshold,
-                           robust_workers=config.robust_workers,
-                           no_filter=True)
+                           robust_workers=config.robust_workers)
     else:
         from .cil.ours import Ours
         cil_method = Ours(num_classes=num_classes, lam=config.ours_proto_lambda,
@@ -1168,14 +1167,30 @@ def run_no_global_pipeline(config: FCILConfig):
     _resume_task = 0
     _resume_round = 0
     _has_ckpt = False
-    _ckpt = _nog_ckpt_load(ckpt_dir, config) if _ckpt_enabled and ckpt_dir else None
+    _resume_task_end = False
+    _resume_mid_task = False
+    _ckpt = _nog_ckpt_load(ckpt_dir, config) if _ckpt_enabled and ckpt_dir and not config.fresh_run else None
     if _ckpt is not None:
         _has_ckpt = True
         cil_method.set_ckpt_state(_ckpt["cil_state"])
-        _resume_task = _ckpt["task_id"]
-        _resume_round = _ckpt["round_num"] + 1
-        log(f"{COLORS.OKGREEN}Resuming from T{_resume_task} R{_resume_round + 1}{COLORS.ENDC}",
-            f"Resuming from T{_resume_task} R{_resume_round + 1}")
+        if _ckpt["task_complete"]:
+            _resume_task = _ckpt["task_id"] + 1
+            _resume_round = 0
+            log(f"{COLORS.OKGREEN}Resuming from T{_resume_task}{COLORS.ENDC}",
+                f"Resuming from T{_resume_task}")
+        else:
+            _resume_task = _ckpt["task_id"]
+            _resume_round = _ckpt["round_num"] + 1
+            _resume_mid_task = True
+        if _resume_mid_task and _resume_round >= config.rounds_per_task:
+            _resume_round = config.rounds_per_task
+            _resume_task_end = True
+            _resume_mid_task = False
+            log(f"{COLORS.OKGREEN}Resuming from T{_resume_task} task-end freeze{COLORS.ENDC}",
+                f"Resuming from T{_resume_task} task-end freeze")
+        elif _resume_mid_task:
+            log(f"{COLORS.OKGREEN}Resuming from T{_resume_task} R{_resume_round + 1}{COLORS.ENDC}",
+                f"Resuming from T{_resume_task} R{_resume_round + 1}")
 
     # Per-client model pool - no global aggregation
     n_clients = config.n_clients
@@ -1186,14 +1201,19 @@ def run_no_global_pipeline(config: FCILConfig):
         if _has_ckpt and task_id < _resume_task:
             continue
         task_classes = task_order[task_id]
-        if not (_has_ckpt and task_id == _resume_task):
+        if not (_has_ckpt and task_id == _resume_task and _resume_mid_task):
             if task_id > 0 and hasattr(cil_method, "set_old_model") and 0 in client_models:
                 cil_method.set_old_model(client_models[0])
             cil_method.before_task(task_id, task_classes)
         
         current_classes = _active_class_count(cil_method, num_classes)
         active_n = _task_active_n(n_clients, num_tasks, task_id)
-        saved_weights = _ckpt["weights"] if _has_ckpt and task_id == _resume_task else {}
+        saved_weights = {}
+        if _has_ckpt and task_id == _resume_task:
+            if _resume_mid_task:
+                saved_weights = _ckpt["weights"]
+            elif _ckpt["task_complete"] and _resume_task == _ckpt["task_id"] + 1:
+                saved_weights = _ckpt["weights"]
         if hasattr(cil_method, "build_public_candidates"):
             public_n = cil_method.build_public_candidates(config, task_id, active_n, num_tasks)
             log(f"{COLORS.OKCYAN}Ours2 task-{task_id} public candidates: {public_n} samples (frozen at task end){COLORS.ENDC}",
@@ -1261,6 +1281,9 @@ def run_no_global_pipeline(config: FCILConfig):
 
                 if hasattr(cil_method, "update_client_drift"):
                     cil_method.update_client_drift(client_models[client_id], paths['X'], paths['y'])
+
+                if config.cil_method == "ours2" and hasattr(cil_method, "update_eva_threshold"):
+                    cil_method.update_eva_threshold(client_id, client_models[client_id], paths['X'], config.batch_size)
                 
                 # Store client weights for consensus building
                 trained_client_ids.append(client_id)
@@ -1282,6 +1305,8 @@ def run_no_global_pipeline(config: FCILConfig):
                 active_models = {cid: client_models[cid] for cid in trained_client_ids}
                 if config.cil_method == "ours2":
                     avg_ekd = 0.0
+                    cil_method._last_survivor_clients = list(range(len(trained_client_ids)))
+                    cil_method._last_survivors = len(trained_client_ids)
                 elif hasattr(cil_method, "update_consensus"):
                     cil_method.update_consensus(scratch_model, client_weights, config)
                     avg_ekd = 0.0
@@ -1301,8 +1326,8 @@ def run_no_global_pipeline(config: FCILConfig):
 
                 if config.cil_method == "ours2":
                     ours2_total = cil_method._last_ce + cil_method._last_kd
-                    log(f"{COLORS.OKCYAN}Ours2 losses: CE={cil_method._last_ce:.4f} | KD={cil_method._last_kd:.4f} | total={ours2_total:.4f} | survivors={cil_method._last_survivors}{COLORS.ENDC}",
-                        f"Ours2 | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | KD={cil_method._last_kd:.4f} | total={ours2_total:.4f} | Survivors={cil_method._last_survivors}")
+                    log(f"{COLORS.OKCYAN}Ours2 losses: CE={cil_method._last_ce:.4f} | KD={cil_method._last_kd:.4f} | total={ours2_total:.4f} | round_clients={cil_method._last_survivors}{COLORS.ENDC}",
+                        f"Ours2 | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | KD={cil_method._last_kd:.4f} | total={ours2_total:.4f} | RoundClients={cil_method._last_survivors}")
                 else:
                     pass_local = cil_method._last_ce + cil_method._last_kd + cil_method._last_proto + cil_method._last_rel
                     pass_total = pass_local + avg_ekd
@@ -1350,13 +1375,19 @@ def run_no_global_pipeline(config: FCILConfig):
             gc.collect()
 
         if config.cil_method == "ours2" and hasattr(cil_method, "freeze_task_memory"):
-            seed_weights = [client_models[cid].get_weights() for cid in range(active_n) if cid in client_models]
+            seed_client_ids = [cid for cid in range(active_n) if cid in client_models]
+            seed_weights = [client_models[cid].get_weights() for cid in seed_client_ids]
             if seed_weights:
                 scratch_model = create_model(current_classes, input_dim, config.batch_size, config.model)
                 _prepare_active_model(cil_method, scratch_model, num_classes)
-                cil_method.freeze_task_memory(scratch_model, seed_weights, config, task_id)
+                cil_method.freeze_task_memory(scratch_model, seed_weights, config, task_id, seed_client_ids)
                 del scratch_model
                 gc.collect()
+                if _ckpt_enabled and ckpt_dir:
+                    end_weights = {cid: client_models[cid].get_weights() for cid in seed_client_ids}
+                    _nog_ckpt_save(ckpt_dir, task_id, config.rounds_per_task - 1, end_weights, cil_method, config, task_complete=True)
+        if _resume_task_end and task_id == _resume_task:
+            _resume_task_end = False
     
     # Final evaluation
     log(f"\n{COLORS.OKGREEN}No-Global Pipeline completed!{COLORS.ENDC}", "No-Global Pipeline completed!")

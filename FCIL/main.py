@@ -145,8 +145,6 @@ def main():
                         help='Clear checkpoint and restart from scratch')
     
     args = parser.parse_args()
-    if args.cil == 'ours2':
-        args.no_filter = True
     if args.feat_lambda is None:
         args.feat_lambda = 1.0 if args.cil == 'exp' else 0.1
 
@@ -225,7 +223,7 @@ def main():
     if args.cil == 'ours2':
         parts.append(f"mem{args.memory}")
         parts.append(f"kg{args.ours_kd_gamma}")
-        parts.append("meanlogits")
+        parts.append(f"eva{0.95}_blom{args.robust_threshold}")
     if args.strategy == 'FedSSD':
         parts.append(f"ssd{args.m_max}")
     log_file = f"results_cil/{'_'.join(parts)}.log"
