@@ -1194,10 +1194,10 @@ def run_no_global_pipeline(config: FCILConfig):
         current_classes = _active_class_count(cil_method, num_classes)
         active_n = _task_active_n(n_clients, num_tasks, task_id)
         saved_weights = _ckpt["weights"] if _has_ckpt and task_id == _resume_task else {}
-        if hasattr(cil_method, "build_public_memory"):
-            public_n, public_per_class = cil_method.build_public_memory(config, task_id, active_n, num_tasks)
-            log(f"{COLORS.OKCYAN}Ours2 public memory: {public_n} samples, up to {public_per_class}/class{COLORS.ENDC}",
-                f"Ours2 | T{task_id} | PublicMemory samples={public_n} per_class={public_per_class}")
+        if hasattr(cil_method, "build_public_candidates"):
+            public_n = cil_method.build_public_candidates(config, task_id, active_n, num_tasks)
+            log(f"{COLORS.OKCYAN}Ours2 task-{task_id} public candidates: {public_n} samples (frozen at task end){COLORS.ENDC}",
+                f"Ours2 | T{task_id} | PublicCandidates samples={public_n}")
         
         # Create/expand client models for this task
         for client_id in range(active_n):
@@ -1280,7 +1280,9 @@ def run_no_global_pipeline(config: FCILConfig):
                 scratch_model = create_model(current_classes, input_dim, config.batch_size, config.model)
                 _prepare_active_model(cil_method, scratch_model, num_classes)
                 active_models = {cid: client_models[cid] for cid in trained_client_ids}
-                if hasattr(cil_method, "update_consensus"):
+                if config.cil_method == "ours2":
+                    avg_ekd = 0.0
+                elif hasattr(cil_method, "update_consensus"):
                     cil_method.update_consensus(scratch_model, client_weights, config)
                     avg_ekd = 0.0
                 else:
@@ -1346,6 +1348,15 @@ def run_no_global_pipeline(config: FCILConfig):
                 _nog_ckpt_save(ckpt_dir, task_id, round_num, round_weights, cil_method, config)
             del client_weights
             gc.collect()
+
+        if config.cil_method == "ours2" and hasattr(cil_method, "freeze_task_memory"):
+            seed_weights = [client_models[cid].get_weights() for cid in range(active_n) if cid in client_models]
+            if seed_weights:
+                scratch_model = create_model(current_classes, input_dim, config.batch_size, config.model)
+                _prepare_active_model(cil_method, scratch_model, num_classes)
+                cil_method.freeze_task_memory(scratch_model, seed_weights, config, task_id)
+                del scratch_model
+                gc.collect()
     
     # Final evaluation
     log(f"\n{COLORS.OKGREEN}No-Global Pipeline completed!{COLORS.ENDC}", "No-Global Pipeline completed!")

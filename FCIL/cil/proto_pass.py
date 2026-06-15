@@ -283,7 +283,9 @@ class PASS(CILMethod):
                 model.nn.train()
                 optimizer.zero_grad()
                 logits = model.nn(X_b, return_logits=True)
-                ce_loss = F.cross_entropy(logits, y_cls, label_smoothing=0.05)
+                n_out = logits.shape[1]
+                valid = (y_cls >= 0) & (y_cls < n_out)
+                ce_loss = F.cross_entropy(logits[valid], y_cls[valid], label_smoothing=0.05) if valid.any() else torch.tensor(0.0, device=dev)
                 feat_wrapper = model.get_feature_model()
                 new_feats = feat_wrapper._features if feat_wrapper._features is not None else \
                     torch.zeros(len(X_b), feat_wrapper._feat_dim, device=dev)
@@ -402,7 +404,9 @@ class PASS(CILMethod):
                 model.nn.train()
                 optimizer.zero_grad()
                 logits = model.nn(X_b, return_logits=True)
-                ce_loss = F.cross_entropy(logits, y_cls, label_smoothing=0.05)
+                n_out = logits.shape[1]
+                valid = (y_cls >= 0) & (y_cls < n_out)
+                ce_loss = F.cross_entropy(logits[valid], y_cls[valid], label_smoothing=0.05) if valid.any() else torch.tensor(0.0, device=dev)
                 feat_wrapper = model.get_feature_model()
                 model.nn(X_b, return_logits=True)
                 new_feats = feat_wrapper._features

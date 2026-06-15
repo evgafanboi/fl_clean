@@ -289,7 +289,9 @@ class Ours(PASS):
                 model.nn.train()
                 optimizer.zero_grad()
                 logits = model.nn(X_b, return_logits=True)
-                ce_loss = F.cross_entropy(logits, y_cls, label_smoothing=0.05)
+                n_out = logits.shape[1]
+                valid = (y_cls >= 0) & (y_cls < n_out)
+                ce_loss = F.cross_entropy(logits[valid], y_cls[valid], label_smoothing=0.05) if valid.any() else torch.tensor(0.0, device=dev)
                 kd_loss = torch.tensor(0.0, device=dev)
                 if self.current_task_id > 0 and self.old_feature_model is not None:
                     feat_wrapper = model.get_feature_model()
