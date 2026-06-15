@@ -15,11 +15,18 @@ def find_task_order_file(partition_type: str, n_clients: int) -> str:
     Find task order file based on partition_type and n_clients.
     Returns exact path or prompts user if multiple found.
     """
-    pattern = f"results/incremental_order/{partition_type}_{n_clients}_client_*.json"
-    matches = glob.glob(pattern)
+    keys = [partition_type]
+    if partition_type.endswith("_cil"):
+        keys.append(partition_type[:-4])
+    if '-' in partition_type:
+        base, client_count = partition_type.rsplit('-', 1)
+        if client_count == str(n_clients):
+            keys.append(base)
+    patterns = [f"results/incremental_order/{key}_{n_clients}_client_*.json" for key in dict.fromkeys(keys)]
+    matches = [path for pattern in patterns for path in glob.glob(pattern)]
     
     if len(matches) == 0:
-        print(f"Error: No task order files found matching pattern: {pattern}")
+        print(f"Error: No task order files found matching patterns: {patterns}")
         print(f"Run partition_task.py first to generate task splits.")
         sys.exit(1)
     elif len(matches) == 1:

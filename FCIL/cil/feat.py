@@ -54,6 +54,11 @@ class FEAT(ICaRL):
         self.client_tail_energy.setdefault(client_id, 0.0)
         self.client_tail_count.setdefault(client_id, 0)
 
+    def get_ckpt_state(self) -> dict:
+        state = super().get_ckpt_state()
+        state.pop('_pt_hook', None)
+        return state
+
     def before_task(self, task_id: int, task_classes: list):
         super().before_task(task_id, task_classes)
         self.tail_classes = list(range(self.old_num_classes))

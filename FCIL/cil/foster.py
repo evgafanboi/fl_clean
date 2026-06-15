@@ -229,8 +229,9 @@ class FOSTER(CILMethod):
     def _get_m_per_class(self, client_id):
         classes = sorted(self.client_seen.get(client_id, []))
         t = len(classes)
-        base = self.memory // t if t > 0 else 0
-        remainder = self.memory - base * t
+        budget = int(self.memory)
+        base = budget // t if t > 0 else 0
+        remainder = budget - base * t
         sizes = {c: base for c in classes}
         for c in classes[:remainder]:
             sizes[c] += 1
