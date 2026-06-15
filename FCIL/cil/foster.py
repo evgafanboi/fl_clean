@@ -190,7 +190,7 @@ class FOSTER(CILMethod):
 
     def compute_stage1_weights(self):
         old_nc = self.old_num_classes
-        samples_old = max(1, self.memory // old_nc) if old_nc > 0 else 0
+        samples_old = max(1, int(self.memory) // old_nc) if old_nc > 0 else 0
         cls_num_list = [samples_old] * old_nc + [
             max(1, self._class_sample_counts.get(self.label_map[c], 1))
             for c in self.class_order[old_nc:]
@@ -206,7 +206,7 @@ class FOSTER(CILMethod):
 
     def compute_stage2_weights(self):
         old_nc = self.old_num_classes
-        samples_old = max(1, self.memory // old_nc) if old_nc > 0 else 0
+        samples_old = max(1, int(self.memory) // old_nc) if old_nc > 0 else 0
         cls_num_list = [samples_old] * old_nc + [
             max(1, self._class_sample_counts.get(self.label_map[c], 1))
             for c in self.class_order[old_nc:]

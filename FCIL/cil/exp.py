@@ -58,7 +58,7 @@ class EXP(FEAT):
     def _tf_synth_arrays(self):
         if self.old_num_classes == 0:
             return None, None, None
-        proto_per_class = self.memory // self.old_num_classes
+        proto_per_class = int(self.memory) // self.old_num_classes
         if proto_per_class <= 0:
             return None, None, None
         labels = np.repeat(np.arange(self.old_num_classes, dtype=np.int64), proto_per_class)
@@ -102,7 +102,7 @@ class EXP(FEAT):
                 feat_box['value'] = inp[0]
 
             self._pt_hook = model.nn.logits.register_forward_pre_hook(_capture)
-            proto_per_class = self.memory // self.old_num_classes if self.old_num_classes > 0 else 0
+            proto_per_class = int(self.memory) // self.old_num_classes if self.old_num_classes > 0 else 0
             synth_labels = []
             for cls_idx in range(self.old_num_classes):
                 synth_labels.extend([cls_idx] * proto_per_class)
