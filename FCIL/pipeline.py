@@ -852,7 +852,10 @@ def run_fcil_pipeline(config: FCILConfig):
                     continue
                 
                 # Reuse client model, just reset weights
+                current_classes = _prepare_active_model(cil_method, global_model, num_classes)
+                _prepare_active_model(cil_method, client_model, num_classes)
                 client_model.set_weights(global_model.get_weights())
+                _prepare_active_model(cil_method, client_model, num_classes)
                 
                 # Train using active train step (SSD or cached CIL)
                 epoch_losses = train_client_fast(client_model, dataset, active_train_step, config.epochs_per_round)
@@ -928,8 +931,10 @@ def run_fcil_pipeline(config: FCILConfig):
                 log(f"{COLORS.WARNING}Round {round_num + 1}: all clients skipped, keeping global model{COLORS.ENDC}",
                     f"Round {round_num + 1}: all clients skipped")
             else:
+                _prepare_active_model(cil_method, global_model, num_classes)
                 global_weights = aggregator.aggregate(client_weights, sample_sizes)
                 global_model.set_weights(global_weights)
+                current_classes = _prepare_active_model(cil_method, global_model, num_classes)
                 del global_weights
 
             if hasattr(cil_method, "proxy_update"):
