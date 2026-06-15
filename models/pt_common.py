@@ -8,7 +8,7 @@ import torch.nn as nn
 def _infer_ctx(dev):
     """Return an autocast context for GPU inference, or a no-op for CPU."""
     if dev.type == 'cuda':
-        return torch.cuda.amp.autocast()
+        return torch.amp.autocast('cuda')
     return contextlib.nullcontext()
 
 
@@ -102,7 +102,7 @@ class _PTLogitsWrapper:
                 for batch in X:
                     x = batch[0] if isinstance(batch, (list, tuple)) else batch
                     parts.append(self._w.nn(x.to(dev, non_blocking=True), return_logits=True))
-        return torch.cat(parts).cpu().numpy()
+        return torch.cat(parts).float().cpu().numpy()
 
     def __call__(self, X, training=False):
         dev = _dev()
@@ -166,7 +166,6 @@ class _PTModelWrapper:
                 batches += 1
             avg = total_loss / max(batches, 1)
             history["loss"].append(avg)
-            print(f"    epoch {epoch + 1}/{epochs}  loss={avg:.4f}")
         return _PTHistory(history)
 
     def predict(self, X, batch_size=None, verbose=None, **kwargs):
@@ -219,11 +218,27 @@ class _PTModelWrapper:
                 f"checkpoint was saved with a different backend (TF vs PT) "
                 f"or a different model architecture."
             )
-        new_sd = {
-            k: torch.from_numpy(np.array(w, dtype=np.float32)).to(dtype=v.dtype)
-            for (k, v), w in zip(sd.items(), weights)
-        }
-        self.nn.load_state_dict(new_sd)
+        keys = list(sd.keys())
+        weight_map = {k: np.array(w, dtype=np.float32) for k, w in zip(keys, weights)}
+        target_classes = self.num_classes
+        if 'logits.weight' in weight_map:
+            target_classes = int(weight_map['logits.weight'].shape[0])
+        if target_classes > self.num_classes:
+            self.expand_classes(target_classes)
+            sd = self.nn.state_dict()
+            keys = list(sd.keys())
+            weight_map = {k: np.array(w, dtype=np.float32) for k, w in zip(keys, weights)}
+        new_sd = {}
+        for k, v in sd.items():
+            wt = torch.from_numpy(weight_map[k]).to(dtype=v.dtype)
+            if wt.shape == v.shape:
+                new_sd[k] = wt
+            else:
+                dst = v.clone()
+                sl = tuple(slice(0, min(a, b)) for a, b in zip(v.shape, wt.shape))
+                dst[sl] = wt[sl]
+                new_sd[k] = dst
+        self.nn.load_state_dict(new_sd, strict=False)
 
     def get_logits_model(self):
         if self._logits_model is None:
@@ -236,4 +251,28 @@ class _PTModelWrapper:
         return self._feature_model
 
     def expand_classes(self, new_num_classes):
-        pass
+        if new_num_classes <= self.num_classes:
+            return
+        old_nn = self.nn
+        old_nc = self.num_classes
+        new_nn = old_nn.__class__(self.input_dim, new_num_classes)
+        old_sd = old_nn.state_dict()
+        new_sd = new_nn.state_dict()
+        for k in new_sd:
+            if k not in old_sd:
+                continue
+            if new_sd[k].shape == old_sd[k].shape:
+                new_sd[k].copy_(old_sd[k])
+            else:
+                slices = tuple(slice(0, s) for s in old_sd[k].shape)
+                new_sd[k][slices] = old_sd[k]
+        new_nn.load_state_dict(new_sd)
+        dev = next(old_nn.parameters()).device
+        new_nn.to(dev)
+        self.nn = new_nn
+        self.num_classes = new_num_classes
+        self._logits_model = None
+        self._feature_model = None
+        lr = self.optimizer.param_groups[0]['lr']
+        eps = self.optimizer.param_groups[0].get('eps', 1e-6)
+        self.optimizer = torch.optim.Adam(self.nn.parameters(), lr=lr, eps=eps)

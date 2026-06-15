@@ -733,7 +733,7 @@ def run_fcil_pipeline(config: FCILConfig):
             cil_method.before_task(task_id, task_classes)
         if hasattr(cil_method, "set_old_model") and task_id > 0 and not _is_mid_task_resume:
             cil_method.set_old_model(global_model)
-        current_classes = _prepare_active_model(cil_method, global_model, num_classes)
+        current_classes = _active_class_count(cil_method, num_classes)
         
         # FOSTER: zero old-class logits so boosted residual starts at 0
         if config.cil_method == "foster" and task_id > 0:
@@ -743,8 +743,7 @@ def run_fcil_pipeline(config: FCILConfig):
         n_clients = 1 if config.strategy == "Centralized" else config.n_clients
         active_n = _task_active_n(n_clients, num_tasks, task_id)
         label_map = cil_method.label_map if hasattr(cil_method, "label_map") else None
-        client_model = create_model(current_classes, input_dim, config.batch_size, config.model)
-        _prepare_active_model(cil_method, client_model, num_classes)
+        client_model = create_model(global_model.num_classes, input_dim, config.batch_size, config.model)
         _opt, _loss_fn = _get_opt_loss(client_model)
         cached_train_step = cil_method.get_train_step(client_model, _opt, _loss_fn)
         

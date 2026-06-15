@@ -321,7 +321,6 @@ class _FedMLBWrapper:
             history["loss_main"].append(avg_m)
             history["loss_hybrid_ce"].append(avg_hce)
             history["loss_hybrid_kl"].append(avg_hkl)
-            print(f"    epoch {epoch + 1}/{epochs}  loss={avg:.4f}  main={avg_m:.4f}  hce={avg_hce:.4f}  hkl={avg_hkl:.4f}")
         return _PTHistory(history)
 
     def predict(self, X, batch_size=None, verbose=None, **kwargs):
