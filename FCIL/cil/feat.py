@@ -66,6 +66,7 @@ class FEAT(ICaRL):
         if _use_tf():
             logits_layer = model.model.get_layer('logits') if hasattr(model, 'model') else model.get_layer('logits')
             feat_dim = int(logits_layer.get_weights()[0].shape[0])
+            num_classes = int(logits_layer.get_weights()[0].shape[1])
             self.etf_weight = _build_etf(feat_dim, num_classes)
             kernel = self.etf_weight.T.astype(np.float32)
             bias = np.zeros((num_classes,), dtype=np.float32)
@@ -75,6 +76,7 @@ class FEAT(ICaRL):
             import torch
             logits_layer = model.nn.logits
             feat_dim = int(logits_layer.in_features)
+            num_classes = int(logits_layer.out_features)
             self.etf_weight = _build_etf(feat_dim, num_classes)
             with torch.no_grad():
                 logits_layer.weight.copy_(torch.from_numpy(self.etf_weight).to(logits_layer.weight.device, dtype=logits_layer.weight.dtype))
@@ -82,8 +84,10 @@ class FEAT(ICaRL):
             logits_layer.weight.requires_grad_(False)
             logits_layer.bias.requires_grad_(False)
         cols = self.etf_weight.T
-        head = cols[:, self.head_classes] if self.head_classes else np.zeros((cols.shape[0], 0), dtype=np.float32)
-        tail = cols[:, self.tail_classes] if self.tail_classes else np.zeros((cols.shape[0], 0), dtype=np.float32)
+        head_classes = [c for c in self.head_classes if c < num_classes]
+        tail_classes = [c for c in self.tail_classes if c < num_classes]
+        head = cols[:, head_classes] if head_classes else np.zeros((cols.shape[0], 0), dtype=np.float32)
+        tail = cols[:, tail_classes] if tail_classes else np.zeros((cols.shape[0], 0), dtype=np.float32)
         self.project_head = _projector(head)
         self.project_tail = _projector(tail)
 

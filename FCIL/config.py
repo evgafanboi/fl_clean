@@ -61,6 +61,7 @@ class FCILConfig:
     feat_temp: float = 0.5
     ours_ekd_epochs: int = 2
     ours_ekd_lambda: float = 1.0
+    ours_proto_lambda: float = 10.0
     ours_proto_rel_lambda: float = 1.0
     ours_encoder_lr_factor: float = 0.5
     # Ours-specific KD scaling (separate from PASS gamma)
@@ -68,6 +69,7 @@ class FCILConfig:
     ours_drift_temp: float = 0.5
     robust_threshold: float = 0.3
     robust_workers: int = 8
+    no_filter: bool = False
 
     # SSD settings
     m_max: float = 1.0

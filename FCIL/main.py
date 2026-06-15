@@ -47,7 +47,7 @@ def main():
     
     # CIL settings
     parser.add_argument('--cil', type=str, default='finetune',
-                        choices=['finetune', 'ewc', 'mas', 'lwf', 'icarl', 'bic', 'foster', 'glfc', 'cbkd', 'pass', 'feat', 'exp', 'ours'],
+                        choices=['finetune', 'ewc', 'mas', 'lwf', 'icarl', 'bic', 'foster', 'glfc', 'cbkd', 'pass', 'feat', 'exp', 'ours', 'ours2'],
                         help='CIL method')
     parser.add_argument('--ewc_lambda', type=float, default=10.0,
                         help='EWC regularization strength (normalized, typical range: 0.1-10)')
@@ -93,6 +93,8 @@ def main():
                         help='Ours: per-task EKD loss weight')
     parser.add_argument('--ours_proto_rel_lambda', type=float, default=1.0,
                         help='Ours: prototype-prototype relation loss weight')
+    parser.add_argument('--ours_proto_lambda', type=float, default=10.0,
+                        help='Ours: prototype augmentation weight for old-class prototypes')
     parser.add_argument('--ours_kd_gamma', type=float, default=1.0,
                         help='Ours: old-feature KD weight')
     parser.add_argument('--ours_encoder_lr_factor', type=float, default=0.5,
@@ -103,6 +105,8 @@ def main():
                         help='Ours: Blom robust-filter discard threshold')
     parser.add_argument('--robust_workers', type=int, default=8,
                         help='Ours: Blom robust-filter workers')
+    parser.add_argument('--no_filter', action='store_true',
+                        help='Ours: disable robust filtering and aggregate client logits by mean')
     parser.add_argument('--m_max', type=float, default=1.0,
                         help='FedSSD: maximum SSD distillation weight')
     parser.add_argument('--encoder_epochs', type=int, default=50,
@@ -134,6 +138,8 @@ def main():
                         help='Clear checkpoint and restart from scratch')
     
     args = parser.parse_args()
+    if args.cil == 'ours2':
+        args.no_filter = True
     if args.feat_lambda is None:
         args.feat_lambda = 1.0 if args.cil == 'exp' else 0.1
 
@@ -202,12 +208,17 @@ def main():
         parts.append(f"rho{args.feat_rho}")
         parts.append(f"temp{args.feat_temp}")
     if args.cil == 'ours':
+        parts.append(f"plam{args.ours_proto_lambda}")
         parts.append(f"ekd{args.ours_ekd_epochs}")
         parts.append(f"ekdl{args.ours_ekd_lambda}")
         parts.append(f"kg{args.ours_kd_gamma}")
         parts.append(f"rel{args.ours_proto_rel_lambda}")
         parts.append(f"enc{args.ours_encoder_lr_factor}")
-        parts.append(f"blom{args.robust_threshold}")
+        parts.append("meanlogits" if args.no_filter else f"blom{args.robust_threshold}")
+    if args.cil == 'ours2':
+        parts.append(f"mem{args.memory}")
+        parts.append(f"kg{args.ours_kd_gamma}")
+        parts.append("meanlogits")
     if args.strategy == 'FedSSD':
         parts.append(f"ssd{args.m_max}")
     log_file = f"results_cil/{'_'.join(parts)}.log"
@@ -241,11 +252,13 @@ def main():
         ours_ekd_epochs=args.ours_ekd_epochs,
         ours_ekd_lambda=args.ours_ekd_lambda,
         ours_kd_gamma=args.ours_kd_gamma,
+        ours_proto_lambda=args.ours_proto_lambda,
         ours_proto_rel_lambda=args.ours_proto_rel_lambda,
         ours_encoder_lr_factor=args.ours_encoder_lr_factor,
         ours_drift_temp=args.ours_drift_temp,
         robust_threshold=args.robust_threshold,
         robust_workers=args.robust_workers,
+        no_filter=args.no_filter,
         partition_type=args.partition_type,
         partition_root=partition_root,
         task_order_file=task_order_file,

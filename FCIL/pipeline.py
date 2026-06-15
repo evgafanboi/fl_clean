@@ -302,8 +302,46 @@ def _metrics_from_cm(cm: np.ndarray, loss: float) -> dict:
         'prec_weighted': float(np.sum(prec * support) / total_support) if total_support > 0 else 0.0,
         'rec_weighted': float(np.sum(rec * support) / total_support) if total_support > 0 else 0.0,
         'f1_weighted': float(np.sum(f1 * support) / total_support) if total_support > 0 else 0.0,
+        'acc_per_class': np.where(support > 0, tp / support, 0.0).tolist(),
+        'prec_per_class': prec.tolist(),
+        'rec_per_class': rec.tolist(),
+        'f1_per_class': f1.tolist(),
+        'support_per_class': support.astype(int).tolist(),
         'cm': cm,
     }
+
+def _per_task_breakdown(cm: np.ndarray, task_order: dict, label_map: dict | None, current_task_id: int) -> list[dict]:
+    out = []
+    for task_idx in range(current_task_id + 1):
+        idxs = sorted({label_map[c] for c in task_order[task_idx] if c in label_map}) if label_map else sorted(task_order[task_idx])
+        tp = np.diag(cm)[idxs].astype(float)
+        support = cm[idxs, :].sum(axis=1)
+        pred = cm[:, idxs].sum(axis=0)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            prec = np.where(pred > 0, tp / pred, 0.0)
+            rec = np.where(support > 0, tp / support, 0.0)
+            f1 = np.where(prec + rec > 0, 2 * prec * rec / (prec + rec), 0.0)
+        total = int(support.sum())
+        out.append({'task': task_idx, 'acc': float(tp.sum()) / total if total > 0 else 0.0,
+                    'f1_macro': float(f1.mean()) if len(f1) else 0.0, 'support': total})
+    return out
+
+def _log_class_task_breakdown(log, results: dict, task_order: dict, label_map: dict | None,
+                              current_task_id: int, class_order: list | None, prefix: str):
+    support = results['support_per_class']
+    inv_map = {v: k for k, v in label_map.items()} if label_map else {}
+    class_parts = []
+    for i, n in enumerate(support):
+        if n <= 0:
+            continue
+        cls = inv_map.get(i, class_order[i] if class_order and i < len(class_order) else i)
+        class_parts.append(f"C{cls}:acc={results['acc_per_class'][i]:.4f},prec={results['prec_per_class'][i]:.4f},rec={results['rec_per_class'][i]:.4f},f1={results['f1_per_class'][i]:.4f},n={n}")
+    task_parts = [f"T{x['task']}:acc={x['acc']:.4f},f1={x['f1_macro']:.4f},n={x['support']}"
+                  for x in _per_task_breakdown(results['cm'], task_order, label_map, current_task_id)]
+    log(f"{prefix} | per-class | " + " | ".join(class_parts),
+        f"{prefix} | per-class | " + " | ".join(class_parts))
+    log(f"{prefix} | per-task | " + " | ".join(task_parts),
+        f"{prefix} | per-task | " + " | ".join(task_parts))
 
 
 def _support_weighted_metrics(task_metrics: list[dict], supports: list[int], loss: float) -> dict:
@@ -492,8 +530,8 @@ def _nog_ckpt_load(ckpt_dir: str, config) -> dict | None:
 def run_fcil_pipeline(config: FCILConfig):
     """Main FCIL pipeline execution"""
     
-    # Route 'ours' to separate no-global pipeline
-    if config.cil_method == "ours":
+    # Ours variants are strictly logits-based: no global-model aggregation path.
+    if config.cil_method in ("ours", "ours2"):
         return run_no_global_pipeline(config)
     
     # Load task order
@@ -588,22 +626,9 @@ def run_fcil_pipeline(config: FCILConfig):
         cil_method = EXP(num_classes=num_classes, memory=config.icarl_memory,
                          lam=config.feat_lambda, rho=config.feat_rho,
                          temp=config.feat_temp)
-    elif config.cil_method == "ours":
-        from .cil.ours import Ours
-        cil_method = Ours(num_classes=num_classes, memory=config.icarl_memory,
-                          lam=config.feat_lambda, rho=config.feat_rho,
-                          temp=config.feat_temp,
-                          ekd_epochs=config.ours_ekd_epochs,
-                          ekd_lambda=config.ours_ekd_lambda,
-                          gamma=config.ours_kd_gamma,
-                          proto_rel_lambda=config.ours_proto_rel_lambda,
-                          encoder_lr_factor=config.ours_encoder_lr_factor,
-                          drift_temp=config.ours_drift_temp,
-                          robust_threshold=config.robust_threshold,
-                          robust_workers=config.robust_workers)
     
     # Initialize global model
-    initial_classes = len(task_order[0]) if config.cil_method in ["lwf", "icarl", "bic", "foster", "glfc", "cbkd", "pass", "feat", "exp", "ours"] else num_classes
+    initial_classes = len(task_order[0]) if config.cil_method in ["lwf", "icarl", "bic", "foster", "glfc", "cbkd", "pass", "feat", "exp"] else num_classes
     global_model = create_model(initial_classes, input_dim, config.batch_size, config.model)
     
     # Logging
@@ -860,7 +885,7 @@ def run_fcil_pipeline(config: FCILConfig):
                     _round_extra.setdefault('L_CE',    []).append(cil_method._last_ce)
                     _round_extra.setdefault('L_KD',    []).append(cil_method._last_kd)
                     _round_extra.setdefault('L_proto', []).append(cil_method._last_proto)
-                if config.cil_method in ("feat", "ours") and task_id > 0:
+                if config.cil_method == "feat" and task_id > 0:
                     _round_extra.setdefault('L_CE',  []).append(cil_method._last_ce)
                     _round_extra.setdefault('L_GSA', []).append(cil_method._last_gsa)
                 if config.cil_method == "exp" and task_id > 0:
@@ -889,47 +914,20 @@ def run_fcil_pipeline(config: FCILConfig):
                 log(f"{COLORS.WARNING}R{round_num + 1} T{task_id}: {_loss_str}{COLORS.ENDC}",
                     f"LOSS | T{task_id} | R{round_num + 1} | {_loss_str}")
 
-            is_ours = config.cil_method == "ours"
-            if not is_ours:
-                if not client_weights:
-                    log(f"{COLORS.WARNING}Round {round_num + 1}: all clients skipped, keeping global model{COLORS.ENDC}",
-                        f"Round {round_num + 1}: all clients skipped")
-                else:
-                    global_weights = aggregator.aggregate(client_weights, sample_sizes)
-                    global_model.set_weights(global_weights)
-                    del global_weights
-
-                if hasattr(cil_method, "proxy_update"):
-                    proxy_perf = cil_method.proxy_update(global_model)
-                    if proxy_perf is not None:
-                        log(
-                            f"{COLORS.OKCYAN}GLFC Proxy: accuracy={proxy_perf:.4f}{COLORS.ENDC}",
-                            f"GLFC Proxy: accuracy={proxy_perf:.4f}")
+            if not client_weights:
+                log(f"{COLORS.WARNING}Round {round_num + 1}: all clients skipped, keeping global model{COLORS.ENDC}",
+                    f"Round {round_num + 1}: all clients skipped")
             else:
-                if hasattr(cil_method, "after_aggregation") and client_weights:
-                    ekd_loss = cil_method.after_aggregation(
-                        None, client_model, client_weights, config,
-                        task_id, round_num, active_n, num_tasks)
-                    if ekd_loss is not None:
-                        log(
-                            f"{COLORS.OKCYAN}Ours: EKD={ekd_loss:.4f}, Blom survivors≈{cil_method._last_survivors}{COLORS.ENDC}",
-                            f"Ours | T{task_id} | R{round_num + 1} | EKD={ekd_loss:.4f} | Blom survivors={cil_method._last_survivors}")
+                global_weights = aggregator.aggregate(client_weights, sample_sizes)
+                global_model.set_weights(global_weights)
+                del global_weights
 
-                if client_weights:
-                    for cid, w in zip(client_ids_trained, client_weights):
-                        if hasattr(cil_method, "set_client"):
-                            cil_method.set_client(cid)
-                        client_model.set_weights(w)
-                        ekd_loss = cil_method.after_aggregation(
-                            client_model, client_model, [w], config,
-                            task_id, round_num, 1, num_tasks)
-                        if ekd_loss is not None:
-                            log(
-                                f"{COLORS.OKCYAN}Ours client {cid}: EKD={ekd_loss:.4f}, Blom survivors≈{cil_method._last_survivors}{COLORS.ENDC}",
-                                f"Ours | T{task_id} | R{round_num + 1} | client={cid} | EKD={ekd_loss:.4f} | Blom survivors={cil_method._last_survivors}")
-                        client_model.set_weights(w)
-                        client_weights[client_ids_trained.index(cid)] = client_model.get_weights()
-                global_model.set_weights(client_weights[0])
+            if hasattr(cil_method, "proxy_update"):
+                proxy_perf = cil_method.proxy_update(global_model)
+                if proxy_perf is not None:
+                    log(
+                        f"{COLORS.OKCYAN}GLFC Proxy: accuracy={proxy_perf:.4f}{COLORS.ENDC}",
+                        f"GLFC Proxy: accuracy={proxy_perf:.4f}")
 
             if hasattr(cil_method, "update_exemplars"):
                 reduce_old = round_num == 0
@@ -942,7 +940,7 @@ def run_fcil_pipeline(config: FCILConfig):
                     )
                     cil_method.update_exemplars(global_model, paths['X'], paths['y'], task_classes, reduce_old=reduce_old)
                 cil_method.rebuild_global_exemplars(global_model)
-                if config.cil_method in ("feat", "ours") and task_id > 0:
+                if config.cil_method == "feat" and task_id > 0:
                     log(
                         f"{COLORS.OKCYAN}FEAT prior: eH={cil_method.global_head_energy:.4f}, eT={cil_method.global_tail_energy:.4f}{COLORS.ENDC}",
                         f"FEAT | T{task_id} | R{round_num + 1} | eH={cil_method.global_head_energy:.4f} | eT={cil_method.global_tail_energy:.4f}")
@@ -980,21 +978,11 @@ def run_fcil_pipeline(config: FCILConfig):
             if round_num in eval_round_ids:
                 X_test, y_test = load_test_data()
                 _yt_labels = y_test if len(y_test.shape) == 1 else np.argmax(y_test, axis=1)
-                _pt_metrics, _pt_ns = [], []
-                for _t in range(task_id + 1):
-                    _t_mask = np.isin(_yt_labels, task_order[_t])
-                    _t_r = evaluate_active_model(
-                        cil_method, global_model, X_test[_t_mask], y_test[_t_mask],
-                        config.batch_size, current_classes)
-                    _pt_metrics.append(_t_r); _pt_ns.append(int(_t_mask.sum()))
-                    _ms = (f"Acc={_t_r['acc']:.4f} | Loss={_t_r['loss']:.4f} | "
-                           f"F1_mac={_t_r['f1_macro']:.4f} | F1_mic={_t_r['f1_micro']:.4f} | "
-                           f"F1_w={_t_r.get('f1_weighted', 0):.4f} | "
-                           f"Prec_mac={_t_r['prec_macro']:.4f} | Rec_mac={_t_r['rec_macro']:.4f}")
-                    log(f"  Task {_t} | {_ms}", f"EVAL | T{task_id} | R{round_num + 1} | Task{_t} | {_ms}")
-                _avg_loss = float(np.average([m['loss'] for m in _pt_metrics], weights=_pt_ns))
-                eval_results = _support_weighted_metrics(_pt_metrics, _pt_ns, _avg_loss)
-                eval_results['cm'] = np.sum([m['cm'] for m in _pt_metrics], axis=0)
+                seen_classes = sorted({c for _t in range(task_id + 1) for c in task_order[_t]})
+                eval_mask = np.isin(_yt_labels, seen_classes)
+                eval_results = evaluate_active_model(
+                    cil_method, global_model, X_test[eval_mask], y_test[eval_mask],
+                    config.batch_size, current_classes)
                 _ms = (f"Acc={eval_results['acc']:.4f} | Loss={eval_results['loss']:.4f} | "
                        f"F1_mac={eval_results['f1_macro']:.4f} | F1_mic={eval_results['f1_micro']:.4f} | "
                        f"F1_w={eval_results['f1_weighted']:.4f} | "
@@ -1007,8 +995,7 @@ def run_fcil_pipeline(config: FCILConfig):
                         eval_results['cm'],
                         str(Path("results_cil/plots") / log_stem / f"T{task_id}_R{round_num + 1}.png"),
                         list(cil_method.class_order) if hasattr(cil_method, "class_order") else None)
-                del _yt_labels, _pt_metrics, _pt_ns
-                del X_test, y_test
+                del _yt_labels, eval_mask, X_test, y_test
                 gc.collect()
 
             # BiC: undo correction so next round trains on uncorrected model
@@ -1034,18 +1021,20 @@ def run_fcil_pipeline(config: FCILConfig):
 
             # Post-compression eval so log reflects actual student quality
             X_test_pc, y_test_pc = load_test_data()
-            for eval_task_id in range(task_id + 1):
-                eval_classes = task_order[eval_task_id]
-                eval_mask = np.isin(
-                    y_test_pc if len(y_test_pc.shape) == 1 else np.argmax(y_test_pc, axis=1),
-                    eval_classes)
-                eval_results = cil_method.evaluate(
-                    global_model, X_test_pc[eval_mask], y_test_pc[eval_mask],
-                    current_classes, logger=log)
-                log(
-                    f"{COLORS.OKCYAN}Post-compress | Task {eval_task_id} | Acc: {eval_results['acc']:.4f}, Loss: {eval_results['loss']:.4f}{COLORS.ENDC}",
-                    f"Post-compress | Task {eval_task_id} | Acc: {eval_results['acc']:.4f} | Loss: {eval_results['loss']:.4f}")
-                del eval_mask
+            _yt_pc_labels = y_test_pc if len(y_test_pc.shape) == 1 else np.argmax(y_test_pc, axis=1)
+            seen_classes = sorted({c for _t in range(task_id + 1) for c in task_order[_t]})
+            eval_mask = np.isin(_yt_pc_labels, seen_classes)
+            eval_results = evaluate_active_model(
+                cil_method, global_model, X_test_pc[eval_mask], y_test_pc[eval_mask],
+                config.batch_size, current_classes)
+            _ms = (f"Acc={eval_results['acc']:.4f} | Loss={eval_results['loss']:.4f} | "
+                   f"F1_mac={eval_results['f1_macro']:.4f} | F1_mic={eval_results['f1_micro']:.4f} | "
+                   f"F1_w={eval_results['f1_weighted']:.4f} | "
+                   f"Prec_mac={eval_results['prec_macro']:.4f} | Rec_mac={eval_results['rec_macro']:.4f} | "
+                   f"Prec_w={eval_results['prec_weighted']:.4f} | Rec_w={eval_results['rec_weighted']:.4f}")
+            log(f"{COLORS.OKCYAN}Post-compress | Tasks 0-{task_id} | {_ms}{COLORS.ENDC}",
+                f"Post-compress | Tasks 0-{task_id} | {_ms}")
+            del eval_mask, _yt_pc_labels
             del X_test_pc, y_test_pc
             gc.collect()
 
@@ -1059,26 +1048,16 @@ def run_fcil_pipeline(config: FCILConfig):
     
     log(f"{COLORS.OKGREEN}Pipeline completed!{COLORS.ENDC}", "Pipeline completed!")
     
-    # Final evaluation: per-task then merged
+    # Final evaluation: pooled over all classes
     X_test, y_test = load_test_data()
     final_classes = len(cil_method.class_order) if hasattr(cil_method, "class_order") else num_classes
     _yt_labels = y_test if len(y_test.shape) == 1 else np.argmax(y_test, axis=1)
-    _pt_metrics, _pt_ns = [], []
-    for _t in range(num_tasks):
-        _t_mask = np.isin(_yt_labels, task_order[_t])
-        _t_r = evaluate_active_model(
-            cil_method, global_model, X_test[_t_mask], y_test[_t_mask],
-            config.batch_size, final_classes)
-        _pt_metrics.append(_t_r); _pt_ns.append(int(_t_mask.sum()))
-        _ms = (f"Acc={_t_r['acc']:.4f} | Loss={_t_r['loss']:.4f} | "
-               f"F1_mac={_t_r['f1_macro']:.4f} | F1_mic={_t_r['f1_micro']:.4f} | "
-               f"F1_w={_t_r.get('f1_weighted', 0):.4f} | "
-               f"Prec_mac={_t_r['prec_macro']:.4f} | Rec_mac={_t_r['rec_macro']:.4f}")
-        log(f"  FINAL Task {_t} | {_ms}", f"FINAL | Task{_t} | {_ms}")
-    _avg_loss = float(np.average([m['loss'] for m in _pt_metrics], weights=_pt_ns))
-    final_results = _support_weighted_metrics(_pt_metrics, _pt_ns, _avg_loss)
-    final_results['cm'] = np.sum([m['cm'] for m in _pt_metrics], axis=0)
-    del X_test, y_test, _yt_labels, _pt_metrics, _pt_ns
+    seen_classes = sorted({c for _t in range(num_tasks) for c in task_order[_t]})
+    eval_mask = np.isin(_yt_labels, seen_classes)
+    final_results = evaluate_active_model(
+        cil_method, global_model, X_test[eval_mask], y_test[eval_mask],
+        config.batch_size, final_classes)
+    del X_test, y_test, _yt_labels, eval_mask
     gc.collect()
     _ms = (f"Acc={final_results['acc']:.4f} | Loss={final_results['loss']:.4f} | "
            f"F1_mac={final_results['f1_macro']:.4f} | F1_mic={final_results['f1_micro']:.4f} | "
@@ -1124,16 +1103,25 @@ def run_no_global_pipeline(config: FCILConfig):
     input_dim = X_test_sample.shape[1]
     del X_test_sample, y_test_sample
     
-    from .cil.ours import Ours
-    cil_method = Ours(num_classes=num_classes, lam=config.cbkd_lambda,
-                      gamma=config.ours_kd_gamma, proto_size=config.cbkd_proto_size,
-                      ekd_epochs=config.ours_ekd_epochs,
-                      ekd_lambda=config.ours_ekd_lambda,
-                      proto_rel_lambda=config.ours_proto_rel_lambda,
-                      encoder_lr_factor=config.ours_encoder_lr_factor,
-                      drift_temp=config.ours_drift_temp,
-                      robust_threshold=config.robust_threshold,
-                      robust_workers=config.robust_workers)
+    if config.cil_method == "ours2":
+        from .cil.ours2 import Ours2
+        cil_method = Ours2(num_classes=num_classes, memory=config.icarl_memory,
+                           kd_gamma=config.ours_kd_gamma,
+                           robust_threshold=config.robust_threshold,
+                           robust_workers=config.robust_workers,
+                           no_filter=True)
+    else:
+        from .cil.ours import Ours
+        cil_method = Ours(num_classes=num_classes, lam=config.ours_proto_lambda,
+                          gamma=config.ours_kd_gamma, proto_size=config.cbkd_proto_size,
+                          ekd_epochs=config.ours_ekd_epochs,
+                          ekd_lambda=config.ours_ekd_lambda,
+                          proto_rel_lambda=config.ours_proto_rel_lambda,
+                          encoder_lr_factor=config.ours_encoder_lr_factor,
+                          drift_temp=config.ours_drift_temp,
+                          robust_threshold=config.robust_threshold,
+                          robust_workers=config.robust_workers,
+                          no_filter=config.no_filter)
     
     # Logging setup
     if config.log_file:
@@ -1191,6 +1179,10 @@ def run_no_global_pipeline(config: FCILConfig):
         current_classes = len(cil_method.class_order)
         active_n = _task_active_n(n_clients, num_tasks, task_id)
         saved_weights = _ckpt["weights"] if _has_ckpt and task_id == _resume_task else {}
+        if hasattr(cil_method, "build_public_memory"):
+            public_n, public_per_class = cil_method.build_public_memory(config, task_id, active_n, num_tasks)
+            log(f"{COLORS.OKCYAN}Ours2 public memory: {public_n} samples, up to {public_per_class}/class{COLORS.ENDC}",
+                f"Ours2 | T{task_id} | PublicMemory samples={public_n} per_class={public_per_class}")
         
         # Create/expand client models for this task
         for client_id in range(active_n):
@@ -1235,10 +1227,13 @@ def run_no_global_pipeline(config: FCILConfig):
                     config.n_clients, client_id, task_id, config.strategy
                 )
                 
-                # Build dataset for current task data
-                dataset, n_samples = create_dataset(
-                    paths['X'], paths['y'], config.batch_size, current_classes, cil_method.label_map
-                )
+                # Build dataset for current task data (Ours2 mixes private + public memory)
+                if hasattr(cil_method, "build_dataset"):
+                    dataset, n_samples = cil_method.build_dataset(paths['X'], paths['y'], config.batch_size)
+                else:
+                    dataset, n_samples = create_dataset(
+                        paths['X'], paths['y'], config.batch_size, current_classes, cil_method.label_map
+                    )
                 
                 if n_samples == 0:
                     continue
@@ -1270,63 +1265,68 @@ def run_no_global_pipeline(config: FCILConfig):
                 log(f"{COLORS.WARNING}R{round_num + 1} T{task_id}: Avg loss={avg_loss:.4f} ({len(round_losses)} clients){COLORS.ENDC}",
                     f"LOSS | T{task_id} | R{round_num + 1} | Avg loss={avg_loss:.4f} ({len(round_losses)} clients)")
             
-            if trained_client_ids and hasattr(cil_method, "aggregate_prototypes"):
-                client_prototypes = [cil_method.prototypes.get(cid, {}) for cid in trained_client_ids]
-                client_counts = [cil_method.client_proto_counts.get(cid, {}) for cid in trained_client_ids]
-                if any(client_prototypes):
-                    cil_method.aggregate_prototypes(client_prototypes, client_counts)
-                    log(f"{COLORS.OKCYAN}Proto aggregation: {len(cil_method.global_prototypes)} classes from {len(trained_client_ids)} clients | var={cil_method.global_variance:.4f}{COLORS.ENDC}",
-                        f"Ours | T{task_id} | R{round_num + 1} | ProtoAgg classes={len(cil_method.global_prototypes)} clients={len(trained_client_ids)} var={cil_method.global_variance:.4f}")
-
             # Stage 2: EKD distillation on shared consensus (single scratch model)
             if client_weights:
                 scratch_model = create_model(current_classes, input_dim, config.batch_size, config.model)
                 if hasattr(cil_method, "prepare_model"):
                     cil_method.prepare_model(scratch_model)
                 active_models = {cid: client_models[cid] for cid in trained_client_ids}
-                avg_ekd = cil_method.distill_round(scratch_model, active_models, client_weights, config, task_id, active_n, num_tasks)
+                if hasattr(cil_method, "update_consensus"):
+                    cil_method.update_consensus(scratch_model, client_weights, config)
+                    avg_ekd = 0.0
+                else:
+                    avg_ekd = cil_method.distill_round(scratch_model, active_models, client_weights, config, task_id, active_n, num_tasks)
                 del scratch_model
                 gc.collect()
+                survivor_client_ids = [trained_client_ids[i] for i in cil_method._last_survivor_clients]
+                if survivor_client_ids and hasattr(cil_method, "aggregate_prototypes"):
+                    client_prototypes = [cil_method.prototypes.get(cid, {}) for cid in survivor_client_ids]
+                    client_counts = [cil_method.client_proto_counts.get(cid, {}) for cid in survivor_client_ids]
+                    if any(client_prototypes):
+                        cil_method.aggregate_prototypes(client_prototypes, client_counts)
+                        log(f"{COLORS.OKCYAN}Proto aggregation: {len(cil_method.global_prototypes)} classes from {len(survivor_client_ids)}/{len(trained_client_ids)} Blom survivors | var={cil_method.global_variance:.4f}{COLORS.ENDC}",
+                            f"Ours | T{task_id} | R{round_num + 1} | ProtoAgg classes={len(cil_method.global_prototypes)} survivor_clients={len(survivor_client_ids)}/{len(trained_client_ids)} var={cil_method.global_variance:.4f}")
                 client_weights = [client_models[cid].get_weights() for cid in trained_client_ids]
 
-                pass_local = cil_method._last_ce + cil_method._last_kd + cil_method._last_proto + cil_method._last_rel
-                pass_total = pass_local + avg_ekd
-                log(f"{COLORS.OKCYAN}Ours losses: CE={cil_method._last_ce:.4f} | old_KD={cil_method._last_kd:.4f} | protoAug={cil_method._last_proto:.4f} | protoRel={cil_method._last_rel:.4f} | EKD={avg_ekd:.4f} | total={pass_total:.4f} | survivors≈{cil_method._last_survivors}{COLORS.ENDC}",
-                    f"Ours | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | old_KD={cil_method._last_kd:.4f} | protoAug={cil_method._last_proto:.4f} | protoRel={cil_method._last_rel:.4f} | EKD={avg_ekd:.4f} | total={pass_total:.4f} | Survivors={cil_method._last_survivors}")
+                if config.cil_method == "ours2":
+                    ours2_total = cil_method._last_ce + cil_method._last_kd
+                    log(f"{COLORS.OKCYAN}Ours2 losses: CE={cil_method._last_ce:.4f} | KD={cil_method._last_kd:.4f} | total={ours2_total:.4f} | survivors={cil_method._last_survivors}{COLORS.ENDC}",
+                        f"Ours2 | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | KD={cil_method._last_kd:.4f} | total={ours2_total:.4f} | Survivors={cil_method._last_survivors}")
+                else:
+                    pass_local = cil_method._last_ce + cil_method._last_kd + cil_method._last_proto + cil_method._last_rel
+                    pass_total = pass_local + avg_ekd
+                    log(f"{COLORS.OKCYAN}Ours losses: CE={cil_method._last_ce:.4f} | old_KD={cil_method._last_kd:.4f} | protoAug={cil_method._last_proto:.4f} | protoRel={cil_method._last_rel:.4f} | EKD={avg_ekd:.4f} | total={pass_total:.4f} | survivors≈{cil_method._last_survivors}{COLORS.ENDC}",
+                        f"Ours | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | old_KD={cil_method._last_kd:.4f} | protoAug={cil_method._last_proto:.4f} | protoRel={cil_method._last_rel:.4f} | EKD={avg_ekd:.4f} | total={pass_total:.4f} | Survivors={cil_method._last_survivors}")
             
             # Evaluation at scheduled rounds
             if round_num in eval_round_ids and client_weights:
                 X_test, y_test = load_test_data()
                 _yt_labels = y_test if len(y_test.shape) == 1 else np.argmax(y_test, axis=1)
-                task_results = []
-                task_supports = []
-                for eval_task_id in range(task_id + 1):
-                    task_mask = np.isin(_yt_labels, task_order[eval_task_id])
-                    task_support = int(task_mask.sum())
-                    if task_support == 0:
-                        continue
-                    client_results = []
-                    for client_id in range(len(client_weights)):
-                        if client_id in client_models:
-                            client_results.append(evaluate_active_model(
-                                cil_method, client_models[client_id],
-                                X_test[task_mask], y_test[task_mask],
-                                config.batch_size, current_classes))
-                    if client_results:
-                        avg_result = {'loss': float(np.mean([r['loss'] for r in client_results]))}
-                        for key in ['acc', 'prec_macro', 'rec_macro', 'f1_macro', 'prec_micro', 'rec_micro', 'f1_micro', 'prec_weighted', 'rec_weighted', 'f1_weighted']:
-                            avg_result[key] = float(np.mean([r[key] for r in client_results]))
-                        avg_result['cm'] = np.sum([r['cm'] for r in client_results], axis=0)
-                        task_results.append(avg_result)
-                        task_supports.append(task_support)
-                        log(
-                            f"  Task {eval_task_id} | Acc={avg_result['acc']:.4f} | F1_mac={avg_result['f1_macro']:.4f} | F1_mic={avg_result['f1_micro']:.4f} | F1_w={avg_result['f1_weighted']:.4f} | Prec_mac={avg_result['prec_macro']:.4f} | Rec_mac={avg_result['rec_macro']:.4f} | Prec_mic={avg_result['prec_micro']:.4f} | Rec_mic={avg_result['rec_micro']:.4f} | Prec_w={avg_result['prec_weighted']:.4f} | Rec_w={avg_result['rec_weighted']:.4f}",
-                            f"EVAL | T{task_id} | R{round_num + 1} | Task{eval_task_id} | Acc={avg_result['acc']:.4f} | F1_mac={avg_result['f1_macro']:.4f} | F1_mic={avg_result['f1_micro']:.4f} | F1_w={avg_result['f1_weighted']:.4f} | Prec_mac={avg_result['prec_macro']:.4f} | Rec_mac={avg_result['rec_macro']:.4f} | Prec_mic={avg_result['prec_micro']:.4f} | Rec_mic={avg_result['rec_micro']:.4f} | Prec_w={avg_result['prec_weighted']:.4f} | Rec_w={avg_result['rec_weighted']:.4f}")
-                if task_results:
-                    overall_result = _support_weighted_metrics(task_results, task_supports, float(np.mean([r['loss'] for r in task_results])))
-                    log(
-                        f"{COLORS.OKGREEN}Round {round_num + 1} | Tasks 0-{task_id} | Acc={overall_result['acc']:.4f} | F1_mac={overall_result['f1_macro']:.4f} | F1_mic={overall_result['f1_micro']:.4f} | F1_w={overall_result['f1_weighted']:.4f} | Prec_mac={overall_result['prec_macro']:.4f} | Rec_mac={overall_result['rec_macro']:.4f} | Prec_mic={overall_result['prec_micro']:.4f} | Rec_mic={overall_result['rec_micro']:.4f} | Prec_w={overall_result['prec_weighted']:.4f} | Rec_w={overall_result['rec_weighted']:.4f}{COLORS.ENDC}",
-                        f"EVAL | T{task_id} | R{round_num + 1} | Acc={overall_result['acc']:.4f} | F1_mac={overall_result['f1_macro']:.4f} | F1_mic={overall_result['f1_micro']:.4f} | F1_w={overall_result['f1_weighted']:.4f} | Prec_mac={overall_result['prec_macro']:.4f} | Rec_mac={overall_result['rec_macro']:.4f} | Prec_mic={overall_result['prec_micro']:.4f} | Rec_mic={overall_result['rec_micro']:.4f} | Prec_w={overall_result['prec_weighted']:.4f} | Rec_w={overall_result['rec_weighted']:.4f}")
+                seen_classes = sorted({c for _t in range(task_id + 1) for c in task_order[_t]})
+                eval_mask = np.isin(_yt_labels, seen_classes)
+                X_eval = X_test[eval_mask]
+                y_eval = y_test[eval_mask]
+                client_results = [evaluate_active_model(
+                    cil_method, client_models[cid], X_eval, y_eval,
+                    config.batch_size, current_classes)
+                    for cid in trained_client_ids if cid in client_models]
+                if client_results:
+                    # Average across client models instead of summing to avoid inflating support counts
+                    pooled_cm = np.mean([r['cm'] for r in client_results], axis=0)
+                    pooled_loss = float(np.mean([r['loss'] for r in client_results]))
+                    overall_result = _metrics_from_cm(pooled_cm, pooled_loss)
+                    overall_result['cm'] = pooled_cm
+                    _ms = (f"Acc={overall_result['acc']:.4f} | Loss={overall_result['loss']:.4f} | "
+                           f"F1_mac={overall_result['f1_macro']:.4f} | F1_mic={overall_result['f1_micro']:.4f} | "
+                           f"F1_w={overall_result['f1_weighted']:.4f} | "
+                           f"Prec_mac={overall_result['prec_macro']:.4f} | Rec_mac={overall_result['rec_macro']:.4f} | "
+                           f"Prec_w={overall_result['prec_weighted']:.4f} | Rec_w={overall_result['rec_weighted']:.4f}")
+                    log(f"{COLORS.OKGREEN}Round {round_num + 1} | Tasks 0-{task_id} | {_ms}{COLORS.ENDC}",
+                        f"EVAL | T{task_id} | R{round_num + 1} | {_ms}")
+                    _log_class_task_breakdown(log, overall_result, task_order, cil_method.label_map,
+                                              task_id, getattr(cil_method, 'class_order', None),
+                                              f"EVAL | T{task_id} | R{round_num + 1}")
+                del eval_mask, X_eval, y_eval
                 del X_test, y_test, _yt_labels
                 gc.collect()
             
@@ -1344,38 +1344,30 @@ def run_no_global_pipeline(config: FCILConfig):
     X_test, y_test = load_test_data()
     _yt_labels = y_test if len(y_test.shape) == 1 else np.argmax(y_test, axis=1)
     final_classes = len(cil_method.class_order)
-    
-    final_task_results = []
-    final_task_supports = []
-    for eval_task_id in range(num_tasks):
-        task_mask = np.isin(_yt_labels, task_order[eval_task_id])
-        task_support = int(task_mask.sum())
-        if task_support == 0:
-            continue
-        client_results = []
-        for client_id, client_model in client_models.items():
-            client_results.append(evaluate_active_model(
-                cil_method, client_model,
-                X_test[task_mask], y_test[task_mask],
-                config.batch_size, final_classes))
-        if client_results:
-            avg_result = {'loss': float(np.mean([r['loss'] for r in client_results]))}
-            for key in ['acc', 'prec_macro', 'rec_macro', 'f1_macro', 'prec_micro', 'rec_micro', 'f1_micro', 'prec_weighted', 'rec_weighted', 'f1_weighted']:
-                avg_result[key] = float(np.mean([r[key] for r in client_results]))
-            avg_result['cm'] = np.sum([r['cm'] for r in client_results], axis=0)
-            final_task_results.append(avg_result)
-            final_task_supports.append(task_support)
-            log(
-                f"  FINAL Task {eval_task_id} | Acc={avg_result['acc']:.4f} | F1_mac={avg_result['f1_macro']:.4f} | F1_mic={avg_result['f1_micro']:.4f} | F1_w={avg_result['f1_weighted']:.4f} | Prec_mac={avg_result['prec_macro']:.4f} | Rec_mac={avg_result['rec_macro']:.4f} | Prec_mic={avg_result['prec_micro']:.4f} | Rec_mic={avg_result['rec_micro']:.4f} | Prec_w={avg_result['prec_weighted']:.4f} | Rec_w={avg_result['rec_weighted']:.4f}",
-                f"FINAL | Task{eval_task_id} | Acc={avg_result['acc']:.4f} | F1_mac={avg_result['f1_macro']:.4f} | F1_mic={avg_result['f1_micro']:.4f} | F1_w={avg_result['f1_weighted']:.4f} | Prec_mac={avg_result['prec_macro']:.4f} | Rec_mac={avg_result['rec_macro']:.4f} | Prec_mic={avg_result['prec_micro']:.4f} | Rec_mic={avg_result['rec_micro']:.4f} | Prec_w={avg_result['prec_weighted']:.4f} | Rec_w={avg_result['rec_weighted']:.4f}")
-    
-    if final_task_results:
-        final_result = _support_weighted_metrics(final_task_results, final_task_supports, float(np.mean([r['loss'] for r in final_task_results])))
-        log(
-            f"{COLORS.OKCYAN}FINAL | all {num_classes} classes | Acc={final_result['acc']:.4f} | F1_mac={final_result['f1_macro']:.4f} | F1_mic={final_result['f1_micro']:.4f} | F1_w={final_result['f1_weighted']:.4f} | Prec_mac={final_result['prec_macro']:.4f} | Rec_mac={final_result['rec_macro']:.4f} | Prec_mic={final_result['prec_micro']:.4f} | Rec_mic={final_result['rec_micro']:.4f} | Prec_w={final_result['prec_weighted']:.4f} | Rec_w={final_result['rec_weighted']:.4f}{COLORS.ENDC}",
-            f"FINAL | all {num_classes} classes | Acc={final_result['acc']:.4f} | F1_mac={final_result['f1_macro']:.4f} | F1_mic={final_result['f1_micro']:.4f} | F1_w={final_result['f1_weighted']:.4f} | Prec_mac={final_result['prec_macro']:.4f} | Rec_mac={final_result['rec_macro']:.4f} | Prec_mic={final_result['prec_micro']:.4f} | Rec_mic={final_result['rec_micro']:.4f} | Prec_w={final_result['prec_weighted']:.4f} | Rec_w={final_result['rec_weighted']:.4f}")
-    
-    del X_test, y_test, _yt_labels
+    seen_classes = sorted({c for _t in range(num_tasks) for c in task_order[_t]})
+    eval_mask = np.isin(_yt_labels, seen_classes)
+    X_eval = X_test[eval_mask]
+    y_eval = y_test[eval_mask]
+    client_results = [evaluate_active_model(
+        cil_method, cm, X_eval, y_eval,
+        config.batch_size, final_classes)
+        for cm in client_models.values()]
+    if client_results:
+        pooled_cm = np.mean([r['cm'] for r in client_results], axis=0)
+        pooled_loss = float(np.mean([r['loss'] for r in client_results]))
+        final_result = _metrics_from_cm(pooled_cm, pooled_loss)
+        final_result['cm'] = pooled_cm
+        _ms = (f"Acc={final_result['acc']:.4f} | Loss={final_result['loss']:.4f} | "
+               f"F1_mac={final_result['f1_macro']:.4f} | F1_mic={final_result['f1_micro']:.4f} | "
+               f"F1_w={final_result['f1_weighted']:.4f} | "
+               f"Prec_mac={final_result['prec_macro']:.4f} | Rec_mac={final_result['rec_macro']:.4f} | "
+               f"Prec_w={final_result['prec_weighted']:.4f} | Rec_w={final_result['rec_weighted']:.4f}")
+        log(f"{COLORS.OKCYAN}FINAL | all {num_classes} classes | {_ms}{COLORS.ENDC}",
+            f"FINAL | all {num_classes} classes | {_ms}")
+        _log_class_task_breakdown(log, final_result, task_order, cil_method.label_map,
+                                  num_tasks - 1, getattr(cil_method, 'class_order', None),
+                                  "FINAL")
+    del X_test, y_test, _yt_labels, eval_mask, X_eval, y_eval
     gc.collect()
     
     if log_file:

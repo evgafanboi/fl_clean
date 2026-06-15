@@ -10,7 +10,7 @@ class Ours(PASS):
     def __init__(self, num_classes: int, lam: float = 10.0, gamma: float = 10.0, proto_size: int = 50,
                  ekd_epochs: int = 1, ekd_lambda: float = 1.0,
                  proto_rel_lambda: float = 1.0, encoder_lr_factor: float = 0.1, drift_temp: float = 0.5,
-                 robust_threshold: float = 0.3, robust_workers: int = 8, **kwargs):
+                 robust_threshold: float = 0.3, robust_workers: int = 8, no_filter: bool = False, **kwargs):
         super().__init__(num_classes=num_classes, lam=lam, gamma=gamma, proto_size=proto_size, **kwargs)
         self.name = 'Ours'
         self.ekd_epochs = ekd_epochs
@@ -19,6 +19,7 @@ class Ours(PASS):
         self.encoder_lr_factor = encoder_lr_factor
         self.drift_temp = drift_temp
         self.robust_filter = RobustFilterV3(robust_threshold=robust_threshold, reference="Blom", workers=robust_workers)
+        self.no_filter = no_filter
         self._last_ekd = 0.0
         self._last_survivors = 0
         self._last_survivor_clients = []
@@ -123,6 +124,8 @@ class Ours(PASS):
         return predictor.predict(X, batch_size=batch_size)
 
     def _blom_mean(self, logits, discard_mask=None):
+        if self.no_filter:
+            return logits.mean(axis=1).astype(np.float32)
         if discard_mask is None:
             discard_mask, _ = self.robust_filter.count_discards_mask(logits)
         keep = ~discard_mask
@@ -235,7 +238,8 @@ class Ours(PASS):
 
     def extra_metrics(self):
         out = super().extra_metrics()
-        out.update({'ours_ekd': self._last_ekd, 'ours_blom_survivors': self._last_survivors, 'ours_proto_rel': self._last_rel})
+        out.update({'ours_ekd': self._last_ekd, 'ours_blom_survivors': self._last_survivors, 'ours_proto_rel': self._last_rel,
+                    'ours_r_std': getattr(self, '_last_r_std', 0.0), 'ours_d_min': getattr(self, '_last_d_min', 0.0)})
         return out
 
     def get_finetune_step(self, model, optimizer, loss_fn):
@@ -247,15 +251,37 @@ class Ours(PASS):
             if self.old_feature_model is not None:
                 self.old_feature_model.to(dev)
             cid = self.active_client
+            # protoAug uses ONLY old-class prototypes for stability;
+            # plasticity comes from real CE on the current-task batch and from
+            # drift-compensated prototypes already updated via update_client_drift.
             proto_classes = sorted(self.global_prototypes.keys()) if self.current_task_id > 0 else []
             old_proto_classes = [c for c in proto_classes if c not in self.current_task_classes]
-            if proto_classes:
-                base_vecs = torch.from_numpy(np.stack([self.global_prototypes[c] for c in proto_classes])).float().to(dev)
-                base_labels = torch.tensor([self.label_map[c] for c in proto_classes], dtype=torch.long, device=dev)
-                r_std = float(np.sqrt(max(self.global_variance, 1e-8)))
+            base_vecs = base_labels = old_base = old_rel = None
+            r_std = 0.0
             if old_proto_classes:
-                old_base = torch.from_numpy(np.stack([self.global_prototypes[c] for c in old_proto_classes])).float().to(dev)
+                base_arr = np.stack([self.global_prototypes[c] for c in old_proto_classes]).astype(np.float32)
+                base_vecs = torch.from_numpy(base_arr).to(dev)
+                base_labels = torch.tensor([self.label_map[c] for c in old_proto_classes], dtype=torch.long, device=dev)
+                old_base = base_vecs
                 old_rel = F.normalize(old_base, dim=1) @ F.normalize(old_base, dim=1).t()
+                # Architecture-aware adaptive noise bound:
+                # 1) per-dim std under chi(D) is sqrt(D) * r_std => want sqrt(D) * r_std <= 0.5 * d_min
+                #    so synthetic samples stay inside the prototype's Voronoi cell.
+                # 2) cap from aggregated empirical variance to avoid blowing up
+                #    when prototypes are degenerate / very close.
+                D = int(base_arr.shape[1])
+                if base_arr.shape[0] >= 2:
+                    diff = base_arr[:, None, :] - base_arr[None, :, :]
+                    d2 = (diff * diff).sum(axis=-1)
+                    np.fill_diagonal(d2, np.inf)
+                    d_min = float(np.sqrt(d2.min()))
+                else:
+                    d_min = float(np.linalg.norm(base_arr[0]) + 1e-6)
+                geom_cap = 0.5 * d_min / np.sqrt(max(D, 1))
+                emp_std = float(np.sqrt(max(self.global_variance, 1e-8)))
+                r_std = float(min(emp_std, geom_cap))
+                self._last_r_std = r_std
+                self._last_d_min = d_min
             def step_pt(X_b, y_b):
                 X_b = X_b.to(dev); y_b = y_b.to(dev)
                 y_cls = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
@@ -277,7 +303,7 @@ class Ours(PASS):
                     kd_loss = F.mse_loss(new_feats, old_feats)
                 proto_loss = torch.tensor(0.0, device=dev)
                 rel_loss = torch.tensor(0.0, device=dev)
-                if proto_classes:
+                if base_vecs is not None:
                     noise = torch.randn_like(base_vecs) * r_std
                     proto_loss = F.cross_entropy(model.nn.logits(base_vecs + noise), base_labels)
                 if old_proto_classes and len(old_proto_classes) > 1:
@@ -339,9 +365,11 @@ class Ours(PASS):
                 pred = self._raw_logits(scratch_model, X_chunk, config.batch_size)
                 preds.append(np.clip(pred, -LOGIT_CLIP, LOGIT_CLIP).astype(np.float32))
             logits = np.stack(preds, axis=1)
-            discard_mask, _ = self.robust_filter.count_discards_mask(logits)
-            total_counts += discard_mask.sum(axis=0)
-            total_rows += len(X_chunk)
+            discard_mask = None
+            if not self.no_filter:
+                discard_mask, _ = self.robust_filter.count_discards_mask(logits)
+                total_counts += discard_mask.sum(axis=0)
+                total_rows += len(X_chunk)
             consensus = self._blom_mean(logits, discard_mask)
             del preds, logits
             for student in client_models.values():
@@ -349,12 +377,17 @@ class Ours(PASS):
             chunks += 1
             del X_chunk, consensus
             gc.collect()
-        discard_frac = total_counts.astype(np.float64) / max(total_rows, 1)
-        survivor = discard_frac <= self.robust_filter.robust_threshold
-        self._last_survivor_clients = [i for i in range(len(client_weights)) if survivor[i]]
-        self._last_survivors = int(survivor.sum())
-        n_failed = int((~survivor).sum())
-        failed_ratios = [(client_id, round(float(discard_frac[client_id]), 4)) for client_id in range(len(client_weights)) if not survivor[client_id]][:10]
-        print(f"  V3 filter: threshold={self.robust_filter.robust_threshold:.2f} | {n_failed}/{len(client_weights)} clients failed | top discard ratios: {failed_ratios}")
+        if self.no_filter:
+            self._last_survivor_clients = list(range(len(client_weights)))
+            self._last_survivors = len(client_weights)
+            print(f"  Mean logits: robust filter disabled | 0/{len(client_weights)} clients failed")
+        else:
+            discard_frac = total_counts.astype(np.float64) / max(total_rows, 1)
+            survivor = discard_frac <= self.robust_filter.robust_threshold
+            self._last_survivor_clients = [i for i in range(len(client_weights)) if survivor[i]]
+            self._last_survivors = int(survivor.sum())
+            n_failed = int((~survivor).sum())
+            failed_ratios = [(client_id, round(float(discard_frac[client_id]), 4)) for client_id in range(len(client_weights)) if not survivor[client_id]][:10]
+            print(f"  V3 filter: threshold={self.robust_filter.robust_threshold:.2f} | {n_failed}/{len(client_weights)} clients failed | top discard ratios: {failed_ratios}")
         self._last_ekd = total_ekd / max(chunks * max(len(client_models), 1), 1)
         return self._last_ekd
