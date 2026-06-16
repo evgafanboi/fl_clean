@@ -550,7 +550,7 @@ def run_fcil_pipeline(config: FCILConfig):
     """Main FCIL pipeline execution"""
     
     # Ours variants are strictly logits-based: no global-model aggregation path.
-    if config.cil_method in ("ours", "ours2"):
+    if config.cil_method in ("ours", "ours2", "ours3"):
         return run_no_global_pipeline(config)
     
     # Load task order
@@ -744,8 +744,6 @@ def run_fcil_pipeline(config: FCILConfig):
         active_n = _task_active_n(n_clients, num_tasks, task_id)
         label_map = cil_method.label_map if hasattr(cil_method, "label_map") else None
         client_model = create_model(global_model.num_classes, input_dim, config.batch_size, config.model)
-        _opt, _loss_fn = _get_opt_loss(client_model)
-        cached_train_step = cil_method.get_train_step(client_model, _opt, _loss_fn)
         
         # SSD: merge public data to temp file once per task
         ssd_pub_X_path, ssd_pub_y_path = None, None
@@ -809,8 +807,6 @@ def run_fcil_pipeline(config: FCILConfig):
                     M_class_tf, m_max_tf)
                 del X_pub, y_pub
                 gc.collect()
-
-            active_train_step = ssd_train_step if ssd_train_step is not None else cached_train_step
             
             client_weights = list(_initial_cw)
             sample_sizes = list(_initial_ss)
@@ -844,17 +840,15 @@ def run_fcil_pipeline(config: FCILConfig):
                 client_model.set_weights(global_model.get_weights())
                 current_classes = _prepare_active_model(cil_method, global_model, num_classes)
                 _prepare_active_model(cil_method, client_model, num_classes)
-                active_train_step = ssd_train_step if ssd_train_step is not None else cached_train_step
-                if config.cil_method in ("ewc", "mas", "cbkd", "pass", "exp", "feat"):
-                    _c_opt, _c_loss = _get_opt_loss(client_model)
-                    if ssd_train_step is not None:
-                        local_logits_model = client_model.get_logits_model()
-                        active_train_step = cil_method.get_ssd_train_step(
-                            client_model, _c_opt, _c_loss,
-                            global_logits_model, local_logits_model,
-                            M_class_tf, m_max_tf)
-                    else:
-                        active_train_step = cil_method.get_train_step(client_model, _c_opt, _c_loss)
+                _c_opt, _c_loss = _get_opt_loss(client_model)
+                if ssd_train_step is not None:
+                    local_logits_model = client_model.get_logits_model()
+                    active_train_step = cil_method.get_ssd_train_step(
+                        client_model, _c_opt, _c_loss,
+                        global_logits_model, local_logits_model,
+                        M_class_tf, m_max_tf)
+                else:
+                    active_train_step = cil_method.get_train_step(client_model, _c_opt, _c_loss)
                 
                 # Train using active train step (SSD or cached CIL)
                 epoch_losses = train_client_fast(client_model, dataset, active_train_step, config.epochs_per_round)
@@ -1055,7 +1049,7 @@ def run_fcil_pipeline(config: FCILConfig):
         old_classes.update(task_classes)
 
         # Clean up reusable client model for this task
-        del client_model, cached_train_step
+        del client_model
         gc.collect()
         
         # EWC/MAS importance now computed per-client inside the client loop above
@@ -1122,7 +1116,17 @@ def run_no_global_pipeline(config: FCILConfig):
         cil_method = Ours2(num_classes=num_classes, memory=config.icarl_memory,
                            kd_gamma=config.ours_kd_gamma,
                            robust_threshold=config.robust_threshold,
-                           robust_workers=config.robust_workers)
+                           robust_workers=config.robust_workers,
+                           ekd_epochs=config.ours_ekd_epochs,
+                           ekd_lambda=config.ours_ekd_lambda)
+    elif config.cil_method == "ours3":
+        from .cil.ours3 import Ours3
+        cil_method = Ours3(num_classes=num_classes, memory=config.icarl_memory,
+                           kd_gamma=config.ours_kd_gamma,
+                           robust_threshold=config.robust_threshold,
+                           robust_workers=config.robust_workers,
+                           ekd_epochs=config.ours_ekd_epochs,
+                           ekd_lambda=config.ours_ekd_lambda)
     else:
         from .cil.ours import Ours
         cil_method = Ours(num_classes=num_classes, lam=config.ours_proto_lambda,
@@ -1215,8 +1219,8 @@ def run_no_global_pipeline(config: FCILConfig):
                 saved_weights = _ckpt["weights"]
         if hasattr(cil_method, "build_public_candidates"):
             public_n = cil_method.build_public_candidates(config, task_id, active_n, num_tasks)
-            log(f"{COLORS.OKCYAN}Ours2 task-{task_id} public candidates: {public_n} samples (frozen at task end){COLORS.ENDC}",
-                f"Ours2 | T{task_id} | PublicCandidates samples={public_n}")
+            log(f"{COLORS.OKCYAN}{cil_method.name} task-{task_id} public candidates: {public_n} samples (frozen at task end){COLORS.ENDC}",
+                f"{cil_method.name} | T{task_id} | PublicCandidates samples={public_n}")
         
         # Create/expand client models for this task
         for client_id in range(active_n):
@@ -1230,7 +1234,7 @@ def run_no_global_pipeline(config: FCILConfig):
         log(f"\n{COLORS.HEADER}TASK {task_id}: {len(task_classes)} classes - {task_classes}{COLORS.ENDC}",
             f"TASK {task_id}: {len(task_classes)} classes - {task_classes}")
         
-        local_epochs = max(config.epochs_per_round - 2, 0)
+        local_epochs = max(config.epochs_per_round - config.ours_ekd_epochs, 0)
 
         # Federated rounds for this task
         eval_round_ids = set(_eval_rounds(config.rounds_per_task))
@@ -1256,7 +1260,7 @@ def run_no_global_pipeline(config: FCILConfig):
                     config.n_clients, client_id, task_id, config.strategy
                 )
                 
-                # Build dataset for current task data (Ours2 mixes private + public memory)
+                # Build dataset for current task data
                 if hasattr(cil_method, "build_dataset"):
                     dataset, n_samples = cil_method.build_dataset(paths['X'], paths['y'], config.batch_size)
                 else:
@@ -1270,10 +1274,10 @@ def run_no_global_pipeline(config: FCILConfig):
                 if task_id > 0 and hasattr(cil_method, "capture_anchor_prototypes"):
                     cil_method.capture_anchor_prototypes(client_models[client_id], paths['X'], paths['y'])
 
-                # Stage 1: CE on task 0; drift-calibrated PASS on later tasks
+                # Stage 1: local client training before EKD stage
                 _opt, _loss_fn = _get_opt_loss(client_models[client_id])
                 train_step = cil_method.get_finetune_step(client_models[client_id], _opt, _loss_fn) if hasattr(cil_method, "get_finetune_step") else cil_method.get_train_step(client_models[client_id], _opt, _loss_fn)
-                stage_epochs = config.epochs_per_round if task_id == 0 else local_epochs
+                stage_epochs = local_epochs
                 epoch_losses = train_client_fast(client_models[client_id], dataset, train_step, stage_epochs)
                 loss = epoch_losses[-1] if epoch_losses else 0.0
                 round_losses.append(loss)
@@ -1281,7 +1285,7 @@ def run_no_global_pipeline(config: FCILConfig):
                 if hasattr(cil_method, "update_client_drift"):
                     cil_method.update_client_drift(client_models[client_id], paths['X'], paths['y'])
 
-                if config.cil_method == "ours2" and hasattr(cil_method, "update_eva_threshold"):
+                if config.cil_method in ("ours2", "ours3") and hasattr(cil_method, "update_eva_threshold"):
                     cil_method.update_eva_threshold(client_id, client_models[client_id], paths['X'], config.batch_size)
                 
                 # Store client weights for consensus building
@@ -1302,10 +1306,10 @@ def run_no_global_pipeline(config: FCILConfig):
                 scratch_model = create_model(current_classes, input_dim, config.batch_size, config.model)
                 _prepare_active_model(cil_method, scratch_model, num_classes)
                 active_models = {cid: client_models[cid] for cid in trained_client_ids}
-                if config.cil_method == "ours2":
-                    avg_ekd = 0.0
-                    cil_method._last_survivor_clients = list(range(len(trained_client_ids)))
-                    cil_method._last_survivors = len(trained_client_ids)
+                if config.cil_method in ("ours2", "ours3"):
+                    avg_ekd = cil_method.distill_round(
+                        scratch_model, active_models, client_weights, config,
+                        task_id, active_n, num_tasks, client_ids=trained_client_ids)
                 elif hasattr(cil_method, "update_consensus"):
                     cil_method.update_consensus(scratch_model, client_weights, config)
                     avg_ekd = 0.0
@@ -1324,9 +1328,13 @@ def run_no_global_pipeline(config: FCILConfig):
                 client_weights = [client_models[cid].get_weights() for cid in trained_client_ids]
 
                 if config.cil_method == "ours2":
-                    ours2_total = cil_method._last_ce + cil_method._last_kd
-                    log(f"{COLORS.OKCYAN}Ours2 losses: CE={cil_method._last_ce:.4f} | KD={cil_method._last_kd:.4f} | total={ours2_total:.4f} | round_clients={cil_method._last_survivors}{COLORS.ENDC}",
-                        f"Ours2 | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | KD={cil_method._last_kd:.4f} | total={ours2_total:.4f} | RoundClients={cil_method._last_survivors}")
+                    log(f"{COLORS.OKCYAN}Ours2 losses: CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | round_clients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f}{COLORS.ENDC}",
+                        f"Ours2 | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | RoundClients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f}")
+                elif config.cil_method == "ours3":
+                    _gate = getattr(cil_method, "_last_replay_support", 0.0)
+                    _replay_n = getattr(cil_method, "_last_replay_kept", 0)
+                    log(f"{COLORS.OKCYAN}Ours3 losses: CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | round_clients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f} | replay_gate={_gate:.3f} ({_replay_n}){COLORS.ENDC}",
+                        f"Ours3 | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | RoundClients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f} | replay_gate={_gate:.3f} ({_replay_n})")
                 else:
                     pass_local = cil_method._last_ce + cil_method._last_kd + cil_method._last_proto + cil_method._last_rel
                     pass_total = pass_local + avg_ekd
@@ -1358,6 +1366,11 @@ def run_no_global_pipeline(config: FCILConfig):
                            f"Prec_w={overall_result['prec_weighted']:.4f} | Rec_w={overall_result['rec_weighted']:.4f}")
                     log(f"{COLORS.OKGREEN}Round {round_num + 1} | Tasks 0-{task_id} | {_ms}{COLORS.ENDC}",
                         f"EVAL | T{task_id} | R{round_num + 1} | {_ms}")
+                    if log_stem != "unnamed":
+                        _plot_confusion_matrix(
+                            overall_result['cm'],
+                            str(Path("results_cil/plots") / log_stem / f"T{task_id}_R{round_num + 1}.png"),
+                            list(cil_method.class_order) if hasattr(cil_method, "class_order") else None)
                     _log_class_task_breakdown(log, overall_result, task_order, cil_method.label_map,
                                               task_id, getattr(cil_method, 'class_order', None),
                                               f"EVAL | T{task_id} | R{round_num + 1}")
@@ -1373,7 +1386,7 @@ def run_no_global_pipeline(config: FCILConfig):
             del client_weights
             gc.collect()
 
-        if config.cil_method == "ours2" and hasattr(cil_method, "freeze_task_memory"):
+        if config.cil_method in ("ours2", "ours3") and hasattr(cil_method, "freeze_task_memory"):
             seed_client_ids = [cid for cid in range(active_n) if cid in client_models]
             seed_weights = [client_models[cid].get_weights() for cid in seed_client_ids]
             if seed_weights:
@@ -1414,6 +1427,11 @@ def run_no_global_pipeline(config: FCILConfig):
                f"Prec_w={final_result['prec_weighted']:.4f} | Rec_w={final_result['rec_weighted']:.4f}")
         log(f"{COLORS.OKCYAN}FINAL | all {num_classes} classes | {_ms}{COLORS.ENDC}",
             f"FINAL | all {num_classes} classes | {_ms}")
+        if log_stem != "unnamed":
+            _plot_confusion_matrix(
+                final_result['cm'],
+                str(Path("results_cil/plots") / log_stem / "final.png"),
+                list(cil_method.class_order) if hasattr(cil_method, "class_order") else None)
         _log_class_task_breakdown(log, final_result, task_order, cil_method.label_map,
                                   num_tasks - 1, getattr(cil_method, 'class_order', None),
                                   "FINAL")

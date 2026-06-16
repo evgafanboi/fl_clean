@@ -54,7 +54,7 @@ def main():
     
     # CIL settings
     parser.add_argument('--cil', type=str, default='finetune',
-                        choices=['finetune', 'ewc', 'mas', 'lwf', 'icarl', 'bic', 'foster', 'glfc', 'cbkd', 'pass', 'feat', 'exp', 'ours', 'ours2'],
+                        choices=['finetune', 'ewc', 'mas', 'lwf', 'icarl', 'bic', 'foster', 'glfc', 'cbkd', 'pass', 'feat', 'exp', 'ours', 'ours2', 'ours3'],
                         help='CIL method')
     parser.add_argument('--ewc_lambda', type=float, default=10.0,
                         help='EWC regularization strength (normalized, typical range: 0.1-10)')
@@ -220,9 +220,11 @@ def main():
         parts.append(f"rel{args.ours_proto_rel_lambda}")
         parts.append(f"enc{args.ours_encoder_lr_factor}")
         parts.append("meanlogits" if args.no_filter else f"blom{args.robust_threshold}")
-    if args.cil == 'ours2':
+    if args.cil in ('ours2', 'ours3'):
         parts.append(f"mem{args.memory}")
         parts.append(f"kg{args.ours_kd_gamma}")
+        if args.cil == 'ours3':
+            parts.append("gated")
         parts.append(f"eva{0.95}_blom{args.robust_threshold}")
     if args.strategy == 'FedSSD':
         parts.append(f"ssd{args.m_max}")

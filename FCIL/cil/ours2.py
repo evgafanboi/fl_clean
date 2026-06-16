@@ -18,11 +18,14 @@ def _energy_from_logits(logits: np.ndarray, temperature: float = 1.0) -> np.ndar
 
 class Ours2(Finetune):
     def __init__(self, num_classes: int, memory: float = 1.0, kd_gamma: float = 1.0,
-                 robust_threshold: float = 0.9, robust_workers: int = 8):
+                 robust_threshold: float = 0.9, robust_workers: int = 8,
+                 ekd_epochs: int = 1, ekd_lambda: float = 1.0):
         super().__init__(num_classes=num_classes)
         self.name = 'Ours2'
         self.memory = memory
         self.kd_gamma = kd_gamma
+        self.ekd_epochs = ekd_epochs
+        self.ekd_lambda = ekd_lambda
         self.class_order = []
         self.label_map = {}
         self.robust_filter = RobustFilterV3(robust_threshold=robust_threshold, reference="Blom", workers=robust_workers)
@@ -89,7 +92,7 @@ class Ours2(Finetune):
         total_eva_cells = 0
         chunk_size = max(config.batch_size * 8, 8192)
         if self._mem_dir is None:
-            self._mem_dir = os.path.join("temp_weights", f"ours2_memory_{config.partition_type}_{config.n_clients}client")
+            self._mem_dir = os.path.join("temp_weights", f"{self.name.lower()}_memory_{config.partition_type}_{config.n_clients}client")
             os.makedirs(self._mem_dir, exist_ok=True)
             self._mem_files = []
 
@@ -149,10 +152,10 @@ class Ours2(Finetune):
         self._last_survivor_clients = [i for i in range(n_clients) if survivor[i]]
         self._last_survivors = int(survivor.sum())
         self._last_eva_support = float(total_eva / max(total_eva_cells, 1))
-        print(f"  Ours2 freeze T{task_id}: Blom {self._last_survivors}/{n_clients} clients | EVA support={self._last_eva_support:.3f}")
+        print(f"  {self.name} freeze T{task_id}: Blom {self._last_survivors}/{n_clients} clients | EVA support={self._last_eva_support:.3f}")
         self.task_candidates = None
         self.eva_thresholds.clear()
-        print(f"  Ours2 frozen memory: {len(self._mem_files)} disk chunks across {len(self.class_order)} classes")
+        print(f"  {self.name} frozen memory: {len(self._mem_files)} disk chunks across {len(self.class_order)} classes")
         gc.collect()
 
     def build_dataset(self, X_path: str, y_path: str, batch_size: int):
@@ -163,33 +166,25 @@ class Ours2(Finetune):
         y_priv = y_priv if len(y_priv.shape) == 1 else np.argmax(y_priv, axis=1)
         X_parts = [np.asarray(X_priv, dtype=np.float32)]
         y_parts = [np.vectorize(self.label_map.get, otypes=[np.int64])(y_priv).astype(np.int64)]
-        kd_parts = [np.zeros((len(y_priv), len(self.class_order)), dtype=np.float32)]
 
         if self._mem_files:
             for chunk_file in self._mem_files:
                 data = np.load(chunk_file)
                 X_parts.append(data['X'])
                 y_parts.append(data['y'].astype(np.int64))
-                logits = data['logits']
-                if logits.shape[1] < len(self.class_order):
-                    pad = np.zeros((logits.shape[0], len(self.class_order) - logits.shape[1]), dtype=np.float32)
-                    logits = np.concatenate([logits, pad], axis=1)
-                kd_parts.append(logits.astype(np.float32))
 
         X = np.concatenate(X_parts, axis=0)
         y = np.concatenate(y_parts, axis=0)
-        kd = np.concatenate(kd_parts, axis=0)
 
         if X.shape[0] == 0:
             dummy_X = torch.empty((1, 1), dtype=torch.float32)
             dummy_y = torch.empty((1, len(self.class_order)), dtype=torch.float32)
-            dummy_kd = torch.empty((1, len(self.class_order)), dtype=torch.float32)
-            loader = DataLoader(TensorDataset(dummy_X, dummy_y, dummy_kd), batch_size=batch_size, shuffle=True, drop_last=False)
+            loader = DataLoader(TensorDataset(dummy_X, dummy_y), batch_size=batch_size, shuffle=True, drop_last=False)
             return loader, 0
 
         y_oh = np.zeros((len(y), len(self.class_order)), dtype=np.float32)
         y_oh[np.arange(len(y)), y] = 1.0
-        loader = DataLoader(TensorDataset(torch.from_numpy(X), torch.from_numpy(y_oh), torch.from_numpy(kd)), batch_size=batch_size, shuffle=True, drop_last=False)
+        loader = DataLoader(TensorDataset(torch.from_numpy(X), torch.from_numpy(y_oh)), batch_size=batch_size, shuffle=True, drop_last=False)
         return loader, len(X)
 
     def get_train_step(self, model, optimizer, loss_fn):
@@ -197,22 +192,132 @@ class Ours2(Finetune):
         import torch.nn.functional as F
         dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model.nn.to(dev)
-        def step(X_b, y_b, kd_b):
-            X_b = X_b.to(dev); y_b = y_b.to(dev); kd_b = kd_b.to(dev)
-            y_cls = y_b.argmax(dim=1)
-            mask = kd_b.abs().sum(dim=1) > 0
+        def step(X_b, y_b):
+            X_b = X_b.to(dev); y_b = y_b.to(dev)
+            y_cls = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
             model.nn.train()
             optimizer.zero_grad(set_to_none=True)
             logits = torch.clamp(model.nn(X_b, return_logits=True), -LOGIT_CLIP, LOGIT_CLIP)
             ce_loss = F.cross_entropy(logits, y_cls, label_smoothing=0.05)
-            kd_loss = torch.tensor(0.0, device=dev)
-            if mask.any():
-                kd_loss = F.kl_div(F.log_softmax(logits[mask], dim=1), F.softmax(kd_b[mask], dim=1), reduction='batchmean')
-            total = ce_loss + self.kd_gamma * kd_loss
-            total.backward()
+            ce_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.nn.parameters(), 1.0)
             optimizer.step()
             self._last_ce = float(ce_loss.item())
-            self._last_kd = float(kd_loss.item()) * self.kd_gamma
-            return ce_loss.item(), kd_loss.item(), total.item()
+            return ce_loss.item(), 0.0, ce_loss.item()
         return step
+
+    def _raw_logits(self, model, X, batch_size):
+        predictor = model.get_logits_model() if hasattr(model, 'get_logits_model') else model
+        return predictor.predict(X, batch_size=batch_size)
+
+    def _consensus_logits(self, scratch_model, X, client_weights, client_ids, config):
+        n_samples = len(X)
+        n_clients = len(client_weights)
+        chunk_size = max(config.batch_size * 8, 8192)
+        X_chunks, consensus_chunks = [], []
+        total_discard = np.zeros(n_clients, dtype=np.int64)
+        total_eva = 0
+        total_eva_cells = 0
+        for start in range(0, n_samples, chunk_size):
+            X_chunk = X[start:start + chunk_size]
+            preds = []
+            eva_keep = np.ones((len(X_chunk), n_clients), dtype=bool)
+            for k, (cid, weights) in enumerate(zip(client_ids, client_weights)):
+                scratch_model.set_weights(weights)
+                pred = self._raw_logits(scratch_model, X_chunk, config.batch_size)
+                pred = np.clip(pred, -LOGIT_CLIP, LOGIT_CLIP).astype(np.float32)
+                preds.append(pred)
+                if cid in self.eva_thresholds:
+                    eva_keep[:, k] = _energy_from_logits(pred) <= self.eva_thresholds[cid]
+            logits_stack = np.stack(preds, axis=1)
+            discard_mask, _ = self.robust_filter.count_discards_mask(logits_stack)
+            robust_keep = ~discard_mask
+            keep_mask = eva_keep & robust_keep
+            support = keep_mask.sum(axis=1)
+            bad = support == 0
+            if bad.any():
+                eva_support = eva_keep[bad].sum(axis=1)
+                fallback = np.where(eva_support[:, None] > 0, eva_keep[bad], robust_keep[bad])
+                still_bad = fallback.sum(axis=1) == 0
+                fallback[still_bad] = True
+                keep_mask[bad] = fallback
+                support[bad] = keep_mask[bad].sum(axis=1)
+            consensus = (np.einsum('nk,nkd->nd', keep_mask.astype(np.float32), logits_stack) / support[:, None]).astype(np.float32)
+            X_chunks.append(X_chunk.copy())
+            consensus_chunks.append(consensus)
+            total_discard += discard_mask.sum(axis=0)
+            total_eva += int(eva_keep.sum())
+            total_eva_cells += eva_keep.size
+            del preds, logits_stack, discard_mask, robust_keep, keep_mask, eva_keep
+            gc.collect()
+        return X_chunks, consensus_chunks, total_discard, total_eva, total_eva_cells
+
+    def _ekd_pt(self, model, X, teacher_logits, batch_size):
+        import torch
+        import torch.nn.functional as F
+        dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model.nn.to(dev).train()
+        X_t = torch.from_numpy(X.astype(np.float32)).to(dev)
+        z_t = torch.from_numpy(teacher_logits.astype(np.float32)).to(dev)
+        n = len(X)
+        final = 0.0
+        for _ in range(self.ekd_epochs):
+            order = np.random.permutation(n)
+            total, batches = 0.0, 0
+            for s in range(0, n, batch_size):
+                idx = order[s:s + batch_size]
+                student = torch.clamp(model.nn(X_t[idx], return_logits=True), -LOGIT_CLIP, LOGIT_CLIP)
+                teacher = torch.clamp(z_t[idx], -LOGIT_CLIP, LOGIT_CLIP)
+                alpha_t = torch.exp(teacher) + 1.0
+                alpha_s = torch.exp(student) + 1.0
+                a0_t = alpha_t.sum(-1, keepdim=True)
+                a0_s = alpha_s.sum(-1, keepdim=True)
+                l1 = ((alpha_t / a0_t) * (torch.log(alpha_t / a0_t + 1e-8) - torch.log(alpha_s / a0_s + 1e-8))).sum(-1)
+                l2 = (torch.lgamma(a0_t[:, 0]) - torch.lgamma(a0_s[:, 0])
+                      - (torch.lgamma(alpha_t) - torch.lgamma(alpha_s)).sum(-1)
+                      + ((alpha_t - alpha_s) * (torch.digamma(alpha_t) - torch.digamma(a0_t))).sum(-1))
+                loss = (l1 + self.ekd_lambda * l2).mean() * self.kd_gamma
+                model.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.nn.parameters(), 0.5)
+                model.optimizer.step()
+                total += float(loss.item()); batches += 1
+            final = total / max(batches, 1)
+        return final
+
+    def distill_round(self, scratch_model, client_models, client_weights, config, task_id: int, active_n: int, num_tasks: int, client_ids=None):
+        if client_ids is None:
+            client_ids = list(range(len(client_weights)))
+        if self.task_candidates is None or len(self.task_candidates) == 0:
+            self._last_kd = 0.0
+            self._last_survivor_clients = list(range(len(client_weights)))
+            self._last_survivors = len(client_weights)
+            return 0.0
+
+        n_samples = len(self.task_candidates)
+        n_clients = len(client_weights)
+        cur_X_chunks, cur_consensus_chunks, total_discard, total_eva, total_eva_cells = (
+            self._consensus_logits(scratch_model, self.task_candidates, client_weights, client_ids, config))
+
+        discard_frac = total_discard.astype(np.float64) / max(n_samples, 1)
+        survivor = discard_frac <= self.robust_filter.robust_threshold
+        self._last_survivor_clients = [i for i in range(n_clients) if survivor[i]]
+        self._last_survivors = int(survivor.sum())
+        self._last_eva_support = float(total_eva / max(total_eva_cells, 1))
+
+        n_classes = len(self.class_order)
+        cur_X = np.concatenate(cur_X_chunks, axis=0)
+        cur_logits = np.concatenate(cur_consensus_chunks, axis=0)
+        if cur_logits.shape[1] < n_classes:
+            pad = np.zeros((cur_logits.shape[0], n_classes - cur_logits.shape[1]), dtype=np.float32)
+            cur_logits = np.concatenate([cur_logits, pad], axis=1)
+        X_all, L_all = cur_X.astype(np.float32), cur_logits.astype(np.float32)
+
+        total_ekd, n_students = 0.0, 0
+        for student in client_models.values():
+            total_ekd += self._ekd_pt(student, X_all, L_all, config.batch_size)
+            n_students += 1
+        self._last_kd = total_ekd / max(n_students, 1)
+        del cur_X_chunks, cur_consensus_chunks, cur_X, cur_logits, X_all, L_all
+        gc.collect()
+        return self._last_kd
