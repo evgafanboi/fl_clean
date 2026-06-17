@@ -45,6 +45,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robust_filter_reference", type=str, default="Blom", help="Ours: reference curve for per-sample spectral filter. 'Blom' (half-normal order stats) or 't' (Student-t, use --robust_v for df; more lenient)")
     parser.add_argument("--robust_v", type=float, default=4.0, help="Degrees of freedom for t-distribution reference (lower = more lenient, default 4.0)")
     parser.add_argument("--robust_filter_cronus", action="store_true", help="Ours: use pooled Cronus robust filter")
+    parser.add_argument("--robust_filter_v3", action="store_true", help="Ours: force use of RobustFilterV3 (default; provided for explicit override)")
     # cronus
     parser.add_argument("--remove_dis", action="store_true", help="Cronus: use plain softmax predictions")
     # fedssd
@@ -192,6 +193,7 @@ def main(argv=None):
             robust_filter_reference=args.robust_filter_reference,
             robust_v=args.robust_v,
             robust_filter_cronus=args.robust_filter_cronus,
+            robust_filter_v3=args.robust_filter_v3,
             eva=args.eva,
             eva2=args.eva2,
             evw=args.evw,
