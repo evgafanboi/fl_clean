@@ -34,6 +34,7 @@ class FCILConfig:
     model: str = "dense"
     batch_size: int = 256
     epochs_per_round: int = 1
+    mixed_models: bool = False
     
     # Logging
     log_file: str = ""
@@ -80,3 +81,7 @@ class FCILConfig:
     # Checkpointing
     checkpoint: int = 0
     fresh_run: bool = False
+
+    # Eval scheduling
+    last_eval: bool = False
+    sweep_eval: bool = False

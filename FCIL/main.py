@@ -133,6 +133,8 @@ def main():
     # Model settings
     parser.add_argument('--model', type=str, default='dense',
                         help='Model architecture')
+    parser.add_argument('--mixed_models', action='store_true',
+                        help='Heterogeneous client architectures (gru/mixed_dcblstm/dense/cnn by client id)')
     parser.add_argument('--batch_size', type=int, default=8192,
                         help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=5,
@@ -143,6 +145,10 @@ def main():
                         help='Save checkpoint every N clients (0 = disabled)')
     parser.add_argument('--fresh_run', action='store_true',
                         help='Clear checkpoint and restart from scratch')
+    parser.add_argument('--last_eval', action='store_true',
+                        help='Evaluate only at the last round of each task')
+    parser.add_argument('--sweep_eval', action='store_true',
+                        help='Skip training: load saved weight records of the matching run and re-evaluate only')
     
     args = parser.parse_args()
     if args.feat_lambda is None:
@@ -171,6 +177,8 @@ def main():
     task_size_token = Path(task_order_file).stem.split('_')[-2]  # e.g., "5.0" from "..._5.0_task"
     
     parts = [args.strategy, args.cil, f"{args.n_clients}client", args.partition_type, task_size_token, args.model]
+    if args.mixed_models:
+        parts.append("mixed")
     if args.cil == 'ewc':
         parts.append(f"lambda{args.ewc_lambda}")
     if args.cil == 'mas':
@@ -270,6 +278,7 @@ def main():
         partition_root=partition_root,
         task_order_file=task_order_file,
         model=args.model,
+        mixed_models=args.mixed_models,
         batch_size=args.batch_size,
         epochs_per_round=args.epochs,
         log_file=log_file,
@@ -278,9 +287,15 @@ def main():
         use_tf=args.use_tf,
         checkpoint=args.checkpoint,
         fresh_run=args.fresh_run,
+        last_eval=args.last_eval,
+        sweep_eval=args.sweep_eval,
     )
     
-    run_fcil_pipeline(config)
+    if config.sweep_eval:
+        from .pipeline import run_sweep_eval_pipeline
+        run_sweep_eval_pipeline(config)
+    else:
+        run_fcil_pipeline(config)
 
 
 if __name__ == '__main__':

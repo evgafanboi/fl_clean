@@ -37,9 +37,28 @@ class ICaRL(CILMethod):
         self.client_budget_tasks = set()
         self.old_num_classes = 0
         self.old_targets = None
+        self.old_model = None
+        self.old_logits_model = None
         self.global_means = None
         self.global_mean_labels = None
         self.exemplar_dir = Path("temp_weights/icarl_exemplars")
+
+    def set_old_model(self, model):
+        if not _use_tf():
+            import copy
+            old = copy.deepcopy(model.nn)
+            old.eval()
+            for p in old.parameters():
+                p.requires_grad_(False)
+            self.old_model = old
+            self.old_logits_model = old
+            return
+        keras_model = model.model if hasattr(model, 'model') else model
+        self.old_model = tf.keras.models.clone_model(keras_model)
+        self.old_model.set_weights(keras_model.get_weights())
+        self.old_model.trainable = False
+        logits_layer = self.old_model.get_layer('logits')
+        self.old_logits_model = tf.keras.Model(self.old_model.input, logits_layer.output)
 
     def set_client(self, client_id: int):
         self.client_id = client_id
@@ -134,15 +153,11 @@ class ICaRL(CILMethod):
             mask = labels == c
             X_c = np.array(X_new[mask], dtype=np.float32)
             m = m_per_class.get(c, 0)
-            exemplars, mean, count = self._construct_exemplars(feature_model, X_c, m)
+            exemplars, _mean, _count = self._construct_exemplars(feature_model, X_c, m)
             self.exemplar_dir.mkdir(parents=True, exist_ok=True)
             path = self.exemplar_dir / f"client_{self.client_id}_class_{c}.npy"
             np.save(path, exemplars)
             self.exemplars[self.client_id][c] = path
-            if self.use_bce and count > 0:
-                mean = mean / (np.linalg.norm(mean) + 1e-12)
-                self.client_means[self.client_id][c] = mean.astype(np.float32)
-                self.client_counts[self.client_id][c] = count
             del X_c, exemplars
         del X_new, y_new, labels, feature_model
         gc.collect()
@@ -152,22 +167,33 @@ class ICaRL(CILMethod):
             self.global_means = None
             self.global_mean_labels = None
             return
+        feature_model = model.get_feature_model() if hasattr(model, "get_feature_model") else None
+        if feature_model is None:
+            self.global_means = None
+            self.global_mean_labels = None
+            return
         means = []
         labels = []
         for c in self.class_order:
-            sum_feat = None
-            count = 0
-            for client_id in self.client_means:
-                if c in self.client_means[client_id]:
-                    mean = self.client_means[client_id][c]
-                    n = self.client_counts[client_id][c]
-                    sum_feat = mean * n if sum_feat is None else sum_feat + mean * n
-                    count += n
-            if count > 0:
-                mean = sum_feat / count
-                mean = mean / (np.linalg.norm(mean) + 1e-12)
-                means.append(mean)
-                labels.append(self.label_map[c])
+            X_parts = []
+            for client_id in self.exemplars:
+                path = self.exemplars[client_id].get(c)
+                if path is None:
+                    continue
+                X_ex = np.load(path, mmap_mode='r')
+                if X_ex.shape[0] > 0:
+                    X_parts.append(np.array(X_ex, dtype=np.float32))
+                del X_ex
+            if not X_parts:
+                continue
+            X_c = np.concatenate(X_parts, axis=0)
+            feats = _batched_predict(feature_model, X_c)
+            feats = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-12)
+            mean = np.mean(feats, axis=0)
+            mean = mean / (np.linalg.norm(mean) + 1e-12)
+            means.append(mean.astype(np.float32))
+            labels.append(self.label_map[c])
+            del X_parts, X_c, feats
         gc.collect()
         self.global_means = np.stack(means, axis=0) if means else None
         self.global_mean_labels = labels
@@ -196,7 +222,7 @@ class ICaRL(CILMethod):
         # Pre-compute old logits on disk to avoid calling model inside generator
         old_targets_path = None
         if old_nc > 0:
-            logits_model = model.get_logits_model() if hasattr(model, "get_logits_model") else None
+            logits_model = self.old_logits_model
             all_old = []
             # new data logits
             for i in range(0, X_new.shape[0], PRED_BATCH):
@@ -311,9 +337,15 @@ class ICaRL(CILMethod):
         if total == 0:
             return None, 0
         if old_nc > 0:
-            logits_model = model.get_logits_model()
-            logits_np = logits_model.predict(X_all, batch_size=PRED_BATCH)
-            old_tgt = 1.0 / (1.0 + np.exp(-logits_np[:, :old_nc])).astype(np.float32)
+            dev = next(self.old_model.parameters()).device
+            self.old_model.eval()
+            parts = []
+            with torch.no_grad():
+                for i in range(0, X_all.shape[0], PRED_BATCH):
+                    xb = torch.from_numpy(X_all[i:i+PRED_BATCH]).to(dev)
+                    parts.append(self.old_model(xb, return_logits=True)[:, :old_nc].cpu().numpy())
+            logits_np = np.concatenate(parts, axis=0)
+            old_tgt = (1.0 / (1.0 + np.exp(-logits_np))).astype(np.float32)
             dataset = TensorDataset(
                 torch.from_numpy(X_all),
                 torch.from_numpy(y_all),

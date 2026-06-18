@@ -34,25 +34,24 @@ class EWC(CILMethod):
             model.nn.to(dev)
             old_weights = [p.detach().cpu().numpy().copy() for p in model.nn.parameters()]
             params = list(model.nn.parameters())
-            fisher = [np.zeros_like(w) for w in old_weights]
+            fisher = [torch.zeros_like(p, device=dev) for p in params]
             total_samples = 0
-            # cuDNN RNN backward is only available in training mode; Fisher needs gradients.
             was_training = model.nn.training
             model.nn.train()
             for batch_X, batch_y in task_data:
                 X_b = batch_X.to(dev)
                 y_cls = (batch_y.argmax(dim=1) if batch_y.ndim > 1 else batch_y.long()).to(dev)
-                B = len(y_cls)
-                for j in range(B):
-                    model.optimizer.zero_grad()
-                    loss = F.cross_entropy(model.nn(X_b[j:j + 1], return_logits=True), y_cls[j:j + 1])
-                    loss.backward()
-                    for i, p in enumerate(params):
-                        if p.grad is not None:
-                            fisher[i] += p.grad.detach().cpu().numpy() ** 2
-                total_samples += B
+                batch_size = len(y_cls)
+                model.optimizer.zero_grad(set_to_none=True)
+                loss = F.cross_entropy(model.nn(X_b, return_logits=True), y_cls)
+                loss.backward()
+                for i, p in enumerate(params):
+                    if p.grad is not None:
+                        fisher[i] += p.grad.detach() ** 2 * batch_size
+                total_samples += batch_size
             for i in range(len(fisher)):
                 fisher[i] /= max(total_samples, 1)
+            fisher = [f.detach().cpu().numpy() for f in fisher]
             self.fisher[cid][self.current_task] = fisher
             self.optimal_weights[cid][self.current_task] = old_weights
             model.nn.train(was_training)
@@ -69,15 +68,15 @@ class EWC(CILMethod):
         num_samples = 0
         for batch_X, batch_y in task_data:
             y_idx = tf.argmax(batch_y, axis=1) if len(batch_y.shape) > 1 else tf.cast(batch_y, tf.int64)
-            for j in range(batch_X.shape[0]):
-                with tf.GradientTape() as tape:
-                    predictions = keras_model(batch_X[j:j + 1], training=False)
-                    loss = tf.keras.losses.sparse_categorical_crossentropy(y_idx[j:j + 1], predictions)
-                grads = tape.gradient(loss, keras_model.trainable_variables)
-                for i, g in enumerate(grads):
-                    if g is not None:
-                        fisher_diag[i] += tf.square(g).numpy()
-            num_samples += batch_X.shape[0]
+            batch_size = batch_X.shape[0]
+            with tf.GradientTape() as tape:
+                predictions = keras_model(batch_X, training=False)
+                loss = tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_idx, predictions))
+            grads = tape.gradient(loss, keras_model.trainable_variables)
+            for i, g in enumerate(grads):
+                if g is not None:
+                    fisher_diag[i] += tf.square(g).numpy() * batch_size
+            num_samples += batch_size
         for i in range(len(fisher_diag)):
             fisher_diag[i] /= num_samples
         self.fisher[cid][self.current_task] = fisher_diag
