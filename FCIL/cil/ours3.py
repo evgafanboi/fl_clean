@@ -1,63 +1,23 @@
 import gc
 import numpy as np
-from .ours2 import Ours2, LOGIT_CLIP
+from .ours2 import Ours2
 
 class Ours3(Ours2):
     def __init__(self, num_classes: int, memory: float = 1.0, kd_gamma: float = 1.0,
                  robust_threshold: float = 0.9, robust_workers: int = 8,
-                 ekd_epochs: int = 1, ekd_lambda: float = 1.0):
-        super().__init__(num_classes, memory, kd_gamma, robust_threshold, robust_workers, ekd_epochs, ekd_lambda)
+                 ekd_epochs: int = 1, ekd_lambda: float = 1.0, replay_cap: bool = True,
+                 replay_min_per_class: int = 128):
+        super().__init__(num_classes, memory, kd_gamma, robust_threshold, robust_workers, ekd_epochs, ekd_lambda, replay_cap, replay_min_per_class)
         self.name = 'Ours3'
         self._last_replay_support = 0.0
         self._last_replay_kept = 0
         self._last_replay_total = 0
         self._scratch_pool = None
 
-    def _consensus_logits(self, scratch_model, X, client_weights, client_ids, config):
-        if not self._scratch_pool:
-            return super()._consensus_logits(scratch_model, X, client_weights, client_ids, config)
-        n_samples = len(X)
-        n_clients = len(client_weights)
-        chunk_size = max(config.batch_size * 8, 8192)
-        X_chunks, consensus_chunks = [], []
-        total_discard = np.zeros(n_clients, dtype=np.int64)
-        total_eva = 0
-        total_eva_cells = 0
-        for start in range(0, n_samples, chunk_size):
-            X_chunk = X[start:start + chunk_size]
-            preds = []
-            eva_keep = np.ones((len(X_chunk), n_clients), dtype=bool)
-            for k, (cid, weights) in enumerate(zip(client_ids, client_weights)):
-                model = self._scratch_pool[cid]
-                model.set_weights(weights)
-                pred = self._raw_logits(model, X_chunk, config.batch_size)
-                pred = np.clip(pred, -LOGIT_CLIP, LOGIT_CLIP).astype(np.float32)
-                preds.append(pred)
-                if cid in self.eva_thresholds:
-                    from .ours2 import _energy_from_logits
-                    eva_keep[:, k] = _energy_from_logits(pred) <= self.eva_thresholds[cid]
-            logits_stack = np.stack(preds, axis=1)
-            discard_mask, _ = self.robust_filter.count_discards_mask(logits_stack)
-            robust_keep = ~discard_mask
-            keep_mask = eva_keep & robust_keep
-            support = keep_mask.sum(axis=1)
-            bad = support == 0
-            if bad.any():
-                eva_support = eva_keep[bad].sum(axis=1)
-                fallback = np.where(eva_support[:, None] > 0, eva_keep[bad], robust_keep[bad])
-                still_bad = fallback.sum(axis=1) == 0
-                fallback[still_bad] = True
-                keep_mask[bad] = fallback
-                support[bad] = keep_mask[bad].sum(axis=1)
-            consensus = (np.einsum('nk,nkd->nd', keep_mask.astype(np.float32), logits_stack) / support[:, None]).astype(np.float32)
-            X_chunks.append(X_chunk.copy())
-            consensus_chunks.append(consensus)
-            total_discard += discard_mask.sum(axis=0)
-            total_eva += int(eva_keep.sum())
-            total_eva_cells += eva_keep.size
-            del preds, logits_stack, discard_mask, robust_keep, keep_mask, eva_keep
-            gc.collect()
-        return X_chunks, consensus_chunks, total_discard, total_eva, total_eva_cells
+    def _client_logits(self, scratch_model, cid, weights, X, batch_size):
+        model = self._scratch_pool[cid] if self._scratch_pool else scratch_model
+        model.set_weights(weights)
+        return self._raw_logits(model, X, batch_size)
 
     def distill_round(self, scratch_model, client_models, client_weights, config, task_id: int, active_n: int, num_tasks: int, client_ids=None):
         if client_ids is None:

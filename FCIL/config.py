@@ -68,6 +68,9 @@ class FCILConfig:
     # Ours-specific KD scaling (separate from PASS gamma)
     ours_kd_gamma: float = 1.0
     ours_drift_temp: float = 0.5
+    replay_cap: bool = True
+    replay_min_per_class: int = 128
+    replay_balance: float = 1.0
     robust_threshold: float = 0.3
     robust_workers: int = 8
     no_filter: bool = False

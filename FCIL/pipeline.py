@@ -580,7 +580,7 @@ def run_fcil_pipeline(config: FCILConfig):
     """Main FCIL pipeline execution"""
     
     # Ours variants are strictly logits-based: no global-model aggregation path.
-    if config.cil_method in ("ours", "ours2", "ours3"):
+    if config.cil_method in ("ours", "ours2", "ours3", "ours4"):
         return run_no_global_pipeline(config)
     
     # Load task order
@@ -1130,7 +1130,9 @@ def run_no_global_pipeline(config: FCILConfig):
                            robust_threshold=config.robust_threshold,
                            robust_workers=config.robust_workers,
                            ekd_epochs=config.ours_ekd_epochs,
-                           ekd_lambda=config.ours_ekd_lambda)
+                           ekd_lambda=config.ours_ekd_lambda,
+                           replay_cap=config.replay_cap,
+                           replay_min_per_class=config.replay_min_per_class)
     elif config.cil_method == "ours3":
         from .cil.ours3 import Ours3
         cil_method = Ours3(num_classes=num_classes, memory=config.icarl_memory,
@@ -1138,7 +1140,20 @@ def run_no_global_pipeline(config: FCILConfig):
                            robust_threshold=config.robust_threshold,
                            robust_workers=config.robust_workers,
                            ekd_epochs=config.ours_ekd_epochs,
-                           ekd_lambda=config.ours_ekd_lambda)
+                           ekd_lambda=config.ours_ekd_lambda,
+                           replay_cap=config.replay_cap,
+                           replay_min_per_class=config.replay_min_per_class)
+    elif config.cil_method == "ours4":
+        from .cil.ours4 import Ours4
+        cil_method = Ours4(num_classes=num_classes, memory=config.icarl_memory,
+                           kd_gamma=config.ours_kd_gamma,
+                           robust_threshold=config.robust_threshold,
+                           robust_workers=config.robust_workers,
+                           ekd_epochs=config.ours_ekd_epochs,
+                           ekd_lambda=config.ours_ekd_lambda,
+                           replay_cap=config.replay_cap,
+                           replay_min_per_class=config.replay_min_per_class,
+                           replay_balance=config.replay_balance)
     else:
         from .cil.ours import Ours
         cil_method = Ours(num_classes=num_classes, lam=config.ours_proto_lambda,
@@ -1262,6 +1277,15 @@ def run_no_global_pipeline(config: FCILConfig):
             client_weights = []
             trained_client_ids = []
             round_losses = []
+            if config.cil_method == "ours4" and hasattr(cil_method, "set_round_private_mean"):
+                private_sizes = []
+                for client_id in range(active_n):
+                    paths = get_task_files(
+                        config.partition_root, config.partition_type,
+                        config.n_clients, client_id, task_id, config.strategy
+                    )
+                    private_sizes.append(len(np.load(paths['X'], mmap_mode='r')))
+                cil_method.set_round_private_mean(float(np.mean(private_sizes)) if private_sizes else 0.0)
             
             # Train each client locally with PASS
             for client_id in range(active_n):
@@ -1298,7 +1322,7 @@ def run_no_global_pipeline(config: FCILConfig):
                 if hasattr(cil_method, "update_client_drift"):
                     cil_method.update_client_drift(client_models[client_id], paths['X'], paths['y'])
 
-                if config.cil_method in ("ours2", "ours3") and hasattr(cil_method, "update_eva_threshold"):
+                if config.cil_method in ("ours2", "ours3", "ours4") and hasattr(cil_method, "update_eva_threshold"):
                     cil_method.update_eva_threshold(client_id, client_models[client_id], paths['X'], config.batch_size)
                 
                 # Store client weights for consensus building
@@ -1326,7 +1350,7 @@ def run_no_global_pipeline(config: FCILConfig):
                         scratch_pool[arch] = m
                     cil_method._scratch_pool = {cid: scratch_pool[client_model_type(config, cid)] for cid in trained_client_ids}
                 active_models = {cid: client_models[cid] for cid in trained_client_ids}
-                if config.cil_method in ("ours2", "ours3"):
+                if config.cil_method in ("ours2", "ours3", "ours4"):
                     avg_ekd = cil_method.distill_round(
                         scratch_model, active_models, client_weights, config,
                         task_id, active_n, num_tasks, client_ids=trained_client_ids)
@@ -1356,6 +1380,16 @@ def run_no_global_pipeline(config: FCILConfig):
                     _replay_n = getattr(cil_method, "_last_replay_kept", 0)
                     log(f"{COLORS.OKCYAN}Ours3 losses: CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | round_clients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f} | replay_gate={_gate:.3f} ({_replay_n}){COLORS.ENDC}",
                         f"Ours3 | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | RoundClients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f} | replay_gate={_gate:.3f} ({_replay_n})")
+                elif config.cil_method == "ours4":
+                    _gate = getattr(cil_method, "_last_replay_support", 0.0)
+                    _replay_n = getattr(cil_method, "_last_replay_kept", 0)
+                    _budget = getattr(cil_method, "_last_replay_budget", 0)
+                    _per_class = getattr(cil_method, "_last_replay_per_class", 0)
+                    _priv = getattr(cil_method, "_last_private_mean", 0.0)
+                    _old = getattr(cil_method, "_last_old_classes", 0)
+                    _ex = getattr(cil_method, "_last_exemplar_mean", 0.0)
+                    log(f"{COLORS.OKCYAN}Ours4 losses: CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | round_clients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f} | replay_gate={_gate:.3f} ({_replay_n}) | budget={_budget} | per_class={_per_class} | priv={_priv:.1f} | old={_old} | ex={_ex:.1f}{COLORS.ENDC}",
+                        f"Ours4 | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | RoundClients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f} | replay_gate={_gate:.3f} ({_replay_n}) | budget={_budget} | per_class={_per_class} | priv={_priv:.1f} | old={_old} | ex={_ex:.1f}")
                 else:
                     pass_local = cil_method._last_ce + cil_method._last_kd + cil_method._last_proto + cil_method._last_rel
                     pass_total = pass_local + avg_ekd
@@ -1407,13 +1441,21 @@ def run_no_global_pipeline(config: FCILConfig):
             del client_weights
             gc.collect()
 
-        if config.cil_method in ("ours2", "ours3") and hasattr(cil_method, "freeze_task_memory"):
+        if config.cil_method in ("ours2", "ours3", "ours4") and hasattr(cil_method, "freeze_task_memory"):
             seed_client_ids = [cid for cid in range(active_n) if cid in client_models]
             seed_weights = [client_models[cid].get_weights() for cid in seed_client_ids]
             if seed_weights:
                 scratch_model = create_model(current_classes, input_dim, config.batch_size, config.model)
                 _prepare_active_model(cil_method, scratch_model, num_classes)
+                if getattr(config, "mixed_models", False):
+                    scratch_pool = {}
+                    for arch in {client_model_type(config, cid) for cid in seed_client_ids}:
+                        m = create_model(current_classes, input_dim, config.batch_size, arch)
+                        _prepare_active_model(cil_method, m, num_classes)
+                        scratch_pool[arch] = m
+                    cil_method._scratch_pool = {cid: scratch_pool[client_model_type(config, cid)] for cid in seed_client_ids}
                 cil_method.freeze_task_memory(scratch_model, seed_weights, config, task_id, seed_client_ids)
+                cil_method._scratch_pool = None
                 del scratch_model
                 gc.collect()
                 if _ckpt_enabled and ckpt_dir:
@@ -1495,7 +1537,9 @@ def _build_cil_method(config: FCILConfig, num_classes: int):
                      robust_threshold=config.robust_threshold,
                      robust_workers=config.robust_workers,
                      ekd_epochs=config.ours_ekd_epochs,
-                     ekd_lambda=config.ours_ekd_lambda)
+                     ekd_lambda=config.ours_ekd_lambda,
+                     replay_cap=config.replay_cap,
+                     replay_min_per_class=config.replay_min_per_class)
     if config.cil_method == "ours3":
         from .cil.ours3 import Ours3
         return Ours3(num_classes=num_classes, memory=config.icarl_memory,
@@ -1503,7 +1547,20 @@ def _build_cil_method(config: FCILConfig, num_classes: int):
                      robust_threshold=config.robust_threshold,
                      robust_workers=config.robust_workers,
                      ekd_epochs=config.ours_ekd_epochs,
-                     ekd_lambda=config.ours_ekd_lambda)
+                     ekd_lambda=config.ours_ekd_lambda,
+                     replay_cap=config.replay_cap,
+                     replay_min_per_class=config.replay_min_per_class)
+    if config.cil_method == "ours4":
+        from .cil.ours4 import Ours4
+        return Ours4(num_classes=num_classes, memory=config.icarl_memory,
+                     kd_gamma=config.ours_kd_gamma,
+                     robust_threshold=config.robust_threshold,
+                     robust_workers=config.robust_workers,
+                     ekd_epochs=config.ours_ekd_epochs,
+                     ekd_lambda=config.ours_ekd_lambda,
+                     replay_cap=config.replay_cap,
+                     replay_min_per_class=config.replay_min_per_class,
+                     replay_balance=config.replay_balance)
     from .cil.ours import Ours
     return Ours(num_classes=num_classes, lam=config.ours_proto_lambda,
                 gamma=config.ours_kd_gamma, proto_size=config.cbkd_proto_size,
@@ -1563,7 +1620,7 @@ def run_sweep_eval_pipeline(config: FCILConfig):
             _write_log_line(log_file, file_msg if file_msg is not None else msg)
 
     plot_stem = f"{log_stem}_sweep" if log_stem != "unnamed" else None
-    if config.cil_method in ("ours", "ours2", "ours3"):
+    if config.cil_method in ("ours", "ours2", "ours3", "ours4"):
         _sweep_eval_no_global(config, task_order, num_classes, input_dim, weight_record_dir, log, plot_stem)
     else:
         _sweep_eval_aggregation(config, task_order, num_classes, input_dim, weight_record_dir, log, plot_stem)
@@ -1605,8 +1662,11 @@ def _sweep_eval_aggregation(config, task_order, num_classes, input_dim, weight_r
                 f"No weight records for task {task_id}")
             continue
 
+        eval_round_ids = {config.rounds_per_task - 1} if config.last_eval else set(_eval_rounds(config.rounds_per_task))
         for round_dir in _sweep_round_dirs(task_weight_dir):
             round_num = int(round_dir.name.split('_')[1]) - 1
+            if round_num not in eval_round_ids:
+                continue
             weight_files = sorted(f for f in round_dir.iterdir() if f.name.endswith('_weight.bin'))
             if not weight_files:
                 continue
@@ -1674,8 +1734,11 @@ def _sweep_eval_no_global(config, task_order, num_classes, input_dim, weight_rec
                 f"No weight records for task {task_id}")
             continue
 
+        eval_round_ids = {config.rounds_per_task - 1} if config.last_eval else set(_eval_rounds(config.rounds_per_task))
         for round_dir in _sweep_round_dirs(task_weight_dir):
             round_num = int(round_dir.name.split('_')[1]) - 1
+            if round_num not in eval_round_ids:
+                continue
             weight_files = sorted(f for f in round_dir.iterdir() if f.name.endswith('_weight.bin'))
             if not weight_files:
                 continue

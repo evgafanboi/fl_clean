@@ -1,5 +1,6 @@
 import gc
 import os
+from collections import defaultdict
 import numpy as np
 from FL.strategy.robust_filter import RobustFilterV3
 from .finetune import Finetune
@@ -19,13 +20,16 @@ def _energy_from_logits(logits: np.ndarray, temperature: float = 1.0) -> np.ndar
 class Ours2(Finetune):
     def __init__(self, num_classes: int, memory: float = 1.0, kd_gamma: float = 1.0,
                  robust_threshold: float = 0.9, robust_workers: int = 8,
-                 ekd_epochs: int = 1, ekd_lambda: float = 1.0):
+                 ekd_epochs: int = 1, ekd_lambda: float = 1.0, replay_cap: bool = True,
+                 replay_min_per_class: int = 128):
         super().__init__(num_classes=num_classes)
         self.name = 'Ours2'
         self.memory = memory
         self.kd_gamma = kd_gamma
         self.ekd_epochs = ekd_epochs
         self.ekd_lambda = ekd_lambda
+        self.replay_cap = replay_cap
+        self.replay_min_per_class = replay_min_per_class
         self.class_order = []
         self.label_map = {}
         self.robust_filter = RobustFilterV3(robust_threshold=robust_threshold, reference="Blom", workers=robust_workers)
@@ -101,8 +105,7 @@ class Ours2(Finetune):
             preds = []
             eva_keep = np.ones((len(X_chunk), n_clients), dtype=bool)
             for k, (cid, weights) in enumerate(zip(client_ids, client_weights)):
-                scratch_model.set_weights(weights)
-                pred = scratch_model.get_logits_model().predict(X_chunk, batch_size=config.batch_size)
+                pred = self._client_logits(scratch_model, cid, weights, X_chunk, config.batch_size)
                 pred = np.clip(pred, -LOGIT_CLIP, LOGIT_CLIP).astype(np.float32)
                 preds.append(pred)
                 if cid in self.eva_thresholds:
@@ -166,12 +169,39 @@ class Ours2(Finetune):
         y_priv = y_priv if len(y_priv.shape) == 1 else np.argmax(y_priv, axis=1)
         X_parts = [np.asarray(X_priv, dtype=np.float32)]
         y_parts = [np.vectorize(self.label_map.get, otypes=[np.int64])(y_priv).astype(np.int64)]
+        replay_X, replay_y = [], []
 
         if self._mem_files:
             for chunk_file in self._mem_files:
                 data = np.load(chunk_file)
-                X_parts.append(data['X'])
-                y_parts.append(data['y'].astype(np.int64))
+                replay_X.append(np.asarray(data['X'], dtype=np.float32))
+                replay_y.append(np.asarray(data['y'], dtype=np.int64))
+
+        if replay_X:
+            X_rep = np.concatenate(replay_X, axis=0)
+            y_rep = np.concatenate(replay_y, axis=0)
+            budget = len(X_parts[0])
+            if self.replay_cap and budget > 0 and len(X_rep) > budget:
+                cls_to_idx = defaultdict(list)
+                for idx, cls in enumerate(y_rep.tolist()):
+                    cls_to_idx[int(cls)].append(idx)
+                classes = sorted(cls_to_idx.keys())
+                budget = max(budget, len(classes) * int(self.replay_min_per_class))
+                budget = min(budget, len(X_rep))
+                per_class = budget // len(classes)
+                remainder = budget % len(classes)
+                chosen = []
+                for pos, cls in enumerate(classes):
+                    idxs = np.asarray(cls_to_idx[cls], dtype=np.int64)
+                    take = per_class + int(pos < remainder)
+                    if take <= 0:
+                        continue
+                    chosen.append(idxs if len(idxs) <= take else np.random.choice(idxs, take, replace=False))
+                chosen_idx = np.concatenate(chosen, axis=0) if chosen else np.array([], dtype=np.int64)
+                X_rep = X_rep[chosen_idx]
+                y_rep = y_rep[chosen_idx]
+            X_parts.append(X_rep)
+            y_parts.append(y_rep)
 
         X = np.concatenate(X_parts, axis=0)
         y = np.concatenate(y_parts, axis=0)
@@ -210,6 +240,10 @@ class Ours2(Finetune):
         predictor = model.get_logits_model() if hasattr(model, 'get_logits_model') else model
         return predictor.predict(X, batch_size=batch_size)
 
+    def _client_logits(self, scratch_model, cid, weights, X, batch_size):
+        scratch_model.set_weights(weights)
+        return self._raw_logits(scratch_model, X, batch_size)
+
     def _consensus_logits(self, scratch_model, X, client_weights, client_ids, config):
         n_samples = len(X)
         n_clients = len(client_weights)
@@ -223,8 +257,7 @@ class Ours2(Finetune):
             preds = []
             eva_keep = np.ones((len(X_chunk), n_clients), dtype=bool)
             for k, (cid, weights) in enumerate(zip(client_ids, client_weights)):
-                scratch_model.set_weights(weights)
-                pred = self._raw_logits(scratch_model, X_chunk, config.batch_size)
+                pred = self._client_logits(scratch_model, cid, weights, X_chunk, config.batch_size)
                 pred = np.clip(pred, -LOGIT_CLIP, LOGIT_CLIP).astype(np.float32)
                 preds.append(pred)
                 if cid in self.eva_thresholds:

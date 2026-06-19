@@ -54,7 +54,7 @@ def main():
     
     # CIL settings
     parser.add_argument('--cil', type=str, default='finetune',
-                        choices=['finetune', 'ewc', 'mas', 'lwf', 'icarl', 'bic', 'foster', 'glfc', 'cbkd', 'pass', 'feat', 'exp', 'ours', 'ours2', 'ours3'],
+                        choices=['finetune', 'ewc', 'mas', 'lwf', 'icarl', 'bic', 'foster', 'glfc', 'cbkd', 'pass', 'feat', 'exp', 'ours', 'ours2', 'ours3', 'ours4'],
                         help='CIL method')
     parser.add_argument('--ewc_lambda', type=float, default=10.0,
                         help='EWC regularization strength (normalized, typical range: 0.1-10)')
@@ -108,7 +108,13 @@ def main():
                         help='Ours: gradient scale for non-classifier parameters')
     parser.add_argument('--ours_drift_temp', type=float, default=0.5,
                         help='Ours: cosine-softmax temperature for old-class drift compensation')
-    parser.add_argument('--robust_threshold', type=float, default=0.3,
+    parser.add_argument('--replay_cap', type=lambda x: str(x).lower() == 'true', default=True,
+                        help='Ours: cap replay memory per client to the current task private length, spread evenly across old exemplar classes')
+    parser.add_argument('--replay_min_per_class', type=int, default=128,
+                        help='Ours: minimum replay exemplars per old class when replay_cap is enabled')
+    parser.add_argument('--replay_balance', type=float, default=1.0,
+                        help='Ours4: target old:new replay ratio knob (>1 more stability, <1 more plasticity)')
+    parser.add_argument('--robust_threshold', type=float, default=0.9,
                         help='Ours: Blom robust-filter discard threshold')
     parser.add_argument('--robust_workers', type=int, default=8,
                         help='Ours: Blom robust-filter workers')
@@ -228,11 +234,16 @@ def main():
         parts.append(f"rel{args.ours_proto_rel_lambda}")
         parts.append(f"enc{args.ours_encoder_lr_factor}")
         parts.append("meanlogits" if args.no_filter else f"blom{args.robust_threshold}")
-    if args.cil in ('ours2', 'ours3'):
+    if args.cil in ('ours2', 'ours3', 'ours4'):
         parts.append(f"mem{args.memory}")
         parts.append(f"kg{args.ours_kd_gamma}")
+        parts.append("cap" if args.replay_cap else "nocap")
+        if args.replay_cap:
+            parts.append(f"rmin{args.replay_min_per_class}")
         if args.cil == 'ours3':
             parts.append("gated")
+        if args.cil == 'ours4':
+            parts.append(f"rbal{args.replay_balance}")
         parts.append(f"eva{0.95}_blom{args.robust_threshold}")
     if args.strategy == 'FedSSD':
         parts.append(f"ssd{args.m_max}")
@@ -271,6 +282,9 @@ def main():
         ours_proto_rel_lambda=args.ours_proto_rel_lambda,
         ours_encoder_lr_factor=args.ours_encoder_lr_factor,
         ours_drift_temp=args.ours_drift_temp,
+        replay_cap=args.replay_cap,
+        replay_min_per_class=args.replay_min_per_class,
+        replay_balance=args.replay_balance,
         robust_threshold=args.robust_threshold,
         robust_workers=args.robust_workers,
         no_filter=args.no_filter,
