@@ -1,0 +1,268 @@
+\begin{thebibliography}{10}
+
+\bibitem{acar2021feddyn}
+Durmus Alp~Emre Acar, Yue Zhao, Ramon~Matas Navarro, Matthew Mattina, Paul~N
+  Whatmough, and Venkatesh Saligrama.
+\newblock Federated learning based on dynamic regularization.
+\newblock {\em arXiv preprint arXiv:2111.04263}, 2021.
+
+\bibitem{baruch2019little}
+Gilad Baruch, Moran Baruch, and Yoav Goldberg.
+\newblock A little is enough: Circumventing defenses for distributed learning.
+\newblock {\em Advances in Neural Information Processing Systems}, 32, 2019.
+
+\bibitem{beltran2023dflsurvey}
+Enrique Tom{\'a}s~Mart{\'\i}nez Beltr{\'a}n, Mario~Quiles P{\'e}rez, Pedro
+  Miguel~S{\'a}nchez S{\'a}nchez, Sergio~L{\'o}pez Bernal, G{\'e}r{\^o}me
+  Bovet, Manuel~Gil P{\'e}rez, Gregorio~Mart{\'\i}nez P{\'e}rez, and
+  Alberto~Huertas Celdr{\'a}n.
+\newblock Decentralized federated learning: Fundamentals, state of the art,
+  frameworks, trends, and challenges.
+\newblock {\em IEEE Communications Surveys \& Tutorials}, 25(4):2983--3013,
+  2023.
+
+\bibitem{blanchard2017krum}
+Peva Blanchard, El~Mahdi El~Mhamdi, Rachid Guerraoui, and Julien Stainer.
+\newblock Machine learning with adversaries: Byzantine tolerant gradient
+  descent.
+\newblock {\em Advances in neural information processing systems}, 30, 2017.
+
+\bibitem{blom}
+Gunnar Blom.
+\newblock {\em Statistical Estimates and Transformed Beta-Variables}.
+\newblock Almqvist \& Wiksell, Stockholm, 1958.
+
+\bibitem{bonawitz2016secagg}
+Keith Bonawitz, Vladimir Ivanov, Ben Kreuter, Antonio Marcedone, H~Brendan
+  McMahan, Sarvar Patel, Daniel Ramage, Aaron Segal, and Karn Seth.
+\newblock Practical secure aggregation for federated learning on user-held
+  data.
+\newblock {\em arXiv preprint arXiv:1611.04482}, 2016.
+
+\bibitem{cao2020fltrust}
+Xiaoyu Cao, Minghong Fang, Jia Liu, and Neil~Zhenqiang Gong.
+\newblock Fltrust: Byzantine-robust federated learning via trust bootstrapping.
+\newblock {\em arXiv preprint arXiv:2012.13995}, 2020.
+
+\bibitem{chang2019cronus}
+Hongyan Chang, Virat Shejwalkar, Reza Shokri, and Amir Houmansadr.
+\newblock Cronus: Robust and heterogeneous collaborative learning with
+  black-box knowledge transfer.
+\newblock {\em arXiv preprint arXiv:1912.11279}, 2019.
+
+\bibitem{fang2020attacks}
+Minghong Fang, Xiaoyu Cao, Jinyuan Jia, and Neil Gong.
+\newblock Local model poisoning attacks to $\{$Byzantine-Robust$\}$ federated
+  learning.
+\newblock In {\em 29th USENIX security symposium (USENIX Security 20)}, pages
+  1605--1622, 2020.
+
+\bibitem{friha20232dfl-ids}
+Othmane Friha, Mohamed~Amine Ferrag, Mohamed Benbouzid, Tarek Berghout, Burak
+  Kantarci, and Kim-Kwang~Raymond Choo.
+\newblock 2df-ids: Decentralized and differentially private federated
+  learning-based intrusion detection system for industrial iot.
+\newblock {\em Computers \& Security}, 127:103097, 2023.
+
+\bibitem{ganju2018inference}
+Karan Ganju, Qi~Wang, Wei Yang, Carl~A Gunter, and Nikita Borisov.
+\newblock Property inference attacks on fully connected neural networks using
+  permutation invariant representations.
+\newblock In {\em Proceedings of the 2018 ACM SIGSAC conference on computer and
+  communications security}, pages 619--633, 2018.
+
+\bibitem{geiping2020inverting}
+Jonas Geiping, Hartmut Bauermeister, Hannah Dr{\"o}ge, and Michael Moeller.
+\newblock Inverting gradients-how easy is it to break privacy in federated
+  learning?
+\newblock {\em Advances in neural information processing systems},
+  33:16937--16947, 2020.
+
+\bibitem{guerraoui2018bulyan}
+Rachid Guerraoui, S{\'e}bastien Rouault, et~al.
+\newblock The hidden vulnerability of distributed learning in byzantium.
+\newblock In {\em International conference on machine learning}, pages
+  3521--3530. PMLR, 2018.
+
+\bibitem{he2022fedssd}
+Yuting He, Yiqiang Chen, XiaoDong Yang, Hanchao Yu, Yi-Hua Huang, and Yang Gu.
+\newblock Learning critically: Selective self-distillation in federated
+  learning on non-iid data.
+\newblock {\em IEEE Transactions on Big Data}, 10(6):789--800, 2022.
+
+\bibitem{hinton2015kd}
+Geoffrey Hinton, Oriol Vinyals, and Jeff Dean.
+\newblock Distilling the knowledge in a neural network.
+\newblock {\em arXiv preprint arXiv:1503.02531}, 2015.
+
+\bibitem{jeong2018federateddistillation}
+Eunjeong Jeong, Seungeun Oh, Hyesung Kim, Jihong Park, Mehdi Bennis, and
+  Seong-Lyun Kim.
+\newblock Communication-efficient on-device machine learning: Federated
+  distillation and augmentation under non-iid private data.
+\newblock {\em arXiv preprint arXiv:1811.11479}, 2018.
+
+\bibitem{kim2022fedmlb}
+Jinkyu Kim, Geeho Kim, and Bohyung Han.
+\newblock Multi-level branched regularization for federated learning.
+\newblock In {\em International Conference on Machine Learning}, pages
+  11058--11073. PMLR, 2022.
+
+\bibitem{li2020deepfed}
+Beibei Li, Yuhao Wu, Jiarui Song, Rongxing Lu, Tao Li, and Liang Zhao.
+\newblock Deepfed: Federated deep learning for intrusion detection in
+  industrial cyber--physical systems.
+\newblock {\em IEEE Transactions on Industrial Informatics}, 17(8):5615--5624,
+  2020.
+
+\bibitem{li2019fedmd}
+Daliang Li and Junpu Wang.
+\newblock Fedmd: Heterogenous federated learning via model distillation.
+\newblock {\em arXiv preprint arXiv:1910.03581}, 2019.
+
+\bibitem{li2024fdsurvey}
+Lin Li, Jianping Gou, Baosheng Yu, Lan Du, and Zhang Yiand~Dacheng Tao.
+\newblock Federated distillation: A survey.
+\newblock {\em arXiv preprint arXiv:2404.08564}, 2024.
+
+\bibitem{li2020fedprox}
+Tian Li, Anit~Kumar Sahu, Manzil Zaheer, Maziar Sanjabi, Ameet Talwalkar, and
+  Virginia Smith.
+\newblock Federated optimization in heterogeneous networks.
+\newblock {\em Proceedings of Machine learning and systems}, 2:429--450, 2020.
+
+\bibitem{liu2020energy}
+Weitang Liu, Xiaoyun Wang, John Owens, and Yixuan Li.
+\newblock Energy-based out-of-distribution detection.
+\newblock {\em Advances in neural information processing systems},
+  33:21464--21475, 2020.
+
+\bibitem{mcinnes2017hdbscan}
+Leland McInnes, John Healy, Steve Astels, et~al.
+\newblock hdbscan: Hierarchical density based clustering.
+\newblock {\em J. Open Source Softw.}, 2(11):205, 2017.
+
+\bibitem{fedavg}
+Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, and Blaise~Aguera
+  y~Arcas.
+\newblock Communication-efficient learning of deep networks from decentralized
+  data.
+\newblock In {\em Artificial intelligence and statistics}, pages 1273--1282.
+  Pmlr, 2017.
+
+\bibitem{melis2019mia}
+Luca Melis, Congzheng Song, Emiliano De~Cristofaro, and Vitaly Shmatikov.
+\newblock Exploiting unintended feature leakage in collaborative learning.
+\newblock In {\em 2019 IEEE symposium on security and privacy (SP)}, pages
+  691--706. IEEE, 2019.
+
+\bibitem{nakip2023dfl-ids}
+Mert Nakip, Baran~Can G{\"u}l, and Erol Gelenbe.
+\newblock Decentralized online federated g-network learning for lightweight
+  intrusion detection.
+\newblock In {\em 2023 31st international symposium on modeling, analysis, and
+  simulation of computer and telecommunication systems (MASCOTS)}, pages 1--8.
+  IEEE, 2023.
+
+\bibitem{netgear2024report}
+{NETGEAR}.
+\newblock The 2024 iot security landscape report.
+\newblock \url{https://www.netgear.com/hub/network/2024-iot-threat-report/},
+  2024.
+\newblock Accessed 2026-06-06.
+
+\bibitem{nguyen2022flame}
+Thien~Duc Nguyen, Phillip Rieger, Huili Chen, Hossein Yalame, Helen
+  M{\"o}llering, Hossein Fereidooni, Samuel Marchal, Markus Miettinen, Azalia
+  Mirhoseini, Shaza Zeitouni, et~al.
+\newblock $\{$FLAME$\}$: Taming backdoors in federated learning.
+\newblock In {\em 31st USENIX security symposium (USENIX Security 22)}, pages
+  1415--1432, 2022.
+
+\bibitem{pyrgelis2017knockknock}
+Apostolos Pyrgelis, Carmela Troncoso, and Emiliano De~Cristofaro.
+\newblock Knock knock, who's there? membership inference on aggregate location
+  data.
+\newblock {\em arXiv preprint arXiv:1708.06145}, 2017.
+
+\bibitem{roux2025byzantine}
+Christophe Roux, Max Zimmer, and Sebastian Pokutta.
+\newblock On the byzantine-resilience of distillation-based federated learning.
+\newblock In {\em International Conference on Learning Representations}, volume
+  2025, pages 43105--43130, 2025.
+
+\bibitem{braintorrent}
+Abhijit~Guha Roy, Shayan Siddiqui, Sebastian P{\"o}lsterl, Nassir Navab, and
+  Christian Wachinger.
+\newblock Braintorrent: A peer-to-peer environment for decentralized federated
+  learning.
+\newblock {\em arXiv preprint arXiv:1905.06731}, 2019.
+
+\bibitem{sonicwall2024report}
+{SonicWall}.
+\newblock 2024 mid-year cyber threat report.
+\newblock
+  \url{https://www.tdsynnex.com/na/us/cybersolv/wp-content/uploads/sites/10/2024/11/SonicWall-2024-Mid-Year-Cyber-Threat-Report.pdf},
+  2024.
+\newblock Accessed 2026-06-06.
+
+\bibitem{tan2022fedproto}
+Yue Tan, Guodong Long, Lu~Liu, Tianyi Zhou, Qinghua Lu, Jing Jiang, and Chengqi
+  Zhang.
+\newblock Fedproto: Federated prototype learning across heterogeneous clients.
+\newblock In {\em Proceedings of the AAAI conference on artificial
+  intelligence}, volume~36, pages 8432--8440, 2022.
+
+\bibitem{hackernews2026report}
+{The Hacker News}.
+\newblock Doj disrupts 3 million-device iot botnets behind record 31.4 tbps
+  ddos attacks.
+\newblock
+  \url{https://thehackernews.com/2026/03/doj-disrupts-3-million-device-iot.html},
+  2026.
+\newblock Accessed 2026-06-06.
+
+\bibitem{tolpegin2020targetedflip}
+Vale Tolpegin, Stacey Truex, Mehmet~Emre Gursoy, and Ling Liu.
+\newblock Data poisoning attacks against federated learning systems.
+\newblock In {\em European symposium on research in computer security}, pages
+  480--501. Springer, 2020.
+
+\bibitem{xiang2025ekd}
+Liangyu Xiang, Junyu Gao, and Changsheng Xu.
+\newblock Evidential knowledge distillation.
+\newblock In {\em Proceedings of the IEEE/CVF International Conference on
+  Computer Vision}, pages 2814--2824, 2025.
+
+\bibitem{xie2025poisonedfl}
+Yueqi Xie, Minghong Fang, and Neil~Zhenqiang Gong.
+\newblock Model poisoning attacks to federated learning via multi-round
+  consistency.
+\newblock In {\em Proceedings of the Computer Vision and Pattern Recognition
+  Conference}, pages 15454--15463, 2025.
+
+\bibitem{yin2018fedcomed}
+Dong Yin, Yudong Chen, Ramchandran Kannan, and Peter Bartlett.
+\newblock Byzantine-robust distributed learning: Towards optimal statistical
+  rates.
+\newblock In {\em International conference on machine learning}, pages
+  5650--5659. Pmlr, 2018.
+
+\bibitem{zhao2020idlg}
+Bo~Zhao, Konda~Reddy Mopuri, and Hakan Bilen.
+\newblock idlg: Improved deep leakage from gradients.
+\newblock {\em arXiv preprint arXiv:2001.02610}, 2020.
+
+\bibitem{zhao2022ssfl}
+Ruijie Zhao, Yijun Wang, Zhi Xue, Tomoaki Ohtsuki, Bamidele Adebisi, and Guan
+  Gui.
+\newblock Semisupervised federated-learning-based intrusion detection method
+  for internet of things.
+\newblock {\em IEEE Internet of Things Journal}, 10(10):8645--8657, 2022.
+
+\bibitem{zhu2019dlg}
+Ligeng Zhu, Zhijian Liu, and Song Han.
+\newblock Deep leakage from gradients.
+\newblock {\em Advances in neural information processing systems}, 32, 2019.
+
+\end{thebibliography}

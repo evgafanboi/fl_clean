@@ -88,6 +88,31 @@ def _save_client_weights(weight_dir, round_num, client_ids, client_weights):
             pickle.dump(weights, f)
 
 
+def _cleanup_old_weight_tasks(weight_record_dir, keep_last):
+    if keep_last <= 0 or not weight_record_dir.exists():
+        return
+    for task_dir in sorted(weight_record_dir.glob("task_*")):
+        if not task_dir.is_dir():
+            continue
+        round_dirs = []
+        for rd in task_dir.glob("round_*"):
+            if rd.is_dir():
+                try:
+                    round_num = int(rd.name.split("_")[1])
+                    round_dirs.append((round_num, rd))
+                except (IndexError, ValueError):
+                    continue
+        round_dirs.sort(key=lambda x: x[0])
+        for _, rd in round_dirs[:-keep_last]:
+            shutil.rmtree(rd, ignore_errors=True)
+            print(f"{COLORS.WARNING}Cleaned up {rd}{COLORS.ENDC}")
+
+    cache_dir = weight_record_dir / "ours_cache"
+    if cache_dir.is_dir():
+        shutil.rmtree(str(cache_dir), ignore_errors=True)
+        print(f"{COLORS.WARNING}Cleaned up {cache_dir}{COLORS.ENDC}")
+
+
 def _support_weighted_metrics(task_metrics, supports, loss):
     if not task_metrics:
         keys = ['acc', 'prec_macro', 'rec_macro', 'f1_macro',
@@ -1102,10 +1127,8 @@ def run_fcil_pipeline(config: FCILConfig):
     if _ckpt_enabled and ckpt_dir and os.path.isdir(ckpt_dir):
         shutil.rmtree(ckpt_dir, ignore_errors=True)
 
-    cache_dir = weight_record_dir / "ours_cache"
-    if cache_dir.is_dir():
-        shutil.rmtree(str(cache_dir), ignore_errors=True)
-        print(f"{COLORS.WARNING}Cleaned up {cache_dir}{COLORS.ENDC}")
+    if config.keep_last_rounds > 0:
+        _cleanup_old_weight_tasks(weight_record_dir, config.keep_last_rounds)
 
 def run_no_global_pipeline(config: FCILConfig):
     """Pipeline for PASS method - no global model, per-client prototype distillation"""
@@ -1137,7 +1160,8 @@ def run_no_global_pipeline(config: FCILConfig):
                            ekd_epochs=config.ours_ekd_epochs,
                            ekd_lambda=config.ours_ekd_lambda,
                            replay_cap=config.replay_cap,
-                           replay_min_per_class=config.replay_min_per_class)
+                           replay_min_per_class=config.replay_min_per_class,
+                           eva_quantile=config.eva_quantile)
     elif config.cil_method == "ours3":
         from .cil.ours3 import Ours3
         cil_method = Ours3(num_classes=num_classes, memory=config.icarl_memory,
@@ -1147,7 +1171,8 @@ def run_no_global_pipeline(config: FCILConfig):
                            ekd_epochs=config.ours_ekd_epochs,
                            ekd_lambda=config.ours_ekd_lambda,
                            replay_cap=config.replay_cap,
-                           replay_min_per_class=config.replay_min_per_class)
+                           replay_min_per_class=config.replay_min_per_class,
+                           eva_quantile=config.eva_quantile)
     elif config.cil_method == "ours4":
         from .cil.ours4 import Ours4
         cil_method = Ours4(num_classes=num_classes, memory=config.icarl_memory,
@@ -1158,7 +1183,9 @@ def run_no_global_pipeline(config: FCILConfig):
                            ekd_lambda=config.ours_ekd_lambda,
                            replay_cap=config.replay_cap,
                            replay_min_per_class=config.replay_min_per_class,
-                           replay_balance=config.replay_balance)
+                           replay_balance=config.replay_balance,
+                           entropy_beta=config.ours_entropy_beta,
+                           eva_quantile=config.eva_quantile)
     else:
         from .cil.ours import Ours
         cil_method = Ours(num_classes=num_classes, lam=config.ours_proto_lambda,
@@ -1482,10 +1509,8 @@ def run_no_global_pipeline(config: FCILConfig):
     if hasattr(cil_method, "cleanup_temp"):
         cil_method.cleanup_temp()
 
-    cache_dir = weight_record_dir / "ours_cache"
-    if cache_dir.is_dir():
-        shutil.rmtree(str(cache_dir), ignore_errors=True)
-        print(f"{COLORS.WARNING}Cleaned up {cache_dir}{COLORS.ENDC}")
+    if config.keep_last_rounds > 0:
+        _cleanup_old_weight_tasks(weight_record_dir, config.keep_last_rounds)
 
 
 def _build_cil_method(config: FCILConfig, num_classes: int):
@@ -1549,7 +1574,8 @@ def _build_cil_method(config: FCILConfig, num_classes: int):
                      ekd_epochs=config.ours_ekd_epochs,
                      ekd_lambda=config.ours_ekd_lambda,
                      replay_cap=config.replay_cap,
-                     replay_min_per_class=config.replay_min_per_class)
+                     replay_min_per_class=config.replay_min_per_class,
+                     eva_quantile=config.eva_quantile)
     if config.cil_method == "ours3":
         from .cil.ours3 import Ours3
         return Ours3(num_classes=num_classes, memory=config.icarl_memory,
@@ -1559,7 +1585,8 @@ def _build_cil_method(config: FCILConfig, num_classes: int):
                      ekd_epochs=config.ours_ekd_epochs,
                      ekd_lambda=config.ours_ekd_lambda,
                      replay_cap=config.replay_cap,
-                     replay_min_per_class=config.replay_min_per_class)
+                     replay_min_per_class=config.replay_min_per_class,
+                     eva_quantile=config.eva_quantile)
     if config.cil_method == "ours4":
         from .cil.ours4 import Ours4
         return Ours4(num_classes=num_classes, memory=config.icarl_memory,
@@ -1570,7 +1597,9 @@ def _build_cil_method(config: FCILConfig, num_classes: int):
                      ekd_lambda=config.ours_ekd_lambda,
                      replay_cap=config.replay_cap,
                      replay_min_per_class=config.replay_min_per_class,
-                     replay_balance=config.replay_balance)
+                     replay_balance=config.replay_balance,
+                     entropy_beta=config.ours_entropy_beta,
+                     eva_quantile=config.eva_quantile)
     from .cil.ours import Ours
     return Ours(num_classes=num_classes, lam=config.ours_proto_lambda,
                 gamma=config.ours_kd_gamma, proto_size=config.cbkd_proto_size,

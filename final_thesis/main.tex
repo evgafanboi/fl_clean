@@ -1,0 +1,73 @@
+\documentclass[12pt, oneside]{thesis}
+
+\begin{document}
+
+\frontmatter\pagestyle{plain}
+
+\input{covers/title_page}
+\input{covers/second_title_page}
+\input{covers/hoi_dong}
+
+\chapter*{LỜI CẢM ƠN}
+\addcontentsline{toc}{chapter}{\textbf{LỜI CẢM ƠN}}
+
+Chúng em xin bày tỏ lòng biết ơn sâu sắc đến quý thầy cô Khoa Mạng máy tính và Truyền thông, Trường Đại học Công nghệ Thông tin, Đại học Quốc gia Thành phố Hồ Chí Minh, những người đã truyền đạt nền tảng kiến thức chuyên môn, phương pháp tư duy khoa học và tinh thần làm việc nghiêm túc trong suốt quá trình học tập. Những bài giảng, những buổi thảo luận và những góp ý học thuật đã tạo nên cơ sở vững chắc để đề tài này được hình thành và phát triển theo hướng bài bản, có hệ thống và phù hợp với định hướng nghiên cứu của ngành.
+
+Đặc biệt, chúng em xin trân trọng cảm ơn ThS. Nguyễn Hữu Quyền, giảng viên hướng dẫn của khóa luận. Trong suốt quá trình thực hiện đề tài, từ giai đoạn xác định vấn đề nghiên cứu, xây dựng cơ sở lý thuyết, thiết kế hệ thống cho đến triển khai thực nghiệm và hoàn thiện bản thảo, sự hướng dẫn tận tình và những góp ý chi tiết của thầy đã giúp chúng em nhìn nhận vấn đề một cách chặt chẽ và toàn diện hơn. Những buổi trao đổi chuyên môn không chỉ dừng lại ở việc chỉnh sửa nội dung, mà còn định hình phương pháp tiếp cận khoa học, cách tổ chức lập luận và cách trình bày kết quả một cách mạch lạc. Sự nghiêm túc trong học thuật và tinh thần trách nhiệm của thầy là nguồn động lực quan trọng để đề tài này được hoàn thiện với chất lượng tốt nhất trong khả năng của chúng em.
+
+Bên cạnh đó, chúng em xin gửi lời cảm ơn đến tập thể cán bộ, giảng viên và nhân viên của Khoa đã tạo điều kiện thuận lợi về cơ sở vật chất, tài liệu tham khảo và môi trường học tập.
+
+Chúng em cũng xin bày tỏ lòng biết ơn đối với gia đình, những người luôn âm thầm ủng hộ và tạo điều kiện tốt nhất để việc học tập và nghiên cứu được diễn ra liên tục và ổn định. Sự động viên, tin tưởng và chia sẻ từ gia đình là chỗ dựa tinh thần quan trọng trong những giai đoạn gặp khó khăn về học thuật cũng như áp lực tiến độ.
+
+Cuối cùng, chúng em nhận định rằng khóa luận này vẫn còn những hạn chế nhất định do phạm vi nghiên cứu và kinh nghiệm còn khiêm tốn. Những góp ý và nhận xét từ quý thầy cô sẽ là cơ sở quan trọng để tiếp tục hoàn thiện kiến thức và định hướng nghiên cứu trong tương lai.
+
+\renewcommand{\contentsname}{NỘI DUNG}
+\tableofcontents
+
+\renewcommand{\figurename}{Hình}
+\renewcommand{\listfigurename}{DANH SÁCH HÌNH ẢNH}
+\addcontentsline{toc}{section}{\textbf{\listfigurename}}
+\listoffigures
+\newpage
+
+\renewcommand{\tablename}{Bảng}
+\renewcommand{\listtablename}{DANH SÁCH BẢNG BIỂU}
+\addcontentsline{toc}{section}{\textbf{\listtablename}}
+\listoftables
+\newpage
+
+\chapter*{DANH MỤC TỪ VIẾT TẮT}
+\addcontentsline{toc}{chapter}{\textbf{DANH MỤC TỪ VIẾT TẮT}}
+\begin{abbreviations}{ll}
+	IDS & Intrusion Detection System \\
+	FL & Federated Learning \\
+	FD & Federated Distillation \\
+	CIL & Class-Incremental Learning \\
+	FCIL & Federated Class-Incremental Learning \\
+	KD & Knowledge Distillation \\
+	IID & Independent and Identically Distributed \\
+	non-IID & Non-Independent and Identically Distributed \\
+	GRU & Gated Recurrent Unit \\
+	MLP & Multi-Layer Perceptron \\
+	SIEM & Security Information and Event Management \\
+\end{abbreviations}
+
+\mainmatter
+\include{chapters/0.tom_tat}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{}
+\lhead{\itshape\small\leftmark}
+\cfoot{\thepage}
+
+\include{chapters/1.tong_quan_de_tai}
+\include{chapters/2.co_so_ly_thuyet}
+\include{chapters/3.phuong_phap_thuc_hien}
+\include{chapters/4.hien_thuc_danh_gia_thao_luan}
+\include{chapters/5.ket_luan}
+
+\printbibliography[title={TÀI LIỆU THAM KHẢO}]
+\addcontentsline{toc}{chapter}{\textbf{TÀI LIỆU THAM KHẢO}}
+
+\end{document}

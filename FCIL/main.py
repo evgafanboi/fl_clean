@@ -114,6 +114,10 @@ def main():
                         help='Ours: minimum replay exemplars per old class when replay_cap is enabled')
     parser.add_argument('--replay_balance', type=float, default=1.0,
                         help='Ours4: target old:new replay ratio knob (>1 more stability, <1 more plasticity)')
+    parser.add_argument('--ours_entropy_beta', type=float, default=0.02,
+                        help='Ours4: entropy regularization beta (penalize overconfidence, 0=disabled)')
+    parser.add_argument('--eva_quantile', type=float, default=0.95,
+                        help='Ours: EVA energy threshold quantile (higher = more aggressive filtering)')
     parser.add_argument('--robust_threshold', type=float, default=0.9,
                         help='Ours: Blom robust-filter discard threshold')
     parser.add_argument('--robust_workers', type=int, default=8,
@@ -155,6 +159,8 @@ def main():
                         help='Evaluate only at the last round of each task')
     parser.add_argument('--sweep_eval', action='store_true',
                         help='Skip training: load saved weight records of the matching run and re-evaluate only')
+    parser.add_argument('--keep_last_rounds', type=int, default=2,
+                        help='Keep only last N round weight records per task (0=keep all)')
     
     args = parser.parse_args()
     if args.feat_lambda is None:
@@ -244,7 +250,9 @@ def main():
             parts.append("gated")
         if args.cil == 'ours4':
             parts.append(f"rbal{args.replay_balance}")
-        parts.append(f"eva{0.95}_blom{args.robust_threshold}")
+            if args.ours_entropy_beta > 0:
+                parts.append(f"eb{args.ours_entropy_beta}")
+        parts.append(f"eva{args.eva_quantile}_blom{args.robust_threshold}")
     if args.strategy == 'FedSSD':
         parts.append(f"ssd{args.m_max}")
     log_file = f"results_cil/{'_'.join(parts)}.log"
@@ -285,6 +293,8 @@ def main():
         replay_cap=args.replay_cap,
         replay_min_per_class=args.replay_min_per_class,
         replay_balance=args.replay_balance,
+        ours_entropy_beta=args.ours_entropy_beta,
+        eva_quantile=args.eva_quantile,
         robust_threshold=args.robust_threshold,
         robust_workers=args.robust_workers,
         no_filter=args.no_filter,
@@ -303,6 +313,7 @@ def main():
         fresh_run=args.fresh_run,
         last_eval=args.last_eval,
         sweep_eval=args.sweep_eval,
+        keep_last_rounds=args.keep_last_rounds,
     )
     
     if config.sweep_eval:

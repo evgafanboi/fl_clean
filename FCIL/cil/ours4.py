@@ -1,4 +1,5 @@
 import numpy as np
+from .ours2 import LOGIT_CLIP
 from .ours3 import Ours3
 
 
@@ -6,7 +7,8 @@ class Ours4(Ours3):
     def __init__(self, num_classes: int, memory: float = 1.0, kd_gamma: float = 1.0,
                  robust_threshold: float = 0.9, robust_workers: int = 8,
                  ekd_epochs: int = 1, ekd_lambda: float = 1.0, replay_cap: bool = True,
-                 replay_min_per_class: int = 128, replay_balance: float = 1.0):
+                 replay_min_per_class: int = 128, replay_balance: float = 1.0,
+                 entropy_beta: float = 0.02, eva_quantile: float = 0.95):
         super().__init__(num_classes=num_classes,
                          memory=memory,
                          kd_gamma=kd_gamma,
@@ -15,9 +17,11 @@ class Ours4(Ours3):
                          ekd_epochs=ekd_epochs,
                          ekd_lambda=ekd_lambda,
                          replay_cap=replay_cap,
-                         replay_min_per_class=replay_min_per_class)
+                         replay_min_per_class=replay_min_per_class,
+                         eva_quantile=eva_quantile)
         self.name = 'Ours4'
         self.replay_balance = float(replay_balance)
+        self.entropy_beta = float(entropy_beta)
         self._last_replay_budget = 0
         self._last_replay_per_class = 0
         self._last_private_mean = 0.0
@@ -39,6 +43,32 @@ class Ours4(Ours3):
         budget = min(int(np.floor(target)), exemplar_total)
         per_class = int(np.floor(budget / max(n_old_classes, 1)))
         return budget, per_class, n_priv_mean, n_ex_mean, target
+
+    def get_train_step(self, model, optimizer, loss_fn):
+        import torch
+        import torch.nn.functional as F
+        dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model.nn.to(dev)
+        beta = self.entropy_beta
+        def step(X_b, y_b):
+            X_b = X_b.to(dev); y_b = y_b.to(dev)
+            y_cls = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
+            model.nn.train()
+            optimizer.zero_grad(set_to_none=True)
+            logits = torch.clamp(model.nn(X_b, return_logits=True), -LOGIT_CLIP, LOGIT_CLIP)
+            ce_loss = F.cross_entropy(logits, y_cls, label_smoothing=0.05)
+            if beta > 0:
+                probs = F.softmax(logits, dim=-1)
+                entropy = -(probs * torch.log(probs + 1e-8)).sum(-1).mean()
+                total = ce_loss - beta * entropy
+            else:
+                total = ce_loss
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(model.nn.parameters(), 1.0)
+            optimizer.step()
+            self._last_ce = float(ce_loss.item())
+            return ce_loss.item(), 0.0, total.item()
+        return step
 
     def build_dataset(self, X_path: str, y_path: str, batch_size: int):
         import torch

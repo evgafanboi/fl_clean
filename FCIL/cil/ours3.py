@@ -6,8 +6,9 @@ class Ours3(Ours2):
     def __init__(self, num_classes: int, memory: float = 1.0, kd_gamma: float = 1.0,
                  robust_threshold: float = 0.9, robust_workers: int = 8,
                  ekd_epochs: int = 1, ekd_lambda: float = 1.0, replay_cap: bool = True,
-                 replay_min_per_class: int = 128):
-        super().__init__(num_classes, memory, kd_gamma, robust_threshold, robust_workers, ekd_epochs, ekd_lambda, replay_cap, replay_min_per_class)
+                 replay_min_per_class: int = 128, eva_quantile: float = 0.95):
+        super().__init__(num_classes, memory, kd_gamma, robust_threshold, robust_workers,
+                         ekd_epochs, ekd_lambda, replay_cap, replay_min_per_class, eva_quantile)
         self.name = 'Ours3'
         self._last_replay_support = 0.0
         self._last_replay_kept = 0

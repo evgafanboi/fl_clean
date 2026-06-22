@@ -71,6 +71,8 @@ class FCILConfig:
     replay_cap: bool = True
     replay_min_per_class: int = 128
     replay_balance: float = 1.0
+    ours_entropy_beta: float = 0.0
+    eva_quantile: float = 0.95
     robust_threshold: float = 0.3
     robust_workers: int = 8
     no_filter: bool = False
@@ -88,3 +90,4 @@ class FCILConfig:
     # Eval scheduling
     last_eval: bool = False
     sweep_eval: bool = False
+    keep_last_rounds: int = 2

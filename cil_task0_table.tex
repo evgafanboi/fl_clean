@@ -1,0 +1,36 @@
+\begin{table}[H]
+    \centering
+    \caption{Kết quả thí nghiệm học tiệm tiến - Task 0.}
+    \label{tab:cil_results_task0}
+    \resizebox{\linewidth}{!}{
+    \begin{tabular}{lcccccccccc}
+        \hline
+        \multirow{2}{*}{Thuật toán} & \multirow{2}{*}{Accuracy} & \multicolumn{3}{c}{Macro} & \multicolumn{3}{c}{Weighted} & \multicolumn{3}{c}{Micro} \\
+        \cline{3-5} \cline{6-8} \cline{9-11}
+        & & Prec & Rec & F1 & Prec & Rec & F1 & Prec & Rec & F1 \\
+        \hline
+        FedAvg & \cellcolor{green!90!black}0.9921 & 0.0869 & 0.0879 & 0.0874 & \cellcolor{green!90!black}0.9864 & \cellcolor{green!90!black}0.9921 & \cellcolor{green!90!black}0.9892 & \cellcolor{green!90!black}0.9921 & \cellcolor{green!90!black}0.9921 & \cellcolor{green!90!black}0.9921 \\
+        \hline
+        \multicolumn{11}{l}{\textit{Regularization-based}} \\
+        FedAvg-EWC & 0.9921 & 0.0870 & 0.0878 & 0.0874 & 0.9863 & 0.9921 & 0.9892 & 0.9921 & 0.9921 & 0.9921 \\
+        FedAvg-MAS & 0.9920 & 0.0869 & 0.0878 & 0.0874 & 0.9862 & 0.9920 & 0.9891 & 0.9920 & 0.9920 & 0.9920 \\
+        FedAvg-LwF & \cellcolor{green!30}0.9921 & 0.5912 & \cellcolor{green!90!black}0.5970 & \cellcolor{green!90!black}0.5941 & \cellcolor{green!30}0.9863 & \cellcolor{green!30}0.9921 & \cellcolor{green!30}0.9892 & \cellcolor{green!30}0.9921 & \cellcolor{green!30}0.9921 & \cellcolor{green!30}0.9921 \\
+        FedAvg-PASS & 0.9920 & \cellcolor{green!60!black}0.5917 & 0.5961 & 0.5939 & 0.9863 & 0.9920 & 0.9891 & 0.9920 & 0.9920 & 0.9920 \\
+        FedAvg-CBKD EFCIL & 0.9919 & 0.5910 & \cellcolor{green!30}0.5970 & \cellcolor{green!30}0.5940 & 0.9862 & 0.9919 & 0.9890 & 0.9919 & 0.9919 & 0.9919 \\
+        \hline
+        \multicolumn{11}{l}{\textit{Replay-based}} \\
+        FedAvg-iCaRL & 0.9879 & 0.5831 & 0.5953 & 0.5890 & 0.9824 & 0.9879 & 0.9850 & 0.9879 & 0.9879 & 0.9879 \\
+        FedAvg-BiC & 0.9894 & 0.5896 & 0.5955 & 0.5925 & 0.9838 & 0.9894 & 0.9865 & 0.9894 & 0.9894 & 0.9894 \\
+        \hline
+        \multicolumn{11}{l}{\textit{Dynamic architecture-based}} \\
+        FedAvg-FOSTER & 0.9918 & \cellcolor{green!90!black}0.5913 & 0.5963 & 0.5938 & 0.9860 & 0.9918 & 0.9889 & 0.9918 & 0.9918 & 0.9918 \\
+        \hline
+        \multicolumn{11}{l}{\textit{Federated CIL}} \\
+        FedAvg-FEAT & \cellcolor{green!60!black}0.9923 & \cellcolor{green!30}0.5913 & \cellcolor{green!60!black}0.5972 & \cellcolor{green!60!black}0.5942 & \cellcolor{green!60!black}0.9866 & \cellcolor{green!60!black}0.9923 & \cellcolor{green!60!black}0.9894 & \cellcolor{green!60!black}0.9923 & \cellcolor{green!60!black}0.9923 & \cellcolor{green!60!black}0.9923 \\
+        \hline
+        \multicolumn{11}{l}{\textbf{Đề xuất}} \\
+        Đề xuất (single) & 0.9460 & 0.4055 & 0.3958 & 0.3885 & 0.9109 & 0.9460 & 0.9256 & 0.9460 & 0.9460 & 0.9460 \\
+        Đề xuất (multiple) & 0.9652 & 0.5734 & 0.4673 & 0.4942 & 0.9594 & 0.9652 & 0.9570 & 0.9652 & 0.9652 & 0.9652 \\
+        \hline
+    \end{tabular}}
+\end{table}

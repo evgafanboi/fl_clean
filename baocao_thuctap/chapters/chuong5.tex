@@ -1,0 +1,61 @@
+
+%% ============================================================
+%%  CHƯƠNG 5: KẾT LUẬN VÀ HƯỚNG PHÁT TRIỂN
+%% ============================================================
+\chapter{Kết luận và hướng phát triển}
+
+\section{Đánh giá kết quả thực tập}
+\label{sec:assessment}
+
+Sau 8 tuần thực tập tại Trung tâm An ninh mạng, nhóm tác giả đã đạt được những kết quả sau:
+
+\subsection{Kiến thức và kỹ năng đạt được}
+\begin{itemize}
+    \item \textbf{Về lý thuyết}: Nắm vững các kiến thức nền tảng về hệ thống phát hiện xâm nhập (IDS), học liên kết (Federated Learning), chắt lọc kiến thức liên kết (Federated Distillation), các dạng tấn công độc hại trong môi trường liên kết (Byzantine attacks) và các cơ chế phòng thủ tương ứng.
+    \item \textbf{Về thực hành}: Có khả năng triển khai và cấu hình môi trường thực nghiệm, tiền xử lý dữ liệu mạng, xây dựng và huấn luyện các mô hình học sâu sử dụng TensorFlow và PyTorch, đánh giá hiệu suất mô hình qua các chỉ số chuẩn.
+    \item \textbf{Về kỹ năng mềm}: Phát triển kỹ năng làm việc nhóm, phân chia và quản lý công việc, kỹ năng thuyết trình và báo cáo kết quả nghiên cứu.
+\end{itemize}
+
+\subsection{Sản phẩm đạt được}
+\begin{itemize}
+    \item Thiết kế và đề xuất DFD-IDS, một cơ chế học chắt lọc liên kết phân tán cho phép nhiều kiến trúc mô hình cùng học liên kết, kết hợp thay thế mô hình discriminator bằng energy và có khả năng chống tấn công Byzantine hiệu quả trong quá trình tổng hợp mà vẫn giữ được kết quả phân loại xấp xỉ phương pháp State-of-the-art như SSFL-IDS ở kịch bản không tấn công.
+    \item Bộ mã nguồn hiện thực trên nền tảng TensorFlow 2.11 và PyTorch 2.12.0.
+    \item Kết quả thực nghiệm trên bộ dữ liệu CICIoT23 \cite{neto2023ciciot2023}.
+    \item Báo cáo thực tập tổng hợp các kết quả nghiên cứu và phát triển.
+\end{itemize}
+
+\subsection{Hạn chế}
+Bên cạnh những kết quả đạt được, đề tài vẫn còn một số hạn chế:
+\begin{itemize}
+    \item Cấu hình thực nghiệm còn thiếu đa dạng (về số lượng client và kiến trúc mô hình).
+    \item Đánh giá mới chỉ tập trung vào một bộ dữ liệu CICIoT23, cần mở rộng sang nhiều bộ dữ liệu khác.
+    \item Chưa xem xét các kịch bản tấn công kết hợp, khi các client Byzantine sử dụng nhiều tấn công khác nhau cùng lúc.
+\end{itemize}
+
+\section{Kết luận}
+\label{sec:conclusion}
+
+Nghiên cứu này đã đề xuất thành công DFD-IDS, một hệ thống học máy liên kết phát hiện xâm nhập, trong đó mang lại:
+
+\begin{itemize}
+    \item \textbf{Model heterogeneity}: Sử dụng học chắt lọc cho phép nhiều kiến trúc mô hình khác nhau tham gia học liên kết.
+    \item \textbf{Decentralization}: Thiết kế phân tán giúp loại bỏ việc phụ thuộc vào một máy chủ cố định.
+    \item \textbf{Lightweight discrimination}: Thay thế việc sử dụng một mô hình Discriminator tốn kém bằng cơ chế EVA có khả năng cấu hình ngưỡng đơn giản và ít tốn kém hơn.
+    \item \textbf{Byzantine-robustness}: Có khả năng loại bỏ các client Byzantine khỏi quá trình tổng hợp với hiệu quả cao.
+\end{itemize}
+
+Kết quả thực nghiệm trên bộ dữ liệu CICIoT23 cho thấy độ chính xác $0.9415$, xấp xỉ SSFL-IDS ở $0.9605$ và FedAvg ở $0.9656$, tuy nhiên ở kịch bản tấn công như PoisonedFL ở tỉ lệ $0.2$, phương pháp có độ chính xác bền bỉ trước tấn công Byzantine là $0.9554$ trong khi SSFL-IDS là $0.0061$ và FedAvg là $0.0235$, so với các phòng thủ khác là FLAME ở $0.7292$ và FedKD-IDS ở $0.7173$.
+
+\section{Hướng phát triển}
+\label{sec:future}
+
+Mặc dù DFD-IDS đã cho thấy những kết quả khả quan, vẫn còn một số hướng phát triển trong tương lai:
+
+\begin{itemize}
+    \item \textbf{Triển khai trên môi trường thực tế}: Các thực nghiệm hiện tại được tiến hành trong môi trường mô phỏng. Nghiên cứu trong tương lai nên tập trung vào việc triển khai DFD-IDS trong môi trường mạng thực tế, bao gồm tích hợp với bộ điều khiển SDN và hệ thống SIEM.
+    \item \textbf{Mở rộng quy mô}: Đánh giá giải pháp với số lượng clients lớn hơn (hàng trăm đến hàng nghìn) và các cấu trúc liên kết mạng đa dạng hơn.
+    \item \textbf{Kết hợp học máy khả giải}: Tích hợp các kỹ thuật XAI (SHAP, LIME, GNNExplainer) để cung cấp các giải thích có thể diễn giải được cho các dự đoán IDS, hỗ trợ các nhà phân tích bảo mật trong việc hiểu và xác thực cảnh báo.
+    \item \textbf{Cải thiện hiệu suất}: Tiếp tục cải thiện phương pháp để vượt SSFL-IDS trong điều kiện không có tấn công, nâng cao giá trị thực tiễn của phương pháp.
+\end{itemize}
+
+\pagebreak

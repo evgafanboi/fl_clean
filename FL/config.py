@@ -50,6 +50,7 @@ class FDConfig:
     hamming_tau: float = 0.5
     exp_rho: float = 0.05
     f1_curve: bool = False
+    keep_last_rounds: int = 2
 
     def to_algorithm_params(self) -> dict:
         return {
