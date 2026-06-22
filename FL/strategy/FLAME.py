@@ -85,12 +85,15 @@ class FLAME:
         S_t = float(np.median(delta_norms))
 
         clipped = []
-        n_clipped = 0
+        clipped_ids = []
         for i in admitted:
             gamma = S_t / (delta_norms[i] + 1e-12)
             if delta_norms[i] > S_t:
-                n_clipped += 1
+                clipped_ids.append(i)
             clipped.append(ref_flat + deltas[i] * min(1.0, gamma))
+
+        byzantine_ids = sorted(set(range(n)) - set(admitted) | set(clipped_ids))
+        benign_ids = sorted(set(admitted) - set(clipped_ids))
 
         agg_flat = np.mean(clipped, axis=0)
         sigma = self.lambda_dp * S_t
@@ -98,9 +101,15 @@ class FLAME:
         noise_norm = float(np.linalg.norm(noise))
         agg_flat += noise
 
-        summary = f"[FLAME] S_t={S_t:.4f} | n_clipped={n_clipped}/{len(admitted)} | sigma={sigma:.6f} | noise_l2={noise_norm:.4f}"
+        summary = f"[FLAME] S_t={S_t:.4f} | clipped={len(clipped_ids)}/{len(admitted)} | sigma={sigma:.6f} | noise_l2={noise_norm:.4f}"
         print(f"  {summary}")
         log.info(summary)
+        byz_msg = f"[FLAME] Byzantine (n={len(byzantine_ids)}): excluded={sorted(set(range(n))-set(admitted))} | clipped={clipped_ids}"
+        print(f"  {byz_msg}")
+        log.info(byz_msg)
+        benign_msg = f"[FLAME] Benign   (n={len(benign_ids)}): {benign_ids}"
+        print(f"  {benign_msg}")
+        log.info(benign_msg)
 
         result, offset = [], 0
         for w_ref in weights_list[0]:

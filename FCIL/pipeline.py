@@ -88,6 +88,26 @@ def _save_client_weights(weight_dir, round_num, client_ids, client_weights):
             pickle.dump(weights, f)
 
 
+def _cleanup_old_weight_tasks(weight_record_dir, keep_last):
+    if keep_last <= 0 or not weight_record_dir.exists():
+        return
+    for task_dir in sorted(weight_record_dir.glob("task_*")):
+        if not task_dir.is_dir():
+            continue
+        round_dirs = []
+        for rd in task_dir.glob("round_*"):
+            if rd.is_dir():
+                try:
+                    round_num = int(rd.name.split("_")[1])
+                    round_dirs.append((round_num, rd))
+                except (IndexError, ValueError):
+                    continue
+        round_dirs.sort(key=lambda x: x[0])
+        for _, rd in round_dirs[:-keep_last]:
+            shutil.rmtree(rd, ignore_errors=True)
+            print(f"{COLORS.WARNING}Cleaned up {rd}{COLORS.ENDC}")
+
+
 def _support_weighted_metrics(task_metrics, supports, loss):
     if not task_metrics:
         keys = ['acc', 'prec_macro', 'rec_macro', 'f1_macro',
@@ -1102,6 +1122,9 @@ def run_fcil_pipeline(config: FCILConfig):
     if _ckpt_enabled and ckpt_dir and os.path.isdir(ckpt_dir):
         shutil.rmtree(ckpt_dir, ignore_errors=True)
 
+    if config.keep_last_rounds > 0:
+        _cleanup_old_weight_tasks(weight_record_dir, config.keep_last_rounds)
+
 def run_no_global_pipeline(config: FCILConfig):
     """Pipeline for PASS method - no global model, per-client prototype distillation"""
     task_order = load_task_order(config.task_order_file)
@@ -1153,7 +1176,8 @@ def run_no_global_pipeline(config: FCILConfig):
                            ekd_lambda=config.ours_ekd_lambda,
                            replay_cap=config.replay_cap,
                            replay_min_per_class=config.replay_min_per_class,
-                           replay_balance=config.replay_balance)
+                           replay_balance=config.replay_balance,
+                           entropy_beta=config.ours_entropy_beta)
     else:
         from .cil.ours import Ours
         cil_method = Ours(num_classes=num_classes, lam=config.ours_proto_lambda,
@@ -1277,16 +1301,7 @@ def run_no_global_pipeline(config: FCILConfig):
             client_weights = []
             trained_client_ids = []
             round_losses = []
-            if config.cil_method == "ours4" and hasattr(cil_method, "set_round_private_mean"):
-                private_sizes = []
-                for client_id in range(active_n):
-                    paths = get_task_files(
-                        config.partition_root, config.partition_type,
-                        config.n_clients, client_id, task_id, config.strategy
-                    )
-                    private_sizes.append(len(np.load(paths['X'], mmap_mode='r')))
-                cil_method.set_round_private_mean(float(np.mean(private_sizes)) if private_sizes else 0.0)
-            
+
             # Train each client locally with PASS
             for client_id in range(active_n):
                 if hasattr(cil_method, "set_client"):
@@ -1385,11 +1400,12 @@ def run_no_global_pipeline(config: FCILConfig):
                     _replay_n = getattr(cil_method, "_last_replay_kept", 0)
                     _budget = getattr(cil_method, "_last_replay_budget", 0)
                     _per_class = getattr(cil_method, "_last_replay_per_class", 0)
-                    _priv = getattr(cil_method, "_last_private_mean", 0.0)
+                    _priv = getattr(cil_method, "_last_private_size", 0)
                     _old = getattr(cil_method, "_last_old_classes", 0)
-                    _ex = getattr(cil_method, "_last_exemplar_mean", 0.0)
-                    log(f"{COLORS.OKCYAN}Ours4 losses: CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | round_clients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f} | replay_gate={_gate:.3f} ({_replay_n}) | budget={_budget} | per_class={_per_class} | priv={_priv:.1f} | old={_old} | ex={_ex:.1f}{COLORS.ENDC}",
-                        f"Ours4 | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | RoundClients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f} | replay_gate={_gate:.3f} ({_replay_n}) | budget={_budget} | per_class={_per_class} | priv={_priv:.1f} | old={_old} | ex={_ex:.1f}")
+                    _ex = getattr(cil_method, "_last_exemplar_total", 0)
+                    _kept = getattr(cil_method, "_last_kept_count", 0)
+                    log(f"{COLORS.OKCYAN}Ours4 losses: CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | round_clients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f} | replay_gate={_gate:.3f} ({_replay_n}) | budget={_budget} | per_class={_per_class} | priv={_priv} | old={_old} | ex={_ex} | kept={_kept}{COLORS.ENDC}",
+                        f"Ours4 | T{task_id} | R{round_num + 1} | CE={cil_method._last_ce:.4f} | EKD={avg_ekd:.4f} | RoundClients={cil_method._last_survivors} | EVA support={cil_method._last_eva_support:.3f} | replay_gate={_gate:.3f} ({_replay_n}) | budget={_budget} | per_class={_per_class} | priv={_priv} | old={_old} | ex={_ex} | kept={_kept}")
                 else:
                     pass_local = cil_method._last_ce + cil_method._last_kd + cil_method._last_proto + cil_method._last_rel
                     pass_total = pass_local + avg_ekd
@@ -1477,6 +1493,9 @@ def run_no_global_pipeline(config: FCILConfig):
     if hasattr(cil_method, "cleanup_temp"):
         cil_method.cleanup_temp()
 
+    if config.keep_last_rounds > 0:
+        _cleanup_old_weight_tasks(weight_record_dir, config.keep_last_rounds)
+
 
 def _build_cil_method(config: FCILConfig, num_classes: int):
     if config.cil_method == "finetune":
@@ -1560,7 +1579,8 @@ def _build_cil_method(config: FCILConfig, num_classes: int):
                      ekd_lambda=config.ours_ekd_lambda,
                      replay_cap=config.replay_cap,
                      replay_min_per_class=config.replay_min_per_class,
-                     replay_balance=config.replay_balance)
+                     replay_balance=config.replay_balance,
+                     entropy_beta=config.ours_entropy_beta)
     from .cil.ours import Ours
     return Ours(num_classes=num_classes, lam=config.ours_proto_lambda,
                 gamma=config.ours_kd_gamma, proto_size=config.cbkd_proto_size,

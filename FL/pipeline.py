@@ -45,7 +45,7 @@ _DISTILL_EVAL_REQUIRED_SUFFIXES = ('Acc', 'F1', 'Precision', 'Recall', 'ECE', 'L
 _POISONEDFL_STATE_KEY = "__poisoned_fl_state__"
 
 
-def _record_round_weights(log_filename, round_num, global_weights=None, context=None):
+def _record_round_weights(log_filename, round_num, global_weights=None, context=None, keep_last_rounds=0):
     stem = os.path.splitext(os.path.basename(log_filename))[0]
     record_dir = os.path.join("temp_weights", f"{stem}_weight_record", f"round_{round_num}")
     os.makedirs(record_dir, exist_ok=True)
@@ -56,6 +56,7 @@ def _record_round_weights(log_filename, round_num, global_weights=None, context=
         with open(tmp, "wb") as f:
             pickle.dump(global_weights, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, path)
+        _cleanup_old_weight_rounds(os.path.join("temp_weights", f"{stem}_weight_record"), keep_last_rounds)
         return
 
     if context is None:
@@ -74,6 +75,7 @@ def _record_round_weights(log_filename, round_num, global_weights=None, context=
             continue
 
     if saved_any or context.model_pool is None:
+        _cleanup_old_weight_rounds(os.path.join("temp_weights", f"{stem}_weight_record"), keep_last_rounds)
         return
 
     pool = context.model_pool
@@ -86,6 +88,27 @@ def _record_round_weights(log_filename, round_num, global_weights=None, context=
         with open(tmp, "wb") as f:
             pickle.dump(w, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, path)
+
+    _cleanup_old_weight_rounds(os.path.join("temp_weights", f"{stem}_weight_record"), keep_last_rounds)
+
+
+def _cleanup_old_weight_rounds(record_base: str, keep_last: int) -> None:
+    if keep_last <= 0:
+        return
+    round_dirs = []
+    for entry in os.listdir(record_base):
+        if entry.startswith("round_"):
+            full = os.path.join(record_base, entry)
+            if os.path.isdir(full):
+                try:
+                    round_num = int(entry.split("_")[1])
+                    round_dirs.append((round_num, full))
+                except (IndexError, ValueError):
+                    continue
+    round_dirs.sort(key=lambda x: x[0])
+    for _, dirpath in round_dirs[:-keep_last]:
+        shutil.rmtree(dirpath, ignore_errors=True)
+        print(f"{COLORS.WARNING}Cleaned up {dirpath}{COLORS.ENDC}")
 
 
 def _config_fingerprint(config) -> str:
@@ -182,6 +205,7 @@ class FLConfig:
     cache_test_set: bool = False
     flame_lambda: float = 0.001
     flame_passive_cluster: bool = False
+    keep_last_rounds: int = 2
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -1474,7 +1498,7 @@ class FederatedLearningPipeline:
                 self._save_checkpoint(round_num, latest_weights, n_clients, round_times,
                                       selected_server=selected_server, ms_prev_scores=ms_prev_scores)
 
-            _record_round_weights(self.log_filename, round_num, global_weights=latest_weights)
+            _record_round_weights(self.log_filename, round_num, global_weights=latest_weights, keep_last_rounds=self.config.keep_last_rounds)
 
             aggressive_memory_cleanup()
 
@@ -2049,9 +2073,12 @@ def run_distillation_pipeline(config, strategy) -> None:
         if _global_model_strategy:
             global_model = context.shared_state.get("global_model")
             if global_model is not None:
-                _record_round_weights(log_filename, round_number, global_weights=global_model.get_weights())
+                _record_round_weights(log_filename, round_number, global_weights=global_model.get_weights(), keep_last_rounds=config.keep_last_rounds)
         else:
             context.record_client_weights(round_number)
+            if config.keep_last_rounds > 0:
+                stem = os.path.splitext(os.path.basename(log_filename))[0]
+                _cleanup_old_weight_rounds(os.path.join("temp_weights", f"{stem}_weight_record"), config.keep_last_rounds)
     
     strategy.finalize(context)
     
@@ -2466,6 +2493,10 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     log_timestamp(logger, "=== SIMULATION COMPLETED ===")
     print(f"{COLORS.OKCYAN}Results saved to {excel_filename}{COLORS.ENDC}")
     print(f"{COLORS.OKGREEN}Simulation completed!{COLORS.ENDC}")
+
+    _keep = getattr(config, 'keep_last_rounds', 0)
+    if _keep > 0:
+        _cleanup_old_weight_rounds(record_base, _keep)
 
 
 # def _extract_labels(dataset: tf.data.Dataset, num_classes: int) -> np.ndarray:
