@@ -91,3 +91,4 @@ class FCILConfig:
     last_eval: bool = False
     sweep_eval: bool = False
     keep_last_rounds: int = 2
+    no_disk_cache: bool = True

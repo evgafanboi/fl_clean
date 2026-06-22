@@ -161,6 +161,8 @@ def main():
                         help='Skip training: load saved weight records of the matching run and re-evaluate only')
     parser.add_argument('--keep_last_rounds', type=int, default=2,
                         help='Keep only last N round weight records per task (0=keep all)')
+    parser.add_argument('--no_disk_cache', action='store_true', default=True,
+                        help='Skip writing logit cache to disk (saves ~3GB/run)')
     
     args = parser.parse_args()
     if args.feat_lambda is None:
@@ -314,6 +316,7 @@ def main():
         last_eval=args.last_eval,
         sweep_eval=args.sweep_eval,
         keep_last_rounds=args.keep_last_rounds,
+        no_disk_cache=args.no_disk_cache,
     )
     
     if config.sweep_eval:

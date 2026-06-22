@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import os
+import shutil
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -934,15 +935,21 @@ class Ours(DistillationStrategy):
         public_features = numpy_from_dataset(public_unlabeled_ds)
         del public_unlabeled_ds
 
-        os.makedirs(self.cache_dir, exist_ok=True)
-        pub_path = os.path.join(self.cache_dir, "public_features.npy")
-        np.save(pub_path, public_features)
-        del public_features
-
-        context.shared_state.update({
-            "public_features_path": pub_path,
-            "public_sample_count": total_public,
-        })
+        no_cache = getattr(config, 'no_disk_cache', False)
+        if no_cache:
+            context.shared_state.update({
+                "public_features": public_features,
+                "public_sample_count": total_public,
+            })
+        else:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            pub_path = os.path.join(self.cache_dir, "public_features.npy")
+            np.save(pub_path, public_features)
+            del public_features
+            context.shared_state.update({
+                "public_features_path": pub_path,
+                "public_sample_count": total_public,
+            })
 
         for client_id, paths in enumerate(context.paths):
             context.add_client_state(client_id, None, paths)
@@ -1286,7 +1293,11 @@ class Ours(DistillationStrategy):
     def run_round(self, context: PipelineContext, round_number: int) -> Dict[int, Dict[str, float]]:
         round_start = time.time()
         config = context.config
-        public_features = np.load(context.shared_state["public_features_path"], mmap_mode="r")
+        no_cache = getattr(config, 'no_disk_cache', False)
+        if no_cache:
+            public_features = context.shared_state["public_features"]
+        else:
+            public_features = np.load(context.shared_state["public_features_path"], mmap_mode="r")
         eva_mode = self.eva_mode
         no_filter = not isinstance(self.robust_filter, RobustFilterV3) and getattr(config, "robust_rm_budget", 0) == 0 and eva_mode is None
         _pfl = getattr(context, 'poisoned_fl_state', None)
@@ -1508,5 +1519,9 @@ class Ours(DistillationStrategy):
 
         if self._ckpt:
             clear_mid_round(context, "ours")
+
+        if no_cache and os.path.isdir(self.cache_dir):
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
+            print(f"{COLORS.WARNING}Cleaned up {self.cache_dir}{COLORS.ENDC}")
 
         return {}
