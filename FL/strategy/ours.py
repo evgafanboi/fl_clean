@@ -27,7 +27,6 @@ from .common import (
     poisonedfl_ghost_model_type,
 )
 
-LOGITS_CACHE_DIR = os.path.join("temp_weights", "ours_cache")
 LOGIT_ABS_CAP = 1e6
 EKD_LOGIT_CLIP = 30.0
 EVA_PRIVATE_CHUNK = 100_000
@@ -71,8 +70,8 @@ def _eva_mode(config) -> Optional[str]:
     return None
 
 
-def _support_path(client_id: int) -> str:
-    return os.path.join(LOGITS_CACHE_DIR, f"client_{client_id}_support.bin")
+def _support_path(cache_dir: str, client_id: int) -> str:
+    return os.path.join(cache_dir, f"client_{client_id}_support.bin")
 
 
 def _client_id_from_logit_path(path: str) -> int:
@@ -925,6 +924,9 @@ class Ours(DistillationStrategy):
 
         print(f"{COLORS.OKGREEN}Preparing Ours ({kd_method.upper()}){COLORS.ENDC}")
 
+        stem = os.path.splitext(os.path.basename(context.log_filename))[0]
+        self.cache_dir = os.path.join("temp_weights", f"{stem}_weight_record", "ours_cache")
+
         public_unlabeled_ds, total_public = load_public_dataset_from_clients(
             context.paths, batch_size=config.batch_size, num_classes=context.num_classes,
             shuffle=False, return_labels=False,
@@ -932,8 +934,8 @@ class Ours(DistillationStrategy):
         public_features = numpy_from_dataset(public_unlabeled_ds)
         del public_unlabeled_ds
 
-        os.makedirs(LOGITS_CACHE_DIR, exist_ok=True)
-        pub_path = os.path.join(LOGITS_CACHE_DIR, "public_features.npy")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        pub_path = os.path.join(self.cache_dir, "public_features.npy")
         np.save(pub_path, public_features)
         del public_features
 
@@ -956,7 +958,7 @@ class Ours(DistillationStrategy):
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
 
         for skipped_idx in range(first_client):
-            fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{context.client_states[skipped_idx].client_id}.bin")
+            fpath = os.path.join(self.cache_dir, f"client_{context.client_states[skipped_idx].client_id}.bin")
             if os.path.exists(fpath):
                 logit_files.append(fpath)
 
@@ -992,13 +994,13 @@ class Ours(DistillationStrategy):
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_client:
                 continue
-            fpath = os.path.join(LOGITS_CACHE_DIR, f"client_{state.client_id}.bin")
+            fpath = os.path.join(self.cache_dir, f"client_{state.client_id}.bin")
             if attack_type == "lma" and state.client_id in context.poisoned_clients:
                 if _lma_adv_bytes is not None:
                     with open(fpath, "wb") as _hf:
                         _hf.write(_lma_adv_bytes)
                     if eva_mode is not None:
-                        _write_support_values(_support_path(state.client_id), np.ones(_lma_adv_shape[0], dtype=np.float32))
+                        _write_support_values(_support_path(self.cache_dir, state.client_id), np.ones(_lma_adv_shape[0], dtype=np.float32))
                     logit_files.append(fpath)
                     if logit_shape is None:
                         logit_shape = _lma_adv_shape
@@ -1011,7 +1013,7 @@ class Ours(DistillationStrategy):
                     with open(fpath, 'wb') as _gf:
                         _gf.write(_ghost_bytes)
                     if eva_mode is not None:
-                        _write_support_values(_support_path(state.client_id), np.ones(_ghost_shape[0], dtype=np.float32))
+                        _write_support_values(_support_path(self.cache_dir, state.client_id), np.ones(_ghost_shape[0], dtype=np.float32))
                     logit_files.append(fpath)
                     if logit_shape is None:
                         logit_shape = _ghost_shape
@@ -1030,7 +1032,7 @@ class Ours(DistillationStrategy):
                 context.logger.info("Round %s | Client %s [POISON] gradient_scale \u00d7%s applied", self._cur_round, state.client_id, poison_value)
             if eva_mode is not None:
                 _, shape, support_stats = generate_logits_and_support_to_file(
-                    model, state.paths["train_X"], public_features, config.batch_size, fpath, _support_path(state.client_id), eva_mode,
+                    model, state.paths["train_X"], public_features, config.batch_size, fpath, _support_path(self.cache_dir, state.client_id), eva_mode,
                 )
                 if eva_mode == "eva" or eva_mode == "eva2":
                     context.logger.info(
@@ -1289,7 +1291,7 @@ class Ours(DistillationStrategy):
         no_filter = not isinstance(self.robust_filter, RobustFilterV3) and getattr(config, "robust_rm_budget", 0) == 0 and eva_mode is None
         _pfl = getattr(context, 'poisoned_fl_state', None)
 
-        os.makedirs(LOGITS_CACHE_DIR, exist_ok=True)
+        os.makedirs(self.cache_dir, exist_ok=True)
 
         self._ckpt = getattr(config, "checkpoint", 0)
         self._cur_round = round_number
@@ -1323,7 +1325,7 @@ class Ours(DistillationStrategy):
             self._run_ce_stage(context, first_client=first_ce)
 
         if no_filter:
-            consensus_path = os.path.join(LOGITS_CACHE_DIR, f"r{round_number}_consensus.npy")
+            consensus_path = os.path.join(self.cache_dir, f"r{round_number}_consensus.npy")
 
             # Stage 1b — generate or load mean consensus
             if not skip_logits:
@@ -1387,8 +1389,8 @@ class Ours(DistillationStrategy):
                     logit_shape = (row_bytes_test // (n_classes * 4), n_classes)
 
             if not skip_kd:
-                consensus_path = os.path.join(LOGITS_CACHE_DIR, f"r{round_number}_consensus.npy")
-                support_mask_path = os.path.join(LOGITS_CACHE_DIR, f"r{round_number}_supported_mask.npy")
+                consensus_path = os.path.join(self.cache_dir, f"r{round_number}_consensus.npy")
+                support_mask_path = os.path.join(self.cache_dir, f"r{round_number}_supported_mask.npy")
                 if logit_shape is None and not os.path.exists(consensus_path):
                     raise RuntimeError(
                         "logit_shape is None — no logit files were produced or recovered. "
@@ -1404,7 +1406,7 @@ class Ours(DistillationStrategy):
                 else:
                     budget = getattr(config, "robust_rm_budget", 0)
                     if eva_mode is not None:
-                        support_files = [_support_path(_client_id_from_logit_path(path)) for path in logit_files]
+                        support_files = [_support_path(self.cache_dir, _client_id_from_logit_path(path)) for path in logit_files]
                         robust_filter = None if budget == 0 else self.robust_filter
                         label = "weighted" if eva_mode == "evw" else "abstention"
                         print(f"\n{COLORS.OKCYAN}Computing {label} consensus logits ({eva_mode.upper()}){COLORS.ENDC}")
@@ -1480,7 +1482,7 @@ class Ours(DistillationStrategy):
                     if os.path.exists(fpath):
                         os.remove(fpath)
                 if eva_mode is not None:
-                    for fpath in [_support_path(_client_id_from_logit_path(path)) for path in logit_files]:
+                    for fpath in [_support_path(self.cache_dir, _client_id_from_logit_path(path)) for path in logit_files]:
                         if os.path.exists(fpath):
                             os.remove(fpath)
 
