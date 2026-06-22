@@ -121,7 +121,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache_test_set", action="store_true", help="Pin X_test to GPU VRAM before evaluation (avoids repeated host↔device transfers; ~1 GB VRAM)")
     parser.add_argument("--use_tf", action="store_true", help="Use TensorFlow backend (default: PyTorch)")
     parser.add_argument("--mixed_models", action="store_true", help="Assign different model architectures to client quartiles (GRU/DCBLSTM/MLP/CNN)")
-    parser.add_argument("--keep_last_rounds", type=int, default=2, help="Keep only last N round weight records (0=keep all)")
 
     return parser
 
@@ -206,7 +205,6 @@ def main(argv=None):
             hamming_tau=args.hamming_tau,
             exp_rho=args.exp_rho,
             f1_curve=args.f1_curve,
-            keep_last_rounds=args.keep_last_rounds,
         )
         
         strategy = strategy_registry[args.strategy](config)
@@ -245,7 +243,6 @@ def main(argv=None):
             cache_test_set=args.cache_test_set,
             flame_lambda=args.flame_lambda,
             flame_passive_cluster=args.passive_cluster,
-            keep_last_rounds=args.keep_last_rounds,
         )
         run_pipeline(config)
 

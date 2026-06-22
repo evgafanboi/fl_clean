@@ -1,5 +1,4 @@
 import numpy as np
-from .ours2 import LOGIT_CLIP
 from .ours3 import Ours3
 
 
@@ -7,8 +6,7 @@ class Ours4(Ours3):
     def __init__(self, num_classes: int, memory: float = 1.0, kd_gamma: float = 1.0,
                  robust_threshold: float = 0.9, robust_workers: int = 8,
                  ekd_epochs: int = 1, ekd_lambda: float = 1.0, replay_cap: bool = True,
-                 replay_min_per_class: int = 128, replay_balance: float = 1.0,
-                 entropy_beta: float = 0.02):
+                 replay_min_per_class: int = 128, replay_balance: float = 1.0):
         super().__init__(num_classes=num_classes,
                          memory=memory,
                          kd_gamma=kd_gamma,
@@ -20,46 +18,27 @@ class Ours4(Ours3):
                          replay_min_per_class=replay_min_per_class)
         self.name = 'Ours4'
         self.replay_balance = float(replay_balance)
-        self.entropy_beta = float(entropy_beta)
         self._last_replay_budget = 0
         self._last_replay_per_class = 0
-        self._last_private_size = 0
-        self._last_exemplar_total = 0
+        self._last_private_mean = 0.0
+        self._last_exemplar_mean = 0.0
         self._last_old_classes = 0
-        self._last_kept_count = 0
+        self._last_balance_target = 0.0
+        self._round_private_mean = 0.0
 
-    def _compute_replay_budget(self, n_private: int, n_old_classes: int, exemplar_total: int):
-        budget = int(np.floor(float(n_private) * self.replay_balance))
-        budget = max(budget, n_old_classes * int(self.replay_min_per_class))
-        budget = min(budget, exemplar_total)
-        per_class = int(np.floor(budget / max(n_old_classes, 1))) if n_old_classes > 0 else 0
-        return budget, per_class
+    def set_round_private_mean(self, n_private_mean: float):
+        self._round_private_mean = float(n_private_mean)
 
-    def get_train_step(self, model, optimizer, loss_fn):
-        import torch
-        import torch.nn.functional as F
-        dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model.nn.to(dev)
-        beta = self.entropy_beta
-        def step(X_b, y_b):
-            X_b = X_b.to(dev); y_b = y_b.to(dev)
-            y_cls = y_b.argmax(dim=1) if y_b.ndim > 1 else y_b.long()
-            model.nn.train()
-            optimizer.zero_grad(set_to_none=True)
-            logits = torch.clamp(model.nn(X_b, return_logits=True), -LOGIT_CLIP, LOGIT_CLIP)
-            ce_loss = F.cross_entropy(logits, y_cls, label_smoothing=0.05)
-            if beta > 0:
-                probs = F.softmax(logits, dim=-1)
-                entropy = -(probs * torch.log(probs + 1e-8)).sum(-1).mean()
-                total = ce_loss - beta * entropy
-            else:
-                total = ce_loss
-            total.backward()
-            torch.nn.utils.clip_grad_norm_(model.nn.parameters(), 1.0)
-            optimizer.step()
-            self._last_ce = float(ce_loss.item())
-            return ce_loss.item(), 0.0, total.item()
-        return step
+    def _compute_replay_budget(self, n_private: int, n_old_classes: int, exemplar_total: int) -> tuple[int, int, float, float, float]:
+        if n_old_classes <= 0 or exemplar_total <= 0:
+            return 0, 0, float(n_private), 0.0, 0.0
+
+        n_priv_mean = float(n_private)
+        n_ex_mean = float(exemplar_total) / float(n_old_classes)
+        target = n_priv_mean * self.replay_balance
+        budget = min(int(np.floor(target)), exemplar_total)
+        per_class = int(np.floor(budget / max(n_old_classes, 1)))
+        return budget, per_class, n_priv_mean, n_ex_mean, target
 
     def build_dataset(self, X_path: str, y_path: str, batch_size: int):
         import torch
@@ -85,8 +64,8 @@ class Ours4(Ours3):
             y_rep = np.concatenate(replay_y, axis=0)
             old_classes = sorted(np.unique(y_rep).tolist())
             exemplar_total = len(y_rep)
-            n_private = len(X_parts[0])
-            budget, per_class = self._compute_replay_budget(
+            n_private = self._round_private_mean if self._round_private_mean > 0 else len(X_parts[0])
+            budget, per_class, n_priv_mean, n_ex_mean, target = self._compute_replay_budget(
                 n_private=n_private,
                 n_old_classes=len(old_classes),
                 exemplar_total=exemplar_total,
@@ -94,9 +73,10 @@ class Ours4(Ours3):
 
             self._last_replay_budget = budget
             self._last_replay_per_class = per_class
-            self._last_private_size = n_private
-            self._last_exemplar_total = exemplar_total
+            self._last_private_mean = n_priv_mean
+            self._last_exemplar_mean = n_ex_mean
             self._last_old_classes = len(old_classes)
+            self._last_balance_target = target
 
             if self.replay_cap and budget > 0 and len(X_rep) > budget:
                 cls_to_idx = {}
@@ -119,7 +99,6 @@ class Ours4(Ours3):
                 X_rep = X_rep[:0]
                 y_rep = y_rep[:0]
 
-            self._last_kept_count = len(X_rep)
             X_parts.append(X_rep)
             y_parts.append(y_rep)
 

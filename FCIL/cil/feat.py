@@ -3,7 +3,6 @@ from ..backend import use_tf as _use_tf
 from .icarl import ICaRL, _batched_predict, PRED_BATCH
 
 tf = __import__('tensorflow') if _use_tf() else None
-GSA_BATCH = 1024
 
 
 def _build_etf(feat_dim: int, num_classes: int) -> np.ndarray:
@@ -100,53 +99,33 @@ class FEAT(ICaRL):
     def build_dataset(self, X_path, y_path, model, batch_size):
         if not _use_tf():
             import torch
-            X_new = np.load(X_path, mmap_mode='r')
-            y_new = np.load(y_path, mmap_mode='r')
+            from torch.utils.data import DataLoader, TensorDataset
+            X_new = np.load(X_path)
+            y_new = np.load(y_path)
             num_classes = len(self.class_order)
             label_map = dict(self.label_map)
-            ex_info = []
-            total = int(X_new.shape[0])
+            labels = y_new if len(y_new.shape) == 1 else np.argmax(y_new, axis=1)
+            mapped = np.vectorize(label_map.get, otypes=[int])(labels)
+            y_oh = np.zeros((len(mapped), num_classes), dtype=np.float32)
+            y_oh[np.arange(len(mapped)), mapped] = 1.0
+            X_parts = [X_new.astype(np.float32)]
+            y_parts = [y_oh]
             for cls, path in self.exemplars.get(self.client_id, {}).items():
-                X_ex = np.load(path, mmap_mode='r')
-                n_ex = int(X_ex.shape[0])
-                if n_ex > 0:
-                    ex_info.append((cls, str(path), n_ex))
-                    total += n_ex
-                del X_ex
-            if total == 0:
+                X_ex = np.load(path)
+                if X_ex.shape[0] == 0:
+                    continue
+                y_ex = np.zeros((len(X_ex), num_classes), dtype=np.float32)
+                y_ex[:, label_map[cls]] = 1.0
+                X_parts.append(X_ex.astype(np.float32))
+                y_parts.append(y_ex)
+            X_all = np.concatenate(X_parts, axis=0)
+            y_all = np.concatenate(y_parts, axis=0)
+            if X_all.shape[0] == 0:
                 return None, 0
-            x_path_str = str(X_path)
-            y_path_str = str(y_path)
-
-            class _Stream:
-                def __iter__(self_inner):
-                    rng = np.random.default_rng()
-                    chunks = [('new', x_path_str, y_path_str, i, min(i + batch_size, X_new.shape[0]), None)
-                              for i in range(0, X_new.shape[0], batch_size)]
-                    for cls, path, n_ex in ex_info:
-                        chunks.extend(('ex', path, None, i, min(i + batch_size, n_ex), cls)
-                                      for i in range(0, n_ex, batch_size))
-                    rng.shuffle(chunks)
-                    for kind, path, y_path, start, end, cls in chunks:
-                        X_src = np.load(path, mmap_mode='r')
-                        X_b = np.array(X_src[start:end], dtype=np.float32)
-                        if kind == 'new':
-                            y_src = np.load(y_path, mmap_mode='r')
-                            lab = np.array(y_src[start:end])
-                            lab = lab if len(lab.shape) == 1 else np.argmax(lab, axis=1)
-                            mapped = np.vectorize(label_map.get, otypes=[int])(lab)
-                            del y_src
-                        else:
-                            mapped = np.full((X_b.shape[0],), label_map[cls], dtype=int)
-                        order = rng.permutation(X_b.shape[0])
-                        X_b = X_b[order]
-                        mapped = mapped[order]
-                        y_b = np.zeros((len(mapped), num_classes), dtype=np.float32)
-                        y_b[np.arange(len(mapped)), mapped] = 1.0
-                        yield torch.from_numpy(X_b), torch.from_numpy(y_b)
-                        del X_src
-
-            return _Stream(), total
+            loader = DataLoader(
+                TensorDataset(torch.from_numpy(X_all), torch.from_numpy(y_all)),
+                batch_size=batch_size, shuffle=True, drop_last=False)
+            return loader, int(X_all.shape[0])
 
         X_new = np.load(X_path, mmap_mode='r')
         y_new = np.load(y_path, mmap_mode='r')
@@ -267,21 +246,14 @@ class FEAT(ICaRL):
                 ce_loss = F.cross_entropy(logits, y_cls, label_smoothing=0.05)
                 gsa_loss = torch.tensor(0.0, device=dev)
                 if self.old_num_classes > 0:
-                    if feats.shape[0] > GSA_BATCH:
-                        idx = torch.randperm(feats.shape[0], device=dev)[:GSA_BATCH]
-                        feats_gsa = feats[idx]
-                        y_gsa = y_cls[idx]
-                    else:
-                        feats_gsa = feats
-                        y_gsa = y_cls
-                    feat_n = F.normalize(feats_gsa, dim=1)
+                    feat_n = F.normalize(feats, dim=1)
                     sim_f = feat_n @ feat_n.T
-                    proto = F.normalize(etf[y_gsa], dim=1)
+                    proto = F.normalize(etf[y_cls], dim=1)
                     sim_p = proto @ proto.T
                     prob_f = torch.softmax(sim_f / self.temperature, dim=1)
                     prob_p = torch.softmax(sim_p / self.temperature, dim=1)
                     kl_rows = (prob_f * (torch.log(prob_f + 1e-12) - torch.log(prob_p + 1e-12))).sum(dim=1)
-                    cls_losses = [kl_rows[y_gsa == cls].mean() for cls in torch.unique(y_gsa)]
+                    cls_losses = [kl_rows[y_cls == cls].mean() for cls in torch.unique(y_cls)]
                     gsa_loss = torch.stack(cls_losses).mean()
                 total = ce_loss + self.lam * gsa_loss
                 total.backward()
@@ -289,7 +261,6 @@ class FEAT(ICaRL):
                 optimizer.step()
                 self._last_ce = float(ce_loss.item())
                 self._last_gsa = float(gsa_loss.item())
-                feat_box.clear()
                 return ce_loss.item(), gsa_loss.item(), total.item()
 
             return step_pt
@@ -348,30 +319,18 @@ class FEAT(ICaRL):
         return feats @ self.etf_weight.T
 
     def evaluate_full(self, model, X, y, num_classes, batch_size=PRED_BATCH):
-        from sklearn.metrics import confusion_matrix
+        from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
         y_true = y if len(y.shape) == 1 else np.argmax(y, axis=1)
         y_true = self.map_labels_np(y_true).astype(int)
-        feature_model = model.get_feature_model()
-        etf_trunc = self.etf_weight[:num_classes].T
-        all_preds = []
-        loss_sum = 0.0
-        n = X.shape[0]
-        for i in range(0, n, batch_size):
-            chunk = np.array(X[i:i+batch_size], dtype=np.float32)
-            y_chunk = y_true[i:i+batch_size]
-            feats = feature_model(chunk, training=False).numpy() if _use_tf() else feature_model.predict(chunk, batch_size=len(chunk))
-            feats = self._correct_features(feats)
-            logits = feats @ etf_trunc
-            logits = logits.astype(np.float32)
-            logits -= logits.max(axis=1, keepdims=True)
-            probs = np.exp(logits)
-            probs /= probs.sum(axis=1, keepdims=True)
-            all_preds.append(np.argmax(probs, axis=1))
-            loss_sum += float(-np.sum(np.log(np.clip(probs[np.arange(len(y_chunk)), y_chunk], 1e-12, 1.0))))
-            del chunk, feats, logits, probs
-        y_pred = np.concatenate(all_preds)
-        loss = loss_sum / n
+        logits = self._predict_logits(model, X, batch_size=batch_size)
+        logits = logits[:, :num_classes]
+        logits = logits.astype(np.float32)
+        logits -= logits.max(axis=1, keepdims=True)
+        probs = np.exp(logits)
+        probs /= probs.sum(axis=1, keepdims=True)
+        y_pred = np.argmax(probs, axis=1)
         labels = list(range(num_classes))
+        loss = float(-np.mean(np.log(np.clip(probs[np.arange(len(y_true)), y_true], 1e-12, 1.0))))
         cm = confusion_matrix(y_true, y_pred, labels=labels)
         tp = np.diag(cm).astype(float)
         fp = cm.sum(axis=0) - tp
@@ -382,22 +341,15 @@ class FEAT(ICaRL):
             prec_per = np.where(tp + fp > 0, tp / (tp + fp), 0.0)
             rec_per = np.where(tp + fn > 0, tp / (tp + fn), 0.0)
             f1_per = np.where(prec_per + rec_per > 0, 2 * prec_per * rec_per / (prec_per + rec_per), 0.0)
-        acc = float(np.sum(tp) / total_support) if total_support > 0 else 0.0
-        prec_macro = float(np.mean(prec_per))
-        rec_macro = float(np.mean(rec_per))
-        f1_macro = float(np.mean(f1_per))
-        prec_micro = float(np.sum(tp) / (np.sum(tp) + np.sum(fp))) if (np.sum(tp) + np.sum(fp)) > 0 else 0.0
-        rec_micro = float(np.sum(tp) / (np.sum(tp) + np.sum(fn))) if (np.sum(tp) + np.sum(fn)) > 0 else 0.0
-        f1_micro = float(2 * prec_micro * rec_micro / (prec_micro + rec_micro)) if (prec_micro + rec_micro) > 0 else 0.0
         return {
             'loss': loss,
-            'acc': acc,
-            'prec_macro': prec_macro,
-            'rec_macro': rec_macro,
-            'f1_macro': f1_macro,
-            'prec_micro': prec_micro,
-            'rec_micro': rec_micro,
-            'f1_micro': f1_micro,
+            'acc': float(accuracy_score(y_true, y_pred)),
+            'prec_macro': float(precision_score(y_true, y_pred, average='macro', zero_division=0, labels=labels)),
+            'rec_macro': float(recall_score(y_true, y_pred, average='macro', zero_division=0, labels=labels)),
+            'f1_macro': float(f1_score(y_true, y_pred, average='macro', zero_division=0, labels=labels)),
+            'prec_micro': float(precision_score(y_true, y_pred, average='micro', zero_division=0)),
+            'rec_micro': float(recall_score(y_true, y_pred, average='micro', zero_division=0)),
+            'f1_micro': float(f1_score(y_true, y_pred, average='micro', zero_division=0)),
             'prec_weighted': float(np.sum(prec_per * support) / total_support) if total_support > 0 else 0.0,
             'rec_weighted': float(np.sum(rec_per * support) / total_support) if total_support > 0 else 0.0,
             'f1_weighted': float(np.sum(f1_per * support) / total_support) if total_support > 0 else 0.0,
