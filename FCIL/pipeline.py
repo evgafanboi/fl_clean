@@ -1102,6 +1102,11 @@ def run_fcil_pipeline(config: FCILConfig):
     if _ckpt_enabled and ckpt_dir and os.path.isdir(ckpt_dir):
         shutil.rmtree(ckpt_dir, ignore_errors=True)
 
+    cache_dir = weight_record_dir / "ours_cache"
+    if cache_dir.is_dir():
+        shutil.rmtree(str(cache_dir), ignore_errors=True)
+        print(f"{COLORS.WARNING}Cleaned up {cache_dir}{COLORS.ENDC}")
+
 def run_no_global_pipeline(config: FCILConfig):
     """Pipeline for PASS method - no global model, per-client prototype distillation"""
     task_order = load_task_order(config.task_order_file)
@@ -1476,6 +1481,11 @@ def run_no_global_pipeline(config: FCILConfig):
     
     if hasattr(cil_method, "cleanup_temp"):
         cil_method.cleanup_temp()
+
+    cache_dir = weight_record_dir / "ours_cache"
+    if cache_dir.is_dir():
+        shutil.rmtree(str(cache_dir), ignore_errors=True)
+        print(f"{COLORS.WARNING}Cleaned up {cache_dir}{COLORS.ENDC}")
 
 
 def _build_cil_method(config: FCILConfig, num_classes: int):

@@ -2467,6 +2467,11 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     print(f"{COLORS.OKCYAN}Results saved to {excel_filename}{COLORS.ENDC}")
     print(f"{COLORS.OKGREEN}Simulation completed!{COLORS.ENDC}")
 
+    cache_dir = os.path.join(record_base, "ours_cache")
+    if os.path.isdir(cache_dir):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        print(f"{COLORS.WARNING}Cleaned up {cache_dir}{COLORS.ENDC}")
+
 
 # def _extract_labels(dataset: tf.data.Dataset, num_classes: int) -> np.ndarray:
 #     labels: List[int] = []
