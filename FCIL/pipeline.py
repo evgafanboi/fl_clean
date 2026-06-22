@@ -107,13 +107,6 @@ def _cleanup_old_weight_tasks(weight_record_dir, keep_last):
             shutil.rmtree(rd, ignore_errors=True)
             print(f"{COLORS.WARNING}Cleaned up {rd}{COLORS.ENDC}")
 
-    # Remove regeneration cache inside weight_record dirs
-    for cache_name in ("ours_cache",):
-        cache_path = weight_record_dir / cache_name
-        if cache_path.is_dir():
-            shutil.rmtree(cache_path, ignore_errors=True)
-            print(f"{COLORS.WARNING}Cleaned up {cache_path}{COLORS.ENDC}")
-
 
 def _support_weighted_metrics(task_metrics, supports, loss):
     if not task_metrics:
