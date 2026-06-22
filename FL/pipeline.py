@@ -110,6 +110,11 @@ def _cleanup_old_weight_rounds(record_base: str, keep_last: int) -> None:
         shutil.rmtree(dirpath, ignore_errors=True)
         print(f"{COLORS.WARNING}Cleaned up {dirpath}{COLORS.ENDC}")
 
+    cache_dir = os.path.join(record_base, "ours_cache")
+    if os.path.isdir(cache_dir):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        print(f"{COLORS.WARNING}Cleaned up {cache_dir}{COLORS.ENDC}")
+
 
 def _config_fingerprint(config) -> str:
     import hashlib
