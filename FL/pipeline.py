@@ -2032,7 +2032,10 @@ def run_distillation_pipeline(config, strategy) -> None:
         with open(os.path.join(ckpt_dir, "info.txt"), "w") as _f:
             _f.write("\n".join(_lines) + "\n")
 
+    round_times: List[float] = []
+
     for round_number in range(start_round, config.rounds + 1):
+        round_start_time = time.time()
         logger.info(f"Round {round_number}/{config.rounds}")
         print(f"\n{COLORS.HEADER}Round {round_number}/{config.rounds}{COLORS.ENDC}")
         log_timestamp(logger, f"Round {round_number} started")
@@ -2085,14 +2088,24 @@ def run_distillation_pipeline(config, strategy) -> None:
             if config.keep_last_rounds > 0:
                 stem = os.path.splitext(os.path.basename(log_filename))[0]
                 _cleanup_old_weight_rounds(os.path.join("temp_weights", f"{stem}_weight_record"), config.keep_last_rounds)
-    
+
+        round_time = time.time() - round_start_time
+        round_times.append(round_time)
+        log_timestamp(logger, f"--- Round {round_number} completed in {round_time:.2f}s ---")
+        print(f"{COLORS.OKGREEN}Round {round_number} completed in {round_time:.2f}s{COLORS.ENDC}")
+
     strategy.finalize(context)
-    
+
     total_time = context.shared_state.get("pipeline_elapsed_s")
     if total_time is not None:
         log_timestamp(logger, f"Training phase completed in {total_time:.2f}s ({total_time/60:.2f}m)")
     else:
         log_timestamp(logger, "Training phase completed")
+    if round_times:
+        avg_round = sum(round_times) / len(round_times)
+        logger.info(f"Average time per round: {avg_round:.2f}s")
+        log_timestamp(logger, f"Average time per round: {avg_round:.2f}s")
+        print(f"{COLORS.OKGREEN}Average time per round: {avg_round:.2f}s{COLORS.ENDC}")
 
     if config.checkpoint and os.path.isdir(ckpt_dir):
         shutil.rmtree(ckpt_dir, ignore_errors=True)
