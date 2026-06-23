@@ -3,7 +3,6 @@ from __future__ import annotations
 import gc
 import os
 import shutil
-import tempfile
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -930,7 +929,6 @@ class Ours(DistillationStrategy):
         no_cache = getattr(config, 'no_disk_cache', False)
         if no_cache:
             # Use a custom cache directory under temp_weights/ that gets cleaned per round
-            # (avoid /dev/shm because it's limited to 15GB and overflows with multiple concurrent runs)
             self.cache_dir = os.path.join("temp_weights", f".cache_{stem}_ours")
         else:
             self.cache_dir = os.path.join("temp_weights", f"{stem}_weight_record", "ours_cache")

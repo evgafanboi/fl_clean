@@ -5,7 +5,6 @@ import os
 import pickle
 import re
 import shutil
-import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -693,9 +692,9 @@ class FederatedLearningPipeline:
                     # Clean up old disk-based cache if it exists
                     if 'temp_weights' in strategy_obj.cache_dir:
                         shutil.rmtree(strategy_obj.cache_dir, ignore_errors=True)
-                # Create new RAM-backed cache directory
+                # Create new cache directory on disk
                 stem = os.path.splitext(os.path.basename(self.log_filename))[0]
-                strategy_obj.cache_dir = tempfile.mkdtemp(prefix=f"ours_{stem}_", dir="/dev/shm")
+                strategy_obj.cache_dir = os.path.join("temp_weights", f".cache_{stem}_ours")
 
         df_path = os.path.join(ckpt_dir, "results_df.pkl")
         if os.path.exists(df_path):
