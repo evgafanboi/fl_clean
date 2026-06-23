@@ -1161,7 +1161,8 @@ def run_no_global_pipeline(config: FCILConfig):
                            ekd_lambda=config.ours_ekd_lambda,
                            replay_cap=config.replay_cap,
                            replay_min_per_class=config.replay_min_per_class,
-                           eva_quantile=config.eva_quantile)
+                           eva_quantile=config.eva_quantile,
+                           no_filter=config.no_filter)
     elif config.cil_method == "ours3":
         from .cil.ours3 import Ours3
         cil_method = Ours3(num_classes=num_classes, memory=config.icarl_memory,
@@ -1172,7 +1173,8 @@ def run_no_global_pipeline(config: FCILConfig):
                            ekd_lambda=config.ours_ekd_lambda,
                            replay_cap=config.replay_cap,
                            replay_min_per_class=config.replay_min_per_class,
-                           eva_quantile=config.eva_quantile)
+                           eva_quantile=config.eva_quantile,
+                           no_filter=config.no_filter)
     elif config.cil_method == "ours4":
         from .cil.ours4 import Ours4
         cil_method = Ours4(num_classes=num_classes, memory=config.icarl_memory,
@@ -1185,7 +1187,8 @@ def run_no_global_pipeline(config: FCILConfig):
                            replay_min_per_class=config.replay_min_per_class,
                            replay_balance=config.replay_balance,
                            entropy_beta=config.ours_entropy_beta,
-                           eva_quantile=config.eva_quantile)
+                           eva_quantile=config.eva_quantile,
+                           no_filter=config.no_filter)
     else:
         from .cil.ours import Ours
         cil_method = Ours(num_classes=num_classes, lam=config.ours_proto_lambda,
@@ -1575,7 +1578,8 @@ def _build_cil_method(config: FCILConfig, num_classes: int):
                      ekd_lambda=config.ours_ekd_lambda,
                      replay_cap=config.replay_cap,
                      replay_min_per_class=config.replay_min_per_class,
-                     eva_quantile=config.eva_quantile)
+                     eva_quantile=config.eva_quantile,
+                     no_filter=config.no_filter)
     if config.cil_method == "ours3":
         from .cil.ours3 import Ours3
         return Ours3(num_classes=num_classes, memory=config.icarl_memory,
@@ -1586,7 +1590,8 @@ def _build_cil_method(config: FCILConfig, num_classes: int):
                      ekd_lambda=config.ours_ekd_lambda,
                      replay_cap=config.replay_cap,
                      replay_min_per_class=config.replay_min_per_class,
-                     eva_quantile=config.eva_quantile)
+                     eva_quantile=config.eva_quantile,
+                     no_filter=config.no_filter)
     if config.cil_method == "ours4":
         from .cil.ours4 import Ours4
         return Ours4(num_classes=num_classes, memory=config.icarl_memory,
@@ -1599,7 +1604,8 @@ def _build_cil_method(config: FCILConfig, num_classes: int):
                      replay_min_per_class=config.replay_min_per_class,
                      replay_balance=config.replay_balance,
                      entropy_beta=config.ours_entropy_beta,
-                     eva_quantile=config.eva_quantile)
+                     eva_quantile=config.eva_quantile,
+                     no_filter=config.no_filter)
     from .cil.ours import Ours
     return Ours(num_classes=num_classes, lam=config.ours_proto_lambda,
                 gamma=config.ours_kd_gamma, proto_size=config.cbkd_proto_size,

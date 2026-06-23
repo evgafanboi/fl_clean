@@ -252,8 +252,8 @@ def main():
             parts.append("gated")
         if args.cil == 'ours4':
             parts.append(f"rbal{args.replay_balance}")
-            if args.ours_entropy_beta > 0:
-                parts.append(f"eb{args.ours_entropy_beta}")
+        if args.ours_entropy_beta > 0:
+            parts.append(f"eb{args.ours_entropy_beta}")
         parts.append(f"eva{args.eva_quantile}_blom{args.robust_threshold}")
     if args.strategy == 'FedSSD':
         parts.append(f"ssd{args.m_max}")

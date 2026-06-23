@@ -8,7 +8,8 @@ class Ours4(Ours3):
                  robust_threshold: float = 0.9, robust_workers: int = 8,
                  ekd_epochs: int = 1, ekd_lambda: float = 1.0, replay_cap: bool = True,
                  replay_min_per_class: int = 128, replay_balance: float = 1.0,
-                 entropy_beta: float = 0.02, eva_quantile: float = 0.95):
+                 entropy_beta: float = 0.0, eva_quantile: float = 0.95,
+                 no_filter: bool = False):
         super().__init__(num_classes=num_classes,
                          memory=memory,
                          kd_gamma=kd_gamma,
@@ -18,7 +19,8 @@ class Ours4(Ours3):
                          ekd_lambda=ekd_lambda,
                          replay_cap=replay_cap,
                          replay_min_per_class=replay_min_per_class,
-                         eva_quantile=eva_quantile)
+                         eva_quantile=eva_quantile,
+                         no_filter=no_filter)
         self.name = 'Ours4'
         self.replay_balance = float(replay_balance)
         self.entropy_beta = float(entropy_beta)
@@ -39,10 +41,9 @@ class Ours4(Ours3):
 
         n_priv_mean = float(n_private)
         n_ex_mean = float(exemplar_total) / float(n_old_classes)
-        target = n_priv_mean * self.replay_balance
-        budget = min(int(np.floor(target)), exemplar_total)
-        per_class = int(np.floor(budget / max(n_old_classes, 1)))
-        return budget, per_class, n_priv_mean, n_ex_mean, target
+        per_class = int(np.floor(n_priv_mean * self.replay_balance))
+        budget = min(per_class * n_old_classes, exemplar_total)
+        return budget, per_class, n_priv_mean, n_ex_mean, float(budget)
 
     def get_train_step(self, model, optimizer, loss_fn):
         import torch

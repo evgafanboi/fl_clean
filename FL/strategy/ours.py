@@ -216,7 +216,25 @@ def generate_logits_and_support_to_file(
 
 # ── Logit generation (chunked to disk) ──────────────────────────────────────
 
+def _check_disk_space(required_gb: float = 2.0) -> None:
+    """Check if there's enough disk space. Raises OSError if not."""
+    try:
+        stat = os.statvfs(".")
+        free_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
+        if free_gb < required_gb:
+            raise OSError(
+                f"Insufficient disk space: {free_gb:.1f}GB free, need {required_gb:.1f}GB. "
+                f"Try: rm -rf temp_weights/.cache_*"
+            )
+    except OSError as e:
+        if "Insufficient disk space" in str(e):
+            raise
+        # If statvfs fails, just continue (best effort)
+        pass
+
+
 def generate_logits_to_file(model_wrapper, public_features: np.ndarray, batch_size: int, output_path: str) -> tuple:
+    _check_disk_space(2.0)  # Each client logit file is ~0.5GB, need buffer
     logits_model = model_wrapper.get_logits_model() if hasattr(model_wrapper, "get_logits_model") else model_wrapper
     chunk_size = 500_000
     total_rows = 0
@@ -930,6 +948,13 @@ class Ours(DistillationStrategy):
         if no_cache:
             # Use a custom cache directory under temp_weights/ that gets cleaned per round
             self.cache_dir = os.path.join("temp_weights", f".cache_{stem}_ours")
+            # Clean up any stale cache directory from a previous crashed run
+            if os.path.isdir(self.cache_dir):
+                try:
+                    shutil.rmtree(self.cache_dir, ignore_errors=True)
+                    print(f"{COLORS.WARNING}Cleaned up stale cache from previous run: {self.cache_dir}{COLORS.ENDC}")
+                except Exception as e:
+                    print(f"{COLORS.WARNING}Failed to clean stale cache {self.cache_dir}: {e}{COLORS.ENDC}")
         else:
             self.cache_dir = os.path.join("temp_weights", f"{stem}_weight_record", "ours_cache")
 
@@ -967,6 +992,8 @@ class Ours(DistillationStrategy):
         eva_mode = self.eva_mode
         attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
+        # Check disk space before starting logit generation (need ~50GB for 100 clients)
+        _check_disk_space(2.0)
 
         for skipped_idx in range(first_client):
             fpath = os.path.join(self.cache_dir, f"client_{context.client_states[skipped_idx].client_id}.bin")
@@ -1090,6 +1117,13 @@ class Ours(DistillationStrategy):
             print(f"  Client {state.client_id}: logits {shape} -> {fpath}")
             if (client_idx + 1) % cleanup_interval == 0:
                 aggressive_memory_cleanup()
+                # Periodic disk space check (every cleanup_interval clients)
+                try:
+                    _check_disk_space(1.0)
+                except OSError as e:
+                    context.logger.error("Disk space check failed: %s", e)
+                    print(f"{COLORS.FAIL}{e}{COLORS.ENDC}")
+                    raise
 
             if self._ckpt and (
                 client_idx == len(context.client_states) - 1
