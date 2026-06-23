@@ -123,6 +123,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mixed_models", action="store_true", help="Assign different model architectures to client quartiles (GRU/DCBLSTM/MLP/CNN)")
     parser.add_argument("--keep_last_rounds", type=int, default=2, help="Keep only last N round weight records (0=keep all)")
     parser.add_argument("--disk_cache", action="store_true", help="Write logit cache to disk (default: use RAM cache)")
+    parser.add_argument("--no_save_weights", action="store_false", dest="save_weights", help="Don't save per-round weights to disk (saves ~100MB/run, disables crash recovery for rounds)")
 
     return parser
 
@@ -209,6 +210,7 @@ def main(argv=None):
             f1_curve=args.f1_curve,
             keep_last_rounds=args.keep_last_rounds,
             no_disk_cache=not args.disk_cache,
+            save_weights=args.save_weights,
         )
         
         strategy = strategy_registry[args.strategy](config)
@@ -249,6 +251,7 @@ def main(argv=None):
             flame_passive_cluster=args.passive_cluster,
             keep_last_rounds=args.keep_last_rounds,
             no_disk_cache=not args.disk_cache,
+            save_weights=args.save_weights,
         )
         run_pipeline(config)
 

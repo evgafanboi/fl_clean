@@ -213,6 +213,7 @@ class FLConfig:
     flame_passive_cluster: bool = False
     keep_last_rounds: int = 2
     no_disk_cache: bool = True
+    save_weights: bool = True
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -257,6 +258,8 @@ class FederatedLearningPipeline:
         self.poison_attack: Optional[str] = None
         self.poison_value: Optional[float] = None
         self.poison_ratio: Optional[float] = None
+        # In-memory round weights (avoids disk I/O when save_weights=False)
+        self.round_weights_history: Dict[int, list] = {}
         # Secure Aggregation state
         self.dh_private_keys: Dict[int, int] = {}
         self.dh_public_keys: Dict[int, int] = {}
@@ -1108,6 +1111,9 @@ class FederatedLearningPipeline:
     def run(self):
         configure_gpu()
 
+        if not getattr(self.config, 'save_weights', True):
+            print(f"{COLORS.WARNING}⚠️  --no_save_weights enabled: round weights stored in memory only, crash recovery disabled for rounds{COLORS.ENDC}")
+
         self.strategy_runtime = build_strategy(
             self.config.strategy,
             self.config.to_strategy_params(),
@@ -1515,7 +1521,12 @@ class FederatedLearningPipeline:
                 self._save_checkpoint(round_num, latest_weights, n_clients, round_times,
                                       selected_server=selected_server, ms_prev_scores=ms_prev_scores)
 
-            _record_round_weights(self.log_filename, round_num, global_weights=latest_weights, keep_last_rounds=self.config.keep_last_rounds)
+            # Store weights in memory (always, for evaluation)
+            self.round_weights_history[round_num] = latest_weights
+
+            # Conditionally write to disk (if save_weights is True)
+            if getattr(self.config, 'save_weights', True):
+                _record_round_weights(self.log_filename, round_num, global_weights=latest_weights, keep_last_rounds=self.config.keep_last_rounds)
 
             aggressive_memory_cleanup()
 
@@ -1546,6 +1557,11 @@ class FederatedLearningPipeline:
         self._run_eval_from_records(
             input_dim, num_classes, class_names, partition_label, excel_filename, record_base,
         )
+
+        # Conservative cleanup: only delete current run's temp_weights if save_weights=False
+        if not getattr(self.config, 'save_weights', True) and os.path.isdir(record_base):
+            shutil.rmtree(record_base, ignore_errors=True)
+            print(f"{COLORS.OKCYAN}Cleaned up {record_base} (save_weights=False){COLORS.ENDC}")
 
     def _run_eval_from_records(self, input_dim, num_classes, class_names, partition_label, excel_filename, record_base):
         log_timestamp(self.logger, "=== EVALUATION ===")
@@ -1605,14 +1621,18 @@ class FederatedLearningPipeline:
             if self.config.skip_eval and round_num != self.config.rounds:
                 continue
 
-            weight_path = os.path.join(record_base, f"round_{round_num}", "global_weight.bin")
-            if not os.path.exists(weight_path):
-                self.logger.info(f"Round {round_num} | SKIPPED (no weight record)")
-                print(f"{COLORS.WARNING}Round {round_num}: skipped (no weight record){COLORS.ENDC}")
-                continue
-
-            with open(weight_path, "rb") as f:
-                weights = pickle.load(f)
+            # Try in-memory weights first (always populated during training)
+            if round_num in self.round_weights_history:
+                weights = self.round_weights_history[round_num]
+            else:
+                # Fallback: load from disk (for resumed runs or when save_weights=True)
+                weight_path = os.path.join(record_base, f"round_{round_num}", "global_weight.bin")
+                if not os.path.exists(weight_path):
+                    self.logger.info(f"Round {round_num} | SKIPPED (no weight record)")
+                    print(f"{COLORS.WARNING}Round {round_num}: skipped (no weight record){COLORS.ENDC}")
+                    continue
+                with open(weight_path, "rb") as f:
+                    weights = pickle.load(f)
             eval_model.set_weights(weights)
             del weights
 
@@ -1925,6 +1945,10 @@ def run_distillation_pipeline(config, strategy) -> None:
     if context.shared_state.get("extra_log_tokens"):
         log_timestamp(logger, f"Extra config: {context.shared_state['extra_log_tokens']}")
     
+    if not getattr(config, 'save_weights', True):
+        print(f"{COLORS.WARNING}⚠️  --no_save_weights enabled: round weights stored in memory only, crash recovery disabled for rounds{COLORS.ENDC}")
+        logger.info("--no_save_weights enabled: round weights stored in memory only, crash recovery disabled for rounds")
+    
     strategy.setup(context)
     
     start_round = 1
@@ -2044,6 +2068,7 @@ def run_distillation_pipeline(config, strategy) -> None:
             _f.write("\n".join(_lines) + "\n")
 
     round_times: List[float] = []
+    round_weights_history: Dict[int, list] = {}
 
     for round_number in range(start_round, config.rounds + 1):
         round_start_time = time.time()
@@ -2093,7 +2118,10 @@ def run_distillation_pipeline(config, strategy) -> None:
         if _global_model_strategy:
             global_model = context.shared_state.get("global_model")
             if global_model is not None:
-                _record_round_weights(log_filename, round_number, global_weights=global_model.get_weights(), keep_last_rounds=config.keep_last_rounds)
+                gw = global_model.get_weights()
+                round_weights_history[round_number] = gw
+                if getattr(config, 'save_weights', True):
+                    _record_round_weights(log_filename, round_number, global_weights=gw, keep_last_rounds=config.keep_last_rounds)
         else:
             context.record_client_weights(round_number)
             if config.keep_last_rounds > 0:
@@ -2129,6 +2157,11 @@ def run_distillation_pipeline(config, strategy) -> None:
     stem = os.path.splitext(os.path.basename(log_filename))[0]
     record_base = os.path.join("temp_weights", f"{stem}_weight_record")
     _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, _global_model_strategy)
+
+    # Conservative cleanup: only delete current run's temp_weights if save_weights=False
+    if not getattr(config, 'save_weights', True) and os.path.isdir(record_base):
+        shutil.rmtree(record_base, ignore_errors=True)
+        print(f"{COLORS.OKCYAN}Cleaned up {record_base} (save_weights=False){COLORS.ENDC}")
 
 
 def _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, global_model_eval=False):
@@ -2198,18 +2231,23 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
         round_dir = os.path.join(record_base, f"round_{round_number}")
 
         if global_model_eval:
-            weight_path = os.path.join(round_dir, "global_weight.bin")
-            if not os.path.exists(weight_path):
-                logger.info(f"Round {round_number} | SKIPPED (no weight record)")
-                print(f"{COLORS.WARNING}Round {round_number}: skipped (no weight record){COLORS.ENDC}")
-                continue
+            # Try in-memory weights first (always populated during training)
+            if round_number in round_weights_history:
+                weights = round_weights_history[round_number]
+            else:
+                # Fallback: load from disk (for resumed runs or when save_weights=True)
+                weight_path = os.path.join(round_dir, "global_weight.bin")
+                if not os.path.exists(weight_path):
+                    logger.info(f"Round {round_number} | SKIPPED (no weight record)")
+                    print(f"{COLORS.WARNING}Round {round_number}: skipped (no weight record){COLORS.ENDC}")
+                    continue
+                with open(weight_path, "rb") as _f:
+                    weights = pickle.load(_f)
             if _eval_model_arch != model_type:
                 del eval_model
                 eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
                 _eval_model_arch = model_type
 
-            with open(weight_path, "rb") as _f:
-                weights = pickle.load(_f)
             eval_model.set_weights(weights)
             del weights
 
@@ -2229,6 +2267,11 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
         else:
             global_weight_path = os.path.join(round_dir, "global_weight.bin")
             _is_final_client_eval = getattr(config, 'algorithm', '') in {"SSFL-IDS", "FedKD-IDS"}
+
+            if not getattr(config, 'save_weights', True) and _is_final_client_eval:
+                logger.info(f"Round {round_number} | SKIPPED (per-client eval requires save_weights=True)")
+                print(f"{COLORS.WARNING}Round {round_number}: skipped (per-client eval requires --save_weights){COLORS.ENDC}")
+                continue
 
             if _is_final_client_eval and round_number == config.rounds:
                 client_bins = sorted(glob.glob(os.path.join(round_dir, "client_*_weight.bin")), key=lambda p: int(os.path.basename(p).split("_")[1]))

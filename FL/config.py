@@ -52,6 +52,7 @@ class FDConfig:
     f1_curve: bool = False
     keep_last_rounds: int = 2
     no_disk_cache: bool = True
+    save_weights: bool = True
 
     def to_algorithm_params(self) -> dict:
         return {
