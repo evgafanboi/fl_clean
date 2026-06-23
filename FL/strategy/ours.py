@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import os
 import shutil
+import tempfile
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -926,7 +927,11 @@ class Ours(DistillationStrategy):
         print(f"{COLORS.OKGREEN}Preparing Ours ({kd_method.upper()}){COLORS.ENDC}")
 
         stem = os.path.splitext(os.path.basename(context.log_filename))[0]
-        self.cache_dir = os.path.join("temp_weights", f"{stem}_weight_record", "ours_cache")
+        no_cache = getattr(config, 'no_disk_cache', False)
+        if no_cache:
+            self.cache_dir = tempfile.mkdtemp(prefix=f"ours_{stem}_", dir="/dev/shm")
+        else:
+            self.cache_dir = os.path.join("temp_weights", f"{stem}_weight_record", "ours_cache")
 
         public_unlabeled_ds, total_public = load_public_dataset_from_clients(
             context.paths, batch_size=config.batch_size, num_classes=context.num_classes,
@@ -935,7 +940,6 @@ class Ours(DistillationStrategy):
         public_features = numpy_from_dataset(public_unlabeled_ds)
         del public_unlabeled_ds
 
-        no_cache = getattr(config, 'no_disk_cache', False)
         if no_cache:
             context.shared_state.update({
                 "public_features": public_features,
@@ -1525,3 +1529,8 @@ class Ours(DistillationStrategy):
             print(f"{COLORS.WARNING}Cleaned up {self.cache_dir}{COLORS.ENDC}")
 
         return {}
+
+    def finalize(self, context) -> None:
+        """Clean up cache directory on experiment finalization."""
+        if hasattr(self, 'cache_dir') and os.path.isdir(self.cache_dir):
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
