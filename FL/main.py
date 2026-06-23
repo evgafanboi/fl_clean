@@ -123,6 +123,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mixed_models", action="store_true", help="Assign different model architectures to client quartiles (GRU/DCBLSTM/MLP/CNN)")
     parser.add_argument("--keep_last_rounds", type=int, default=2, help="Keep only last N round weight records (0=keep all)")
     parser.add_argument("--disk_cache", action="store_true", help="Write logit cache to disk instead of RAM")
+    parser.add_argument("--save_weights", action="store_true", default=True, help="Save per-round model weights to disk (default: True)")
+    parser.add_argument("--no_save_weights", action="store_false", dest="save_weights", help="Store round weights in memory only — disables crash recovery")
 
     return parser
 
