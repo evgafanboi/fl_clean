@@ -928,10 +928,13 @@ class Ours(DistillationStrategy):
 
         stem = os.path.splitext(os.path.basename(context.log_filename))[0]
         no_cache = getattr(config, 'no_disk_cache', False)
+        print(f"{COLORS.WARNING}[DEBUG] Ours.setup: no_disk_cache={no_cache}, stem={stem}{COLORS.ENDC}")
         if no_cache:
             self.cache_dir = tempfile.mkdtemp(prefix=f"ours_{stem}_", dir="/dev/shm")
+            print(f"{COLORS.OKGREEN}[DEBUG] Created cache_dir in /dev/shm: {self.cache_dir}{COLORS.ENDC}")
         else:
             self.cache_dir = os.path.join("temp_weights", f"{stem}_weight_record", "ours_cache")
+            print(f"{COLORS.WARNING}[DEBUG] Using disk cache_dir: {self.cache_dir}{COLORS.ENDC}")
 
         public_unlabeled_ds, total_public = load_public_dataset_from_clients(
             context.paths, batch_size=config.batch_size, num_classes=context.num_classes,
