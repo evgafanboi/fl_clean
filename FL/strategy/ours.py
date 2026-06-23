@@ -933,8 +933,6 @@ class Ours(DistillationStrategy):
             for start in range(0, len(public_features), EVA_PUBLIC_CHUNK):
                 chunk = public_features[start:start + EVA_PUBLIC_CHUNK]
                 logits = _sanitize_logits(logits_model.predict(chunk, batch_size=batch_size, verbose=0))
-                if logit_shape is None:
-                    _n_classes = logits.shape[1]
                 energies = _energy_from_logits(logits)
                 if eva_mode == "eva" or eva_mode == "eva2":
                     support = (energies <= q95).astype(np.float32)
@@ -964,17 +962,6 @@ class Ours(DistillationStrategy):
             shape = logits_arr.shape
             del chunks
             return logits_arr, shape, None
-
-            if self._ckpt and (
-                client_idx == len(context.client_states) - 1
-                or (client_idx + 1) % self._ckpt == 0
-            ):
-                save_mid_round(context, "ours", {
-                    "round": self._cur_round,
-                    "stage": "logits",
-                    "last_client_idx": client_idx,
-                    "logit_files": logit_files,
-                })
 
         # If all clients were already done (checkpoint resume), derive shape
         # from the first recovered file so callers never receive None.
