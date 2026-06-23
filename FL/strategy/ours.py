@@ -929,7 +929,9 @@ class Ours(DistillationStrategy):
         stem = os.path.splitext(os.path.basename(context.log_filename))[0]
         no_cache = getattr(config, 'no_disk_cache', False)
         if no_cache:
-            self.cache_dir = tempfile.mkdtemp(prefix=f"ours_{stem}_", dir="/dev/shm")
+            # Use a custom cache directory under temp_weights/ that gets cleaned per round
+            # (avoid /dev/shm because it's limited to 15GB and overflows with multiple concurrent runs)
+            self.cache_dir = os.path.join("temp_weights", f".cache_{stem}_ours")
         else:
             self.cache_dir = os.path.join("temp_weights", f"{stem}_weight_record", "ours_cache")
 

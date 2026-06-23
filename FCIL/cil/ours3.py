@@ -37,7 +37,7 @@ class Ours3(Ours2):
         discard_frac = total_discard.astype(np.float64) / max(n_samples, 1)
         survivor = discard_frac <= self.robust_filter.robust_threshold
         self._last_survivor_clients = [i for i in range(n_clients) if survivor[i]]
-        self._last_survivors = int(survivor.sum())
+        self._last_survivors = int(survivor.sum()) if not self.no_filter else n_clients
         self._last_eva_support = float(total_eva / max(total_eva_cells, 1))
 
         n_classes = len(self.class_order)

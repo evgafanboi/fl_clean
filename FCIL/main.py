@@ -241,7 +241,7 @@ def main():
         parts.append(f"kg{args.ours_kd_gamma}")
         parts.append(f"rel{args.ours_proto_rel_lambda}")
         parts.append(f"enc{args.ours_encoder_lr_factor}")
-        parts.append("meanlogits" if args.no_filter else f"blom{args.robust_threshold}")
+        parts.append("mean_agg" if args.no_filter else f"blom{args.robust_threshold}")
     if args.cil in ('ours2', 'ours3', 'ours4'):
         parts.append(f"mem{args.memory}")
         parts.append(f"kg{args.ours_kd_gamma}")
