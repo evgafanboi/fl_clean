@@ -122,7 +122,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_tf", action="store_true", help="Use TensorFlow backend (default: PyTorch)")
     parser.add_argument("--mixed_models", action="store_true", help="Assign different model architectures to client quartiles (GRU/DCBLSTM/MLP/CNN)")
     parser.add_argument("--keep_last_rounds", type=int, default=2, help="Keep only last N round weight records (0=keep all)")
-    parser.add_argument("--no_disk_cache", action="store_true", help="Skip writing logit cache to disk (uses more RAM, saves ~3GB/run on disk)")
+    parser.add_argument("--no_disk_cache", action="store_false", dest="disk_cache", help="Skip writing logit cache to disk (default: skip disk cache, uses RAM instead)")
 
     return parser
 
@@ -208,7 +208,7 @@ def main(argv=None):
             exp_rho=args.exp_rho,
             f1_curve=args.f1_curve,
             keep_last_rounds=args.keep_last_rounds,
-            no_disk_cache=args.no_disk_cache,
+            no_disk_cache=not args.disk_cache,
         )
         
         strategy = strategy_registry[args.strategy](config)
@@ -248,7 +248,7 @@ def main(argv=None):
             flame_lambda=args.flame_lambda,
             flame_passive_cluster=args.passive_cluster,
             keep_last_rounds=args.keep_last_rounds,
-            no_disk_cache=args.no_disk_cache,
+            no_disk_cache=not args.disk_cache,
         )
         run_pipeline(config)
 
