@@ -206,7 +206,6 @@ class FLConfig:
     flame_lambda: float = 0.001
     flame_passive_cluster: bool = False
     keep_last_rounds: int = 2
-    no_disk_cache: bool = True
     save_weights: bool = True
 
     def to_strategy_params(self) -> Dict[str, object]:
