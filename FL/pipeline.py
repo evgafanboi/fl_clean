@@ -110,11 +110,6 @@ def _cleanup_old_weight_rounds(record_base: str, keep_last: int) -> None:
         shutil.rmtree(dirpath, ignore_errors=True)
         print(f"{COLORS.WARNING}Cleaned up {dirpath}{COLORS.ENDC}")
 
-    cache_dir = os.path.join(record_base, "ours_cache")
-    if os.path.isdir(cache_dir):
-        shutil.rmtree(cache_dir, ignore_errors=True)
-        print(f"{COLORS.WARNING}Cleaned up {cache_dir}{COLORS.ENDC}")
-
 
 def _config_fingerprint(config) -> str:
     import hashlib
@@ -686,15 +681,7 @@ class FederatedLearningPipeline:
             for key, val in strategy_state.items():
                 setattr(strategy_obj, key, val)
             
-            # Reset cache_dir for Ours strategy if no_disk_cache is enabled
-            if self.config.strategy == "Ours" and getattr(self.config, 'no_disk_cache', False):
-                if hasattr(strategy_obj, 'cache_dir') and os.path.isdir(strategy_obj.cache_dir):
-                    # Clean up old disk-based cache if it exists
-                    if 'temp_weights' in strategy_obj.cache_dir:
-                        shutil.rmtree(strategy_obj.cache_dir, ignore_errors=True)
-                # Create new cache directory on disk
-                stem = os.path.splitext(os.path.basename(self.log_filename))[0]
-                strategy_obj.cache_dir = os.path.join("temp_weights", f".cache_{stem}_ours")
+
 
         df_path = os.path.join(ckpt_dir, "results_df.pkl")
         if os.path.exists(df_path):
@@ -2569,11 +2556,6 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     _keep = getattr(config, 'keep_last_rounds', 0)
     if _keep > 0:
         _cleanup_old_weight_rounds(record_base, _keep)
-    else:
-        cache_dir = os.path.join(record_base, "ours_cache")
-        if os.path.isdir(cache_dir):
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            print(f"{COLORS.WARNING}Cleaned up {cache_dir}{COLORS.ENDC}")
 
 
 # def _extract_labels(dataset: tf.data.Dataset, num_classes: int) -> np.ndarray:
