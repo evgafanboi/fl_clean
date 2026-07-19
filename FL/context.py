@@ -155,7 +155,7 @@ class PipelineContext:
 
     def _weight_record_dir(self, round_num: int) -> str:
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
-        return os.path.join("temp_weights", f"{stem}_weight_record", f"round_{round_num}")
+        return os.path.join("weight_records", f"{stem}_weight_record", f"round_{round_num}")
 
     def record_client_weight(self, round_num: int, client_id: int, weights) -> None:
         record_dir = self._weight_record_dir(round_num)

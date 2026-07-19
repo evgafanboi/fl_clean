@@ -1,14 +1,62 @@
 import logging
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 
 from .colors import COLORS
 
+_EVAL_COMPLETE_LINE_RE = re.compile(rb'Round \d+ \| (?:GLOBAL|AVG|BENIGN_AVG) \|')
+
+
+def _completed_eval_rounds_from_log(filepath: str) -> set:
+    p = Path(filepath)
+    if not p.exists():
+        return set()
+    data = p.read_bytes()
+    eval_marker = b"=== EVALUATION ==="
+    eval_idx = data.find(eval_marker)
+    if eval_idx == -1:
+        return set()
+    post_eval = data[eval_idx:]
+    rounds = set()
+    for m in _EVAL_COMPLETE_LINE_RE.finditer(post_eval):
+        r = int(m.group().split()[1])
+        rounds.add(r)
+    return rounds
+
+
+def _truncate_after_last_complete_eval(filepath: str, completed: set) -> bool:
+    p = Path(filepath)
+    if not p.exists():
+        return False
+    data = p.read_bytes()
+    eval_marker = b"=== EVALUATION ==="
+    eval_idx = data.find(eval_marker)
+    if eval_idx == -1:
+        return False
+    post_eval = data[eval_idx:]
+    last_pos = eval_idx
+    for m in _EVAL_COMPLETE_LINE_RE.finditer(post_eval):
+        r = int(m.group().split()[1])
+        if r in completed:
+            line_end = data.find(b'\n', eval_idx + m.start())
+            if line_end == -1:
+                line_end = len(data)
+            last_pos = line_end + 1
+    if last_pos > eval_idx and last_pos < len(data):
+        p.write_bytes(data[:last_pos])
+        return True
+    if not completed:
+        line_start = data.rfind(b"\n", 0, eval_idx)
+        cut = line_start + 1 if line_start >= 0 else 0
+        p.write_bytes(data[:cut])
+        return True
+    return False
+
 
 def _truncate_after_last_round(filepath: str) -> None:
-    """Truncate a log file after the last 'Round N completed' line, removing partial-round leftovers."""
     p = Path(filepath)
     if not p.exists():
         return
@@ -72,18 +120,8 @@ def _truncate_after_checkpoint_client(filepath: str, round_number: int, client_i
 
 
 def _truncate_at_evaluation(filepath: str) -> bool:
-    p = Path(filepath)
-    if not p.exists():
-        return False
-    data = p.read_bytes()
-    marker = b"=== EVALUATION ==="
-    idx = data.rfind(marker)
-    if idx == -1:
-        return False
-    line_start = data.rfind(b"\n", 0, idx)
-    cut = line_start + 1 if line_start >= 0 else 0
-    p.write_bytes(data[:cut])
-    return True
+    completed = _completed_eval_rounds_from_log(filepath)
+    return _truncate_after_last_complete_eval(filepath, completed)
 
 
 def _truncate_for_resume(filepath: str) -> None:

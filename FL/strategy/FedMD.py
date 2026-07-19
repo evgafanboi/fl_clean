@@ -13,7 +13,7 @@ from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
 from .base import DistillationStrategy
-from ..poison_utils import poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights, parse_poison_config
+from ..poison_utils import poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights, parse_poison_config, ipoisonedfl_client_weights
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import (
     create_model,
@@ -22,7 +22,7 @@ from .common import (
     numpy_from_dataset,
 )
 
-LOGITS_CACHE_DIR = os.path.join("temp_weights", "fedmd_logits")
+LOGITS_CACHE_DIR = os.path.join("weight_records", "fedmd_logits")
 
 
 def generate_public_logits_to_file(model_wrapper, public_features: np.ndarray, batch_size: int, output_path: str) -> tuple:
@@ -363,7 +363,7 @@ class FedMD(DistillationStrategy):
             for st in context.client_states:
                 if st.client_id in context.poisoned_clients:
                     m = pool.checkout(st.client_id)
-                    m.set_weights(poisoned_w)
+                    m.set_weights(ipoisonedfl_client_weights(poisoned_w, st.client_id) if attack_type_dgt == "ipoisonedfl" else poisoned_w)
                     pool.checkin(st.client_id, m)
             context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost digest'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
             del ghost_w, poisoned_w

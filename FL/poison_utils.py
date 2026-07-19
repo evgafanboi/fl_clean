@@ -7,8 +7,8 @@ def parse_poison_config(poison_arg):
         return None, None, None
     parts = poison_arg.split()
     attack_type = parts[0]
-    assert attack_type in ("gradient_scale", "label_flip", "targeted_flip", "poisonedfl", "lma"), f"Unknown attack: {attack_type}"
-    no_value = attack_type in ("label_flip", "lma")
+    assert attack_type in ("gradient_scale", "label_flip", "targeted_flip", "poisonedfl", "ipoisonedfl", "lma", "ilma"), f"Unknown attack: {attack_type}"
+    no_value = attack_type in ("label_flip", "lma", "ilma")
     value = None if no_value else float(parts[1])
     ratio = float(parts[-1])
     return attack_type, value, ratio
@@ -42,15 +42,26 @@ class PoisonedFLState:
             return None
         prev_global = np.nan_to_num(np.asarray(self.prev_global, dtype=np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
         last_grad = current_flat - prev_global
-        history_vec = self.last_grad if self.last_grad is not None else last_grad
-        history_vec = np.nan_to_num(np.asarray(history_vec, dtype=np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
+        last_grad_norm = float(np.linalg.norm(last_grad))
+        sf = self.scaling_factor
+        if self.last_grad is None:
+            deviation = self.fixed_rand / np.sqrt(float(d))
+            m_update = np.nan_to_num(sf * last_grad_norm * deviation, nan=0.0, posinf=fmax, neginf=-fmax)
+            m_update = np.clip(m_update, -fmax, fmax).astype(np.float32)
+            self.last_grad = np.clip(last_grad, -fmax, fmax).astype(np.float32)
+            self.last_poisoned = m_update.copy()
+            self.prev_global = current_flat.copy()
+            self.last_aligned = None
+            self.last_dimension = None
+            self.last_hypothesis_success = None
+            print(f"  [PoisonedFL] armed c={sf:.4f}, 1-gradient attack, mal_norm={float(np.linalg.norm(m_update)):.4e}")
+            return m_update
+        history_vec = np.nan_to_num(np.asarray(self.last_grad, dtype=np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
         history = history_vec.reshape(d, 1)
         history_norm = float(np.linalg.norm(history))
-        last_grad_norm = float(np.linalg.norm(last_grad))
         residual = history - last_grad.reshape(d, 1) * history_norm / (last_grad_norm + 1e-9)
         scale = np.nan_to_num(np.linalg.norm(residual, axis=1), nan=0.0, posinf=fmax, neginf=0.0)
         deviation = np.nan_to_num(scale * self.fixed_rand / (float(np.linalg.norm(scale)) + 1e-9), nan=0.0, posinf=1.0, neginf=-1.0)
-        sf = self.scaling_factor
         if self.has_applied_poison:
             aligned = int(np.sum(np.sign(last_grad) == self.fixed_rand))
             k_99 = int(d / 2 + 2.326 * np.sqrt(d) / 2)
@@ -98,6 +109,21 @@ def poisonedfl_unified_weights(byz_weights_list, state: PoisonedFLState, allow_d
     return poisoned
 
 
+def ipoisonedfl_client_weights(weights, client_id: int):
+    eps = np.finfo(np.float16).eps
+    low, high = float(eps), float(0.1 * eps) # too large?
+    rng = np.random.default_rng(int(client_id))
+    out = []
+    for w in weights:
+        modifier = rng.uniform(low, high, size=w.shape).astype(w.dtype, copy=False)
+        out.append((w + w * modifier).astype(w.dtype, copy=False))
+    return out
+
+
+def ipoisonedfl_client_weight_map(weights, client_ids):
+    return {int(cid): ipoisonedfl_client_weights(weights, int(cid)) for cid in client_ids}
+
+
 def poisonedfl_broadcast_weights(current_weights, state: PoisonedFLState, allow_decay: bool = True):
     fmax = float(np.finfo(np.float32).max)
     current_flat = np.nan_to_num(np.concatenate([w.ravel() for w in current_weights]).astype(np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
@@ -124,24 +150,34 @@ def poisonedfl_broadcast_weights(current_weights, state: PoisonedFLState, allow_
     scale = np.nan_to_num(scale, nan=0.0, posinf=fmax, neginf=0.0)
     deviation = np.nan_to_num(scale * state.fixed_rand / (float(np.linalg.norm(scale)) + 1e-9), nan=0.0, posinf=1.0, neginf=-1.0)
     sf = state.scaling_factor
-    aligned = int(np.sum(np.sign(last_grad) == state.fixed_rand))
-    k_99 = int(d / 2 + 2.326 * np.sqrt(d) / 2)
-    hypothesis_success = aligned >= k_99
-    if allow_decay and not hypothesis_success and sf * 0.7 >= 0.5:
-        sf *= 0.7
+    if state.has_applied_poison:
+        aligned = int(np.sum(np.sign(last_grad) == state.fixed_rand))
+        k_99 = int(d / 2 + 2.326 * np.sqrt(d) / 2)
+        hypothesis_success = aligned >= k_99
+        if allow_decay and not hypothesis_success and sf * 0.7 >= 0.5:
+            sf *= 0.7
+        state.last_aligned = aligned
+        state.last_dimension = d
+    else:
+        aligned = None
+        k_99 = None
+        hypothesis_success = None
+        state.last_aligned = None
+        state.last_dimension = None
     state.scaling_factor = sf
     state.has_applied_poison = True
     state.last_hypothesis_success = hypothesis_success
-    state.last_aligned = aligned
-    state.last_dimension = d
     mal_update = np.nan_to_num(sf * last_grad_norm * deviation, nan=0.0, posinf=fmax, neginf=-fmax)
     mal_update = np.clip(mal_update, -fmax, fmax).astype(np.float32)
     state.last_grad = np.clip(last_grad, -fmax, fmax).astype(np.float32)
     state.last_poisoned = mal_update.copy()
     state.prev_global = current_flat.copy()
     state.cached_update = mal_update
-    hypothesis = "H1" if hypothesis_success else "H0"
-    print(f"  [PoisonedFL] {hypothesis} c={sf:.4f}, aligned={aligned}/{d} (k99={k_99}), mal_norm={float(np.linalg.norm(mal_update)):.4e}")
+    if hypothesis_success is None:
+        print(f"  [PoisonedFL] armed c={sf:.4f}, hypothesis deferred, mal_norm={float(np.linalg.norm(mal_update)):.4e}")
+    else:
+        hypothesis = "H1" if hypothesis_success else "H0"
+        print(f"  [PoisonedFL] {hypothesis} c={sf:.4f}, aligned={aligned}/{d} (k99={k_99}), mal_norm={float(np.linalg.norm(mal_update)):.4e}")
     poisoned_flat = np.nan_to_num(current_flat + mal_update.astype(np.float64), nan=0.0, posinf=fmax, neginf=-fmax)
     poisoned_flat = np.clip(poisoned_flat, -fmax, fmax)
     offset, poisoned = 0, []

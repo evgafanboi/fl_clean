@@ -36,7 +36,7 @@ from .decentralized import (
     braintorrent_select_server, log_braintorrent_selection,
     compute_model_similarity_scores, select_model_similarity_server, log_model_similarity_selection,
 )
-from .poison_utils import parse_poison_config, get_or_create_poisoned_clients, PoisonedDataLoader, apply_gradient_scale_poison, PoisonedFLState
+from .poison_utils import parse_poison_config, get_or_create_poisoned_clients, PoisonedDataLoader, apply_gradient_scale_poison, PoisonedFLState, ipoisonedfl_client_weights
 
 
 _STANDARD_EVAL_COLUMNS = ['Round', 'Loss', 'Accuracy', 'F1_Score', 'Precision', 'Recall', 'AUPRC', 'ECE']
@@ -47,7 +47,7 @@ _POISONEDFL_STATE_KEY = "__poisoned_fl_state__"
 
 def _record_round_weights(log_filename, round_num, global_weights=None, context=None, keep_last_rounds=0):
     stem = os.path.splitext(os.path.basename(log_filename))[0]
-    record_dir = os.path.join("temp_weights", f"{stem}_weight_record", f"round_{round_num}")
+    record_dir = os.path.join("weight_records", f"{stem}_weight_record", f"round_{round_num}")
     os.makedirs(record_dir, exist_ok=True)
 
     if global_weights is not None:
@@ -56,7 +56,7 @@ def _record_round_weights(log_filename, round_num, global_weights=None, context=
         with open(tmp, "wb") as f:
             pickle.dump(global_weights, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, path)
-        _cleanup_old_weight_rounds(os.path.join("temp_weights", f"{stem}_weight_record"), keep_last_rounds)
+        _cleanup_old_weight_rounds(os.path.join("weight_records", f"{stem}_weight_record"), keep_last_rounds)
         return
 
     if context is None:
@@ -75,7 +75,7 @@ def _record_round_weights(log_filename, round_num, global_weights=None, context=
             continue
 
     if saved_any or context.model_pool is None:
-        _cleanup_old_weight_rounds(os.path.join("temp_weights", f"{stem}_weight_record"), keep_last_rounds)
+        _cleanup_old_weight_rounds(os.path.join("weight_records", f"{stem}_weight_record"), keep_last_rounds)
         return
 
     pool = context.model_pool
@@ -89,26 +89,11 @@ def _record_round_weights(log_filename, round_num, global_weights=None, context=
             pickle.dump(w, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, path)
 
-    _cleanup_old_weight_rounds(os.path.join("temp_weights", f"{stem}_weight_record"), keep_last_rounds)
+    _cleanup_old_weight_rounds(os.path.join("weight_records", f"{stem}_weight_record"), keep_last_rounds)
 
 
 def _cleanup_old_weight_rounds(record_base: str, keep_last: int) -> None:
-    if keep_last <= 0:
-        return
-    round_dirs = []
-    for entry in os.listdir(record_base):
-        if entry.startswith("round_"):
-            full = os.path.join(record_base, entry)
-            if os.path.isdir(full):
-                try:
-                    round_num = int(entry.split("_")[1])
-                    round_dirs.append((round_num, full))
-                except (IndexError, ValueError):
-                    continue
-    round_dirs.sort(key=lambda x: x[0])
-    for _, dirpath in round_dirs[:-keep_last]:
-        shutil.rmtree(dirpath, ignore_errors=True)
-        print(f"{COLORS.WARNING}Cleaned up {dirpath}{COLORS.ENDC}")
+    pass
 
 
 def _config_fingerprint(config) -> str:
@@ -208,6 +193,7 @@ class FLConfig:
     keep_last_rounds: int = 2
     no_disk_cache: bool = True
     save_weights: bool = True
+    eval_only: bool = False
 
     def to_strategy_params(self) -> Dict[str, object]:
         return {
@@ -670,7 +656,7 @@ class FederatedLearningPipeline:
         if os.path.exists(pfl_state_path):
             with open(pfl_state_path, "rb") as f:
                 self.poisoned_fl_state = pickle.load(f)
-        elif self.poison_attack == "poisonedfl":
+        elif self.poison_attack in ("poisonedfl", "ipoisonedfl"):
             print(f"{COLORS.WARNING}Checkpoint missing PoisonedFL adaptive state; resume will restart attack adaptation{COLORS.ENDC}")
 
         strategy_state_path = os.path.join(ckpt_dir, "strategy_state.bin")
@@ -773,7 +759,7 @@ class FederatedLearningPipeline:
             scale = self.poison_value or 1.0
             print(f"  \u26a0\ufe0f  POISONED CLIENT - Scaling gradients x{scale:.1f}")
 
-        if poisoned and self.poison_attack == "poisonedfl" and self.poisoned_fl_state is not None and latest_weights is not None:
+        if poisoned and self.poison_attack in ("poisonedfl", "ipoisonedfl") and self.poisoned_fl_state is not None and latest_weights is not None:
             _mmap = np.load(paths['train_X'], mmap_mode='r')
             sample_size = _mmap.shape[0]
             del _mmap
@@ -788,7 +774,7 @@ class FederatedLearningPipeline:
             if reuse_model is None:
                 del model
             aggressive_memory_cleanup()
-            print(f"{COLORS.WARNING}Client {client_id}, (poisonedfl attack) - skipping training and returning poisoned weights{COLORS.ENDC}")
+            print(f"{COLORS.WARNING}Client {client_id}, ({self.poison_attack} attack) - skipping training and returning poisoned weights{COLORS.ENDC}")
             return result_data, sample_size, 0.0
 
         train_dataset = create_client_dataset(
@@ -995,7 +981,7 @@ class FederatedLearningPipeline:
     def _apply_poison_to_weights(self, weights, latest_weights, client_id):
         if self.poison_attack == "gradient_scale" and client_id in self.poisoned_clients:
             return apply_gradient_scale_poison(weights, self.poison_value or 1.0)
-        if self.poison_attack == "poisonedfl" and client_id in self.poisoned_clients:
+        if self.poison_attack in ("poisonedfl", "ipoisonedfl") and client_id in self.poisoned_clients:
             state = self.poisoned_fl_state
             if state.cached_update is not None and latest_weights is not None:
                 state.has_applied_poison = True
@@ -1004,6 +990,8 @@ class FederatedLearningPipeline:
                     n = w.size
                     poisoned.append((w.ravel() + state.cached_update[offset:offset + n]).reshape(w.shape).astype(w.dtype))
                     offset += n
+                if self.poison_attack == "ipoisonedfl":
+                    poisoned = ipoisonedfl_client_weights(poisoned, client_id)
                 return poisoned
         return weights
 
@@ -1127,7 +1115,7 @@ class FederatedLearningPipeline:
             strategy_name=self.config.strategy,
             extra_tokens=extra_tokens,
             poison_suffix=poison_suffix,
-            resume=self.config.checkpoint,
+            resume=bool(self.config.checkpoint) or self.config.eval_only,
         )
         excel_filename = self.log_filename.replace('.log', '.xlsx')
 
@@ -1149,8 +1137,8 @@ class FederatedLearningPipeline:
         self.poison_attack = attack_type
         self.poison_value = poison_value
         self.poison_ratio = poison_ratio
-        if attack_type == "lma":
-            raise ValueError("LMA is only supported for Ours, FedDistill, SSFL-IDS, and FedKD-IDS")
+        if attack_type in ("lma", "ilma"):
+            raise ValueError("LMA/iLMA is only supported for Ours, FedDistill, SSFL-IDS, and FedKD-IDS")
         if attack_type:
             self.poisoned_clients = get_or_create_poisoned_clients(
                 partition_label, attack_type, poison_value, poison_ratio, n_clients
@@ -1167,7 +1155,7 @@ class FederatedLearningPipeline:
                         "targeted_flip", num_classes,
                         dominant_class=dominant, target_label=target_label,
                     )
-            elif attack_type == "poisonedfl":
+            elif attack_type in ("poisonedfl", "ipoisonedfl"):
                 self.poisoned_fl_state = PoisonedFLState(c0=poison_value)
             log_timestamp(self.logger, f"Poisoned clients: {self.poisoned_clients}")
             print(f"\n  POISONING ENABLED: {attack_type} attack (value={poison_value})")
@@ -1186,15 +1174,11 @@ class FederatedLearningPipeline:
         round_times: List[float] = []
 
         if self.config.fresh_run:
-            stem = os.path.splitext(os.path.basename(self.log_filename))[0]
-            _wr_base = os.path.join("temp_weights", f"{stem}_weight_record")
-            if os.path.isdir(_wr_base):
-                shutil.rmtree(_wr_base)
             _ckpt_base = self._checkpoint_dir()
             if os.path.isdir(_ckpt_base):
                 shutil.rmtree(_ckpt_base)
             _clear_eval_artifacts(self.log_filename.replace('.log', '.xlsx'))
-            print(f"{COLORS.OKCYAN}fresh_run: cleared weight records, checkpoint, and eval artifacts{COLORS.ENDC}")
+            print(f"{COLORS.OKCYAN}fresh_run: cleared checkpoint and eval artifacts{COLORS.ENDC}")
 
         if self.config.checkpoint:
             ckpt = self._load_checkpoint()
@@ -1211,7 +1195,7 @@ class FederatedLearningPipeline:
 
         # Check if final weight records already exist — skip training entirely
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
-        record_base = os.path.join("temp_weights", f"{stem}_weight_record")
+        record_base = os.path.join("weight_records", f"{stem}_weight_record")
         final_round_dir = os.path.join(record_base, f"round_{self.config.rounds}")
         ckpt_info_path = os.path.join("checkpoint", stem, "info.txt")
         _allow_final_record_shortcut, _shortcut_info = _allow_eval_shortcut_from_records(ckpt_info_path, self.config)
@@ -1226,6 +1210,15 @@ class FederatedLearningPipeline:
         if _final_exists and not _allow_final_record_shortcut:
             _stage = _shortcut_info.get("stage", "?")
             print(f"{COLORS.WARNING}Final-round weight records exist, but checkpoint is not fully complete (stage={_stage}) — resuming training{COLORS.ENDC}")
+
+        if self.config.eval_only:
+            if not os.path.isdir(record_base):
+                print(f"{COLORS.FAIL}No weight records found at {record_base} — exiting{COLORS.ENDC}")
+                return
+            self._run_eval_from_records(
+                input_dim, num_classes, class_names, partition_label, excel_filename, record_base,
+            )
+            return
 
         # Special handling for None strategy (independent learning)
         if self.config.strategy == "None":
@@ -1539,15 +1532,10 @@ class FederatedLearningPipeline:
         aggressive_memory_cleanup()
 
         stem = os.path.splitext(os.path.basename(self.log_filename))[0]
-        record_base = os.path.join("temp_weights", f"{stem}_weight_record")
+        record_base = os.path.join("weight_records", f"{stem}_weight_record")
         self._run_eval_from_records(
             input_dim, num_classes, class_names, partition_label, excel_filename, record_base,
         )
-
-        # Conservative cleanup: only delete current run's temp_weights if save_weights=False
-        if not getattr(self.config, 'save_weights', True) and os.path.isdir(record_base):
-            shutil.rmtree(record_base, ignore_errors=True)
-            print(f"{COLORS.OKCYAN}Cleaned up {record_base} (save_weights=False){COLORS.ENDC}")
 
     def _run_eval_from_records(self, input_dim, num_classes, class_names, partition_label, excel_filename, record_base):
         log_timestamp(self.logger, "=== EVALUATION ===")
@@ -1684,15 +1672,15 @@ class FederatedLearningPipeline:
                 _global_aurc = compute_aurc(y_true_cache, proba)
                 del proba
                 self.logger.info(
-                    "F1_CURVE | GLOBAL | Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
-                    _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"],
-                    _min_cov_pt["theta"], _min_cov_pt["Acc"], _min_cov_pt["F1"], _min_cov_pt["Precision"], _min_cov_pt["Recall"], _min_cov_pt["Coverage"],
+                    "F1_CURVE | GLOBAL | Best θ=%.2f Acc=%.4f F1=%.4f EffF1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f EffF1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
+                    _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Effective_F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"],
+                    _min_cov_pt["theta"], _min_cov_pt["Acc"], _min_cov_pt["F1"], _min_cov_pt["Effective_F1"], _min_cov_pt["Precision"], _min_cov_pt["Recall"], _min_cov_pt["Coverage"],
                     _global_aurc,
                 )
                 print(
-                    f"{COLORS.OKGREEN}F1_CURVE Global | Best θ={_best_pt['theta']:.2f}: Acc={_best_pt['Acc']:.4f} F1={_best_pt['F1']:.4f} "
+                    f"{COLORS.OKGREEN}F1_CURVE Global | Best θ={_best_pt['theta']:.2f}: Acc={_best_pt['Acc']:.4f} F1={_best_pt['F1']:.4f} EffF1={_best_pt['Effective_F1']:.4f} "
                     f"P={_best_pt['Precision']:.4f} R={_best_pt['Recall']:.4f} Cov={_best_pt['Coverage']:.4f} | "
-                    f"MinCov θ={_min_cov_pt['theta']:.2f}: Acc={_min_cov_pt['Acc']:.4f} F1={_min_cov_pt['F1']:.4f} "
+                    f"MinCov θ={_min_cov_pt['theta']:.2f}: Acc={_min_cov_pt['Acc']:.4f} F1={_min_cov_pt['F1']:.4f} EffF1={_min_cov_pt['Effective_F1']:.4f} "
                     f"P={_min_cov_pt['Precision']:.4f} R={_min_cov_pt['Recall']:.4f} Cov={_min_cov_pt['Coverage']:.4f} | AURC={_global_aurc:.4f}{COLORS.ENDC}"
                 )
 
@@ -1878,8 +1866,8 @@ def run_distillation_pipeline(config, strategy) -> None:
     poison_loader = None
     per_client_loaders = {}
     attack_type, poison_value, poison_ratio = parse_poison_config(config.poison)
-    if attack_type == "lma" and strategy.name not in {"Ours", "FedDistill", "SSFL-IDS", "FedKD-IDS"}:
-        raise ValueError("LMA is only supported for Ours, FedDistill, SSFL-IDS, and FedKD-IDS")
+    if attack_type in ("lma", "ilma") and strategy.name not in {"Ours", "FedDistill", "SSFL-IDS", "FedKD-IDS"}:
+        raise ValueError("LMA/iLMA is only supported for Ours, FedDistill, SSFL-IDS, and FedKD-IDS")
     if attack_type:
         poisoned_clients = get_or_create_poisoned_clients(
             partition_label, attack_type, poison_value, poison_ratio, n_clients
@@ -1922,7 +1910,7 @@ def run_distillation_pipeline(config, strategy) -> None:
         poison_loader=poison_loader,
         per_client_loaders=per_client_loaders,
         model_pool=model_pool,
-        poisoned_fl_state=PoisonedFLState(c0=poison_value) if attack_type == "poisonedfl" else None,
+        poisoned_fl_state=PoisonedFLState(c0=poison_value) if attack_type in ("poisonedfl", "ipoisonedfl") else None,
     )
     
     log_timestamp(logger, "SIMULATION STARTED")
@@ -1942,14 +1930,10 @@ def run_distillation_pipeline(config, strategy) -> None:
     ckpt_dir = os.path.join("checkpoint", ckpt_stem)
     ckpt_info_path = os.path.join(ckpt_dir, "info.txt")
     if getattr(config, 'fresh_run', False):
-        _wr_stem = os.path.splitext(os.path.basename(log_filename))[0]
-        _wr_base = os.path.join("temp_weights", f"{_wr_stem}_weight_record")
-        if os.path.isdir(_wr_base):
-            shutil.rmtree(_wr_base)
         if os.path.isdir(ckpt_dir):
             shutil.rmtree(ckpt_dir)
         _clear_eval_artifacts(excel_filename)
-        print(f"{COLORS.OKCYAN}fresh_run: cleared weight records, checkpoint, and eval artifacts{COLORS.ENDC}")
+        print(f"{COLORS.OKCYAN}fresh_run: cleared checkpoint and eval artifacts{COLORS.ENDC}")
     if config.checkpoint:
         if os.path.exists(ckpt_info_path):
             ckpt_info = {}
@@ -1983,7 +1967,7 @@ def run_distillation_pipeline(config, strategy) -> None:
                 results_path = os.path.join(ckpt_dir, "results.pkl")
                 if os.path.exists(results_path):
                     context.results = pd.read_pickle(results_path)
-                if attack_type == "poisonedfl" and start_round > 1 and not _loaded_pfl_state:
+                if attack_type in ("poisonedfl", "ipoisonedfl") and start_round > 1 and not _loaded_pfl_state:
                     print(f"{COLORS.WARNING}Checkpoint missing PoisonedFL adaptive state; resume will restart attack adaptation{COLORS.ENDC}")
                 if _round_done:
                     print(f"{COLORS.OKGREEN}Resuming from checkpoint (completed round {_ckpt_round}) -> starting round {start_round}{COLORS.ENDC}")
@@ -1998,7 +1982,7 @@ def run_distillation_pipeline(config, strategy) -> None:
     # For completed rounds: use previous round's records
     if model_pool is not None:
         _wr_stem = os.path.splitext(os.path.basename(log_filename))[0]
-        _wr_base = os.path.join("temp_weights", f"{_wr_stem}_weight_record")
+        _wr_base = os.path.join("weight_records", f"{_wr_stem}_weight_record")
         _seed_dir = os.path.join(_wr_base, f"round_{start_round}")
         if not os.path.isdir(_seed_dir) and start_round > 1:
             _seed_dir = os.path.join(_wr_base, f"round_{start_round - 1}")
@@ -2016,9 +2000,10 @@ def run_distillation_pipeline(config, strategy) -> None:
 
     # Check if final weight records already exist — skip training entirely
     stem = os.path.splitext(os.path.basename(log_filename))[0]
-    record_base = os.path.join("temp_weights", f"{stem}_weight_record")
+    record_base = os.path.join("weight_records", f"{stem}_weight_record")
     final_round_dir = os.path.join(record_base, f"round_{config.rounds}")
     _global_model_strategy = getattr(strategy, "has_global_model", False)
+    round_weights_history: dict = {}
     _allow_final_record_shortcut, _shortcut_info = _allow_eval_shortcut_from_records(ckpt_info_path, config)
 
     if _global_model_strategy:
@@ -2031,11 +2016,18 @@ def run_distillation_pipeline(config, strategy) -> None:
     if _final_exists and _allow_final_record_shortcut:
         log_timestamp(logger, f"Weight records found (round {config.rounds}), skipping training")
         print(f"{COLORS.OKGREEN}Weight records found up to round {config.rounds} — skipping to evaluation{COLORS.ENDC}")
-        _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, _global_model_strategy)
+        _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, _global_model_strategy, round_weights_history)
         return
     if _final_exists and not _allow_final_record_shortcut:
         _stage = _shortcut_info.get("stage", "?")
         print(f"{COLORS.WARNING}Final-round weight records exist, but checkpoint is not fully complete (stage={_stage}) — resuming training{COLORS.ENDC}")
+
+    if getattr(config, 'eval_only', False):
+        if not os.path.isdir(record_base):
+            print(f"{COLORS.FAIL}No weight records found at {record_base} — exiting{COLORS.ENDC}")
+            return
+        _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, _global_model_strategy, round_weights_history)
+        return
 
     def _write_ckpt_info(rnd, complete):
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -2107,12 +2099,12 @@ def run_distillation_pipeline(config, strategy) -> None:
                 gw = global_model.get_weights()
                 round_weights_history[round_number] = gw
                 if getattr(config, 'save_weights', True):
-                    _record_round_weights(log_filename, round_number, global_weights=gw, keep_last_rounds=config.keep_last_rounds)
+                    _record_round_weights(log_filename, round_number, global_weights=gw, keep_last_rounds=config.keep_last_rounds if config.skip_eval else 0)
         else:
             context.record_client_weights(round_number)
-            if config.keep_last_rounds > 0:
+            if config.skip_eval and config.keep_last_rounds > 0:
                 stem = os.path.splitext(os.path.basename(log_filename))[0]
-                _cleanup_old_weight_rounds(os.path.join("temp_weights", f"{stem}_weight_record"), config.keep_last_rounds)
+                _cleanup_old_weight_rounds(os.path.join("weight_records", f"{stem}_weight_record"), config.keep_last_rounds)
 
         round_time = time.time() - round_start_time
         round_times.append(round_time)
@@ -2141,16 +2133,11 @@ def run_distillation_pipeline(config, strategy) -> None:
     aggressive_memory_cleanup()
 
     stem = os.path.splitext(os.path.basename(log_filename))[0]
-    record_base = os.path.join("temp_weights", f"{stem}_weight_record")
-    _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, _global_model_strategy)
-
-    # Conservative cleanup: only delete current run's temp_weights if save_weights=False
-    if not getattr(config, 'save_weights', True) and os.path.isdir(record_base):
-        shutil.rmtree(record_base, ignore_errors=True)
-        print(f"{COLORS.OKCYAN}Cleaned up {record_base} (save_weights=False){COLORS.ENDC}")
+    record_base = os.path.join("weight_records", f"{stem}_weight_record")
+    _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, _global_model_strategy, round_weights_history)
 
 
-def _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, global_model_eval=False):
+def _run_distillation_eval(config, context, logger, log_filename, excel_filename, input_dim, num_classes, n_clients, model_type, record_base, global_model_eval=False, round_weights_history=None):
     from .context import evaluate_model, get_model_proba
     from .evaluation import compute_aurc, plot_f1_threshold_curve
     from .strategy.common import create_model as create_strategy_model
@@ -2199,10 +2186,11 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     _eval_model_arch = model_type
     eval_model = create_strategy_model(input_dim, num_classes, config.batch_size, model_type=model_type)
     attack_type, _, _ = parse_poison_config(getattr(config, 'poison', None))
-    _poisonedfl_eval = attack_type == "poisonedfl" and bool(context.poisoned_clients)
-    _lma_eval = attack_type == "lma" and bool(context.poisoned_clients)
+    _poisonedfl_eval = attack_type in ("poisonedfl", "ipoisonedfl") and bool(context.poisoned_clients)
+    _lma_eval = attack_type in ("lma", "ilma") and bool(context.poisoned_clients)
     _skip_synthetic_byzantine_eval = _poisonedfl_eval or _lma_eval
     _f1_log_stem = os.path.splitext(os.path.basename(log_filename))[0]
+    round_weights_history = round_weights_history or {}
 
     for round_number in range(config.rounds, 0, -1):
         if round_number in evaluated_rounds:
@@ -2298,8 +2286,8 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                             _c_plot = os.path.join("results", "plots", _f1_log_stem, f"client_{cid}.png")
                             _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}", logger=logger)
                             _aurc_val = compute_aurc(test_labels, _proba)
-                            logger.info("Round %s | Client %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
-                                round_number, cid, _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"], _aurc_val)
+                            logger.info("Round %s | Client %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f EffF1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
+                                round_number, cid, _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Effective_F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"], _aurc_val)
                             _f1_curve_results.append((_best_pt, _min_cov_pt))
                             _aurc_results.append(_aurc_val)
                             del _proba
@@ -2317,16 +2305,16 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         print(f"{COLORS.OKGREEN}Round {round_number} {_avg_label.replace('_', ' ')} | Acc={avg['Acc']:.4f}, F1={avg['F1']:.4f}, "
                               f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, TPR={avg['TPR']:.4f}, FPR={avg['FPR']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}")
                         if _f1_curve_results:
-                            _mk = ["Acc", "F1", "Precision", "Recall", "Coverage"]
+                            _mk = ["Acc", "F1", "Effective_F1", "Precision", "Recall", "Coverage"]
                             _avg_best = {k: float(np.mean([r[0][k] for r in _f1_curve_results])) for k in _mk}
                             _avg_best_theta = float(np.mean([r[0]["theta"] for r in _f1_curve_results]))
                             _avg_mc = {k: float(np.mean([r[1][k] for r in _f1_curve_results])) for k in _mk}
                             _avg_mc_theta = float(np.mean([r[1]["theta"] for r in _f1_curve_results]))
-                            logger.info("Round %s | %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f",
+                            logger.info("Round %s | %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f EffF1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f EffF1=%.4f P=%.4f R=%.4f Cov=%.4f",
                                 round_number, _avg_label,
-                                _avg_best_theta, _avg_best["Acc"], _avg_best["F1"], _avg_best["Precision"], _avg_best["Recall"], _avg_best["Coverage"],
-                                _avg_mc_theta, _avg_mc["Acc"], _avg_mc["F1"], _avg_mc["Precision"], _avg_mc["Recall"], _avg_mc["Coverage"])
-                            print(f"{COLORS.OKGREEN}  Best θ={_avg_best_theta:.2f}: Acc={_avg_best['Acc']:.4f} F1={_avg_best['F1']:.4f} P={_avg_best['Precision']:.4f} R={_avg_best['Recall']:.4f} Cov={_avg_best['Coverage']:.4f} | MinCov θ={_avg_mc_theta:.2f}: Acc={_avg_mc['Acc']:.4f} F1={_avg_mc['F1']:.4f} P={_avg_mc['Precision']:.4f} R={_avg_mc['Recall']:.4f} Cov={_avg_mc['Coverage']:.4f}{COLORS.ENDC}")
+                                _avg_best_theta, _avg_best["Acc"], _avg_best["F1"], _avg_best["Effective_F1"], _avg_best["Precision"], _avg_best["Recall"], _avg_best["Coverage"],
+                                _avg_mc_theta, _avg_mc["Acc"], _avg_mc["F1"], _avg_mc["Effective_F1"], _avg_mc["Precision"], _avg_mc["Recall"], _avg_mc["Coverage"])
+                            print(f"{COLORS.OKGREEN}  Best θ={_avg_best_theta:.2f}: Acc={_avg_best['Acc']:.4f} F1={_avg_best['F1']:.4f} EffF1={_avg_best['Effective_F1']:.4f} P={_avg_best['Precision']:.4f} R={_avg_best['Recall']:.4f} Cov={_avg_best['Coverage']:.4f} | MinCov θ={_avg_mc_theta:.2f}: Acc={_avg_mc['Acc']:.4f} F1={_avg_mc['F1']:.4f} EffF1={_avg_mc['Effective_F1']:.4f} P={_avg_mc['Precision']:.4f} R={_avg_mc['Recall']:.4f} Cov={_avg_mc['Coverage']:.4f}{COLORS.ENDC}")
                             _missing_counts = {}
                             for _best, _ in _f1_curve_results:
                                 for _cls in _best.get("Missing_Classes", []):
@@ -2440,8 +2428,8 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         _c_plot = os.path.join("results", "plots", _f1_log_stem, f"client_{cid}.png")
                         _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, _proba, _c_plot, label=f"Client {cid}", logger=logger)
                         _aurc_val = compute_aurc(test_labels, _proba)
-                        logger.info("Round %s | Client %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
-                            round_number, cid, _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"], _aurc_val)
+                        logger.info("Round %s | Client %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f EffF1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
+                            round_number, cid, _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Effective_F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"], _aurc_val)
                         _f1_curve_results.append((_best_pt, _min_cov_pt))
                         _aurc_results.append(_aurc_val)
                         del _proba
@@ -2463,16 +2451,16 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
                         f"Precision={avg['Precision']:.4f}, Recall={avg['Recall']:.4f}, TPR={avg['TPR']:.4f}, FPR={avg['FPR']:.4f}, ECE={avg['ECE']:.4f}, Loss={avg['Loss']:.4f}{COLORS.ENDC}"
                     )
                     if _f1_curve_results:
-                        _mk = ["Acc", "F1", "Precision", "Recall", "Coverage"]
+                        _mk = ["Acc", "F1", "Effective_F1", "Precision", "Recall", "Coverage"]
                         _avg_best = {k: float(np.mean([r[0][k] for r in _f1_curve_results])) for k in _mk}
                         _avg_best_theta = float(np.mean([r[0]["theta"] for r in _f1_curve_results]))
                         _avg_mc = {k: float(np.mean([r[1][k] for r in _f1_curve_results])) for k in _mk}
                         _avg_mc_theta = float(np.mean([r[1]["theta"] for r in _f1_curve_results]))
-                        logger.info("Round %s | %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f",
+                        logger.info("Round %s | %s | F1_CURVE Best θ=%.2f Acc=%.4f F1=%.4f EffF1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f EffF1=%.4f P=%.4f R=%.4f Cov=%.4f",
                             round_number, _avg_label,
-                            _avg_best_theta, _avg_best["Acc"], _avg_best["F1"], _avg_best["Precision"], _avg_best["Recall"], _avg_best["Coverage"],
-                            _avg_mc_theta, _avg_mc["Acc"], _avg_mc["F1"], _avg_mc["Precision"], _avg_mc["Recall"], _avg_mc["Coverage"])
-                        print(f"{COLORS.OKGREEN}  Best θ={_avg_best_theta:.2f}: Acc={_avg_best['Acc']:.4f} F1={_avg_best['F1']:.4f} P={_avg_best['Precision']:.4f} R={_avg_best['Recall']:.4f} Cov={_avg_best['Coverage']:.4f} | MinCov θ={_avg_mc_theta:.2f}: Acc={_avg_mc['Acc']:.4f} F1={_avg_mc['F1']:.4f} P={_avg_mc['Precision']:.4f} R={_avg_mc['Recall']:.4f} Cov={_avg_mc['Coverage']:.4f}{COLORS.ENDC}")
+                            _avg_best_theta, _avg_best["Acc"], _avg_best["F1"], _avg_best["Effective_F1"], _avg_best["Precision"], _avg_best["Recall"], _avg_best["Coverage"],
+                            _avg_mc_theta, _avg_mc["Acc"], _avg_mc["F1"], _avg_mc["Effective_F1"], _avg_mc["Precision"], _avg_mc["Recall"], _avg_mc["Coverage"])
+                        print(f"{COLORS.OKGREEN}  Best θ={_avg_best_theta:.2f}: Acc={_avg_best['Acc']:.4f} F1={_avg_best['F1']:.4f} EffF1={_avg_best['Effective_F1']:.4f} P={_avg_best['Precision']:.4f} R={_avg_best['Recall']:.4f} Cov={_avg_best['Coverage']:.4f} | MinCov θ={_avg_mc_theta:.2f}: Acc={_avg_mc['Acc']:.4f} F1={_avg_mc['F1']:.4f} EffF1={_avg_mc['Effective_F1']:.4f} P={_avg_mc['Precision']:.4f} R={_avg_mc['Recall']:.4f} Cov={_avg_mc['Coverage']:.4f}{COLORS.ENDC}")
                         _missing_counts = {}
                         for _best, _ in _f1_curve_results:
                             for _cls in _best.get("Missing_Classes", []):
@@ -2536,11 +2524,11 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
             proba = get_model_proba(eval_model, X_test, config.batch_size)
             _best_pt, _min_cov_pt = plot_f1_threshold_curve(test_labels, proba, plot_path, label=label, logger=logger)
             _global_aurc = compute_aurc(test_labels, proba)
-            logger.info("F1_CURVE | GLOBAL | Best θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
-                _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"],
-                _min_cov_pt["theta"], _min_cov_pt["Acc"], _min_cov_pt["F1"], _min_cov_pt["Precision"], _min_cov_pt["Recall"], _min_cov_pt["Coverage"],
+            logger.info("F1_CURVE | GLOBAL | Best θ=%.2f Acc=%.4f F1=%.4f EffF1=%.4f P=%.4f R=%.4f Cov=%.4f | MinCov θ=%.2f Acc=%.4f F1=%.4f EffF1=%.4f P=%.4f R=%.4f Cov=%.4f | AURC=%.4f",
+                _best_pt["theta"], _best_pt["Acc"], _best_pt["F1"], _best_pt["Effective_F1"], _best_pt["Precision"], _best_pt["Recall"], _best_pt["Coverage"],
+                _min_cov_pt["theta"], _min_cov_pt["Acc"], _min_cov_pt["F1"], _min_cov_pt["Effective_F1"], _min_cov_pt["Precision"], _min_cov_pt["Recall"], _min_cov_pt["Coverage"],
                 _global_aurc)
-            print(f"{COLORS.OKGREEN}F1_CURVE Global | Best θ={_best_pt['theta']:.2f}: Acc={_best_pt['Acc']:.4f} F1={_best_pt['F1']:.4f} P={_best_pt['Precision']:.4f} R={_best_pt['Recall']:.4f} Cov={_best_pt['Coverage']:.4f} | MinCov θ={_min_cov_pt['theta']:.2f}: Acc={_min_cov_pt['Acc']:.4f} F1={_min_cov_pt['F1']:.4f} P={_min_cov_pt['Precision']:.4f} R={_min_cov_pt['Recall']:.4f} Cov={_min_cov_pt['Coverage']:.4f} | AURC={_global_aurc:.4f}{COLORS.ENDC}")
+            print(f"{COLORS.OKGREEN}F1_CURVE Global | Best θ={_best_pt['theta']:.2f}: Acc={_best_pt['Acc']:.4f} F1={_best_pt['F1']:.4f} EffF1={_best_pt['Effective_F1']:.4f} P={_best_pt['Precision']:.4f} R={_best_pt['Recall']:.4f} Cov={_best_pt['Coverage']:.4f} | MinCov θ={_min_cov_pt['theta']:.2f}: Acc={_min_cov_pt['Acc']:.4f} F1={_min_cov_pt['F1']:.4f} EffF1={_min_cov_pt['Effective_F1']:.4f} P={_min_cov_pt['Precision']:.4f} R={_min_cov_pt['Recall']:.4f} Cov={_min_cov_pt['Coverage']:.4f} | AURC={_global_aurc:.4f}{COLORS.ENDC}")
             del proba
 
     del eval_model, X_test, y_test, test_labels
@@ -2552,10 +2540,6 @@ def _run_distillation_eval(config, context, logger, log_filename, excel_filename
     log_timestamp(logger, "=== SIMULATION COMPLETED ===")
     print(f"{COLORS.OKCYAN}Results saved to {excel_filename}{COLORS.ENDC}")
     print(f"{COLORS.OKGREEN}Simulation completed!{COLORS.ENDC}")
-
-    _keep = getattr(config, 'keep_last_rounds', 0)
-    if _keep > 0:
-        _cleanup_old_weight_rounds(record_base, _keep)
 
 
 # def _extract_labels(dataset: tf.data.Dataset, num_classes: int) -> np.ndarray:

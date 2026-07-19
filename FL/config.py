@@ -53,6 +53,7 @@ class FDConfig:
     keep_last_rounds: int = 2
     no_disk_cache: bool = True
     save_weights: bool = True
+    eval_only: bool = False
 
     def to_algorithm_params(self) -> dict:
         return {

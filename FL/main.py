@@ -100,13 +100,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="TOKEN",
         default=None,
-        help="Poison config tokens: <attack> [value] <ratio>, e.g., gradient_scale 10 0.5 or label_flip 0.2 or lma 0.2",
+        help="Poison config tokens: <attack> [value] <ratio>, e.g., gradient_scale 10 0.5 or label_flip 0.2 or lma 0.2 or ilma 0.2",
     )
     # label_flip, ratio = fraction of clients to poison, e.g. "label_flip 0.2"
     # gradient_scale, value = multiplicative factor for weight updates (e.g. 10x), ratio = fraction of clients to poison, e.g. "gradient_scale 10 0.2"
     # targeted_flip, value = target label index (0 to num_classes-1), ratio = fraction of clients to poison, e.g. "targeted_flip 0 0.2"
     # poisonedfl, value (default 8) = c0 value, ratio = fraction of clients to poison, e.g. "poisonedfl 8 0.2"
-    # lma, ratio = fraction of clients to poison, e.g. "lma 0.2"
+    # lma/ilma, ratio = fraction of clients to poison, e.g. "lma 0.2" or "ilma 0.2"
 
     # decentralized
     parser.add_argument("--decentralized", type=str, default=None, help="Decentralized topology simulation (e.g. braintorrent)")
@@ -125,6 +125,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disk_cache", action="store_true", help="Write logit cache to disk instead of RAM")
     parser.add_argument("--save_weights", action="store_true", default=True, help="Save per-round model weights to disk (default: True)")
     parser.add_argument("--no_save_weights", action="store_false", dest="save_weights", help="Store round weights in memory only — disables crash recovery")
+    parser.add_argument("--eval_only", action="store_true", help="Skip training, evaluate existing weight records and exit")
 
     return parser
 
@@ -212,6 +213,7 @@ def main(argv=None):
             keep_last_rounds=args.keep_last_rounds,
             no_disk_cache=not args.disk_cache,
             save_weights=args.save_weights,
+            eval_only=args.eval_only,
         )
         
         strategy = strategy_registry[args.strategy](config)
@@ -253,6 +255,7 @@ def main(argv=None):
             keep_last_rounds=args.keep_last_rounds,
             no_disk_cache=not args.disk_cache,
             save_weights=args.save_weights,
+            eval_only=args.eval_only,
         )
         run_pipeline(config)
 

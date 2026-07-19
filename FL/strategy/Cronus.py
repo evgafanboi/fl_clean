@@ -14,13 +14,13 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights, ipoisonedfl_client_weights
 from .base import DistillationStrategy
 from .common import create_model, load_public_dataset_from_clients, numpy_from_dataset, poisonedfl_ghost_model_type
 from .robust_filter import CronusRobustFilter
 from tqdm import tqdm
 
-CACHE_DIR = os.path.join("temp_weights", "cronus_cache")
+CACHE_DIR = os.path.join("weight_records", "cronus_cache")
 
 
 # ── file-path helpers ──────────────────────────────────────────────────
@@ -397,7 +397,7 @@ class Cronus(DistillationStrategy):
             poisoned = cid in context.poisoned_clients
             p_loader = context.per_client_loaders.get(cid, context.poison_loader) if poisoned else None
 
-            if poisoned and attack_type == "poisonedfl":
+            if poisoned and attack_type in ("poisonedfl", "ipoisonedfl"):
                 context.logger.info("Round %s | Client %s [PoisonedFL] all stages skipped", round_number, cid)
                 if _mixed:
                     del model
@@ -454,7 +454,7 @@ class Cronus(DistillationStrategy):
                                 pred_pack_path, pred_cids, pub_X_file)
 
         # ---- PoisonedFL: ghost model ----
-        if attack_type == "poisonedfl" and context.poisoned_clients and context.poisoned_fl_state is not None:
+        if attack_type in ("poisonedfl", "ipoisonedfl") and context.poisoned_clients and context.poisoned_fl_state is not None:
             _pfl = context.poisoned_fl_state
             ghost_arch = poisonedfl_ghost_model_type(cfg)
             ghost_w = poisonedfl_warmstart_weights(context.shared_state, _pfl, fallback=context.shared_state.get("init_w"))
@@ -496,8 +496,10 @@ class Cronus(DistillationStrategy):
             for st in context.client_states:
                 if st.client_id not in context.poisoned_clients:
                     continue
+                client_poisoned_w = ipoisonedfl_client_weights(poisoned_w, st.client_id) if attack_type == "ipoisonedfl" else poisoned_w
                 if not _mixed:
-                    st.data["w"] = poisoned_w
+                    st.data["w"] = client_poisoned_w
+                poison_model.set_weights(client_poisoned_w)
                 _counts = _predict_to_file(
                     poison_model, open_X, context.num_classes, cfg.batch_size,
                     pred_pack_path, client_id=st.client_id, n_samples=n_pub)

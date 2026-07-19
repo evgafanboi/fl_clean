@@ -86,10 +86,12 @@ class FLAME:
 
         clipped = []
         n_clipped = 0
+        clipped_ids = []
         for i in admitted:
             gamma = S_t / (delta_norms[i] + 1e-12)
             if delta_norms[i] > S_t:
                 n_clipped += 1
+                clipped_ids.append(i)
             clipped.append(ref_flat + deltas[i] * min(1.0, gamma))
 
         agg_flat = np.mean(clipped, axis=0)
@@ -98,7 +100,7 @@ class FLAME:
         noise_norm = float(np.linalg.norm(noise))
         agg_flat += noise
 
-        summary = f"[FLAME] S_t={S_t:.4f} | n_clipped={n_clipped}/{len(admitted)} | sigma={sigma:.6f} | noise_l2={noise_norm:.4f}"
+        summary = f"[FLAME] S_t={S_t:.4f} | n_clipped={n_clipped}/{len(admitted)} | clipped_ids={sorted(clipped_ids)} | sigma={sigma:.6f} | noise_l2={noise_norm:.4f}"
         print(f"  {summary}")
         log.info(summary)
 

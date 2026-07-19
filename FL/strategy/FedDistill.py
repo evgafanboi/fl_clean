@@ -14,12 +14,12 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_broadcast_weights, poisonedfl_log_values
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_broadcast_weights, poisonedfl_log_values, ipoisonedfl_client_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
-from .common import create_model, load_public_dataset_from_clients, lma_logits as _lma_logits, numpy_from_dataset
+from .common import create_model, load_public_dataset_from_clients, lma_logits as _lma_logits, ilma_logits as _ilma_logits, numpy_from_dataset
 
-FEDEXPGUARD_CACHE_DIR = os.path.join("temp_weights", "fedexpguard_cache")
+FEDEXPGUARD_CACHE_DIR = os.path.join("weight_records", "fedexpguard_cache")
 
 
 def _base_public_path():
@@ -104,17 +104,20 @@ _EXPGUARD_ROW_BLOCK = 2_048
 
 
 def _expguard_pass1_block(chunks, quantile, k_keep):
+    K = chunks.shape[0]
     scores1 = _filter_outlier_scores(chunks)
     abs_s1 = np.abs(scores1.squeeze(2))
     rank = np.argsort(abs_s1, axis=1)
     keep_idx = rank[:, :k_keep]
+    trim_counts = np.bincount(rank[:, k_keep:].ravel(), minlength=K)
     nkc = chunks.transpose(1, 0, 2)
     reduced = nkc[np.arange(chunks.shape[1])[:, None], keep_idx, :].transpose(1, 0, 2)
     scores2 = _filter_outlier_scores(reduced)
     abs_s2 = np.abs(scores2.squeeze(2))
     threshold = np.quantile(abs_s2, quantile, axis=1)
     con = _filtered_mean(reduced, scores2, threshold)
-    return np.linalg.norm(chunks - con[None], axis=2).sum(axis=1).astype(np.float64)
+    rho_sum = np.linalg.norm(chunks - con[None], axis=2).sum(axis=1).astype(np.float64)
+    return rho_sum, trim_counts
 
 
 def _expguard_pass2_block(chunks, w_norm):
@@ -140,6 +143,7 @@ def _expguard_aggregate(
 
     # ── Pass 1: streaming Cronus filter → Cronus consensus + per-client rho ──
     rho_sum = np.zeros(K, dtype=np.float64)
+    trim_total = np.zeros(K, dtype=np.int64)
     fp = open(soft_pack_path, "rb")
     for off in range(0, N_pub, _EXPGUARD_CHUNK):
         rows = min(_EXPGUARD_CHUNK, N_pub - off)
@@ -156,9 +160,13 @@ def _expguard_aggregate(
                     for start, end in blocks
                 ]
                 for future in futures:
-                    rho_sum += future.result()
+                    _r, _t = future.result()
+                    rho_sum += _r
+                    trim_total += _t
         else:
-            rho_sum += _expguard_pass1_block(chunks, quantile, k_keep)
+            _r, _t = _expguard_pass1_block(chunks, quantile, k_keep)
+            rho_sum += _r
+            trim_total += _t
         del chunks
     fp.close()
 
@@ -200,7 +208,7 @@ def _expguard_aggregate(
         del chunks
     fp.close()
 
-    return consensus, new_w
+    return consensus, new_w, trim_total, mean_rho
 
 
 def _train_on_soft_labels_pt(model_wrapper, X, soft_y, batch_size, epochs):
@@ -338,8 +346,8 @@ class FedDistillExpGuard(DistillationStrategy):
                                         config.batch_size, model_type=config.model_type)
             client_model.set_weights(global_w)
 
-            if _poisoned and attack_type in ("poisonedfl", "lma"):
-                _tag = "PoisonedFL" if attack_type == "poisonedfl" else "LMA"
+            if _poisoned and attack_type in ("poisonedfl", "ipoisonedfl", "lma", "ilma"):
+                _tag = "PoisonedFL" if attack_type in ("poisonedfl", "ipoisonedfl") else "LMA"
                 context.logger.info("Round %s | Client %s [%s] CE skipped", round_number, cid, _tag)
                 del client_model
                 continue
@@ -379,39 +387,39 @@ class FedDistillExpGuard(DistillationStrategy):
                 })
 
         # ---- LMA: ghost soft labels (compute once, copy to all byzantine clients) ----
-        if attack_type == "lma" and context.poisoned_clients:
+        if attack_type in ("lma", "ilma") and context.poisoned_clients:
             stale = context.shared_state.get("lma_stale_consensus")
             if stale is not None:
-                _lma_adv = _lma_logits(stale)
-                _lma_bytes = _lma_adv.astype(np.float32).tobytes()
                 for st in context.client_states:
                     if st.client_id not in context.poisoned_clients:
                         continue
+                    _lma_adv = _ilma_logits(stale, st.client_id) if attack_type == "ilma" else _lma_logits(stale)
+                    _lma_bytes = _lma_adv.astype(np.float32).tobytes()
                     with open(soft_pack_path, "r+b") as _cf:
                         _cf.seek(st.client_id * _soft_stride(n_public, context.num_classes))
                         _cf.write(_lma_bytes)
                     if st.client_id not in soft_client_ids:
                         soft_client_ids.append(st.client_id)
+                    del _lma_adv, _lma_bytes
                 context.logger.info(
-                    "Round %s | LMA | Byzantine soft labels generated for %d clients",
-                    round_number, len(context.poisoned_clients),
+                    "Round %s | %s | Byzantine soft labels generated for %d clients",
+                    round_number, "iLMA" if attack_type == "ilma" else "LMA", len(context.poisoned_clients),
                 )
-                del _lma_adv, _lma_bytes
 
         # ---- PoisonedFL: poison the current global model once, then copy logits ----
         _pfl = getattr(context, "poisoned_fl_state", None)
         if _pfl is not None and context.poisoned_clients:
             poisoned_w = poisonedfl_broadcast_weights(global_w, _pfl)
-            poison_model = create_model(context.input_dim, context.num_classes,
-                                        config.batch_size, model_type=config.model_type)
-            poison_model.set_weights(poisoned_w)
             for st in context.client_states:
                 if st.client_id not in context.poisoned_clients:
                     continue
+                poison_model = create_model(context.input_dim, context.num_classes,
+                                            config.batch_size, model_type=config.model_type)
+                poison_model.set_weights(ipoisonedfl_client_weights(poisoned_w, st.client_id) if attack_type == "ipoisonedfl" else poisoned_w)
                 _predict_soft_labels(poison_model, pub_X, config.batch_size, soft_pack_path, client_id=st.client_id, n_public=n_public)
                 if st.client_id not in soft_client_ids:
                     soft_client_ids.append(st.client_id)
-            del poison_model
+                del poison_model
             _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl)
             context.logger.info(
                 "Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Broadcast global model generated soft labels for %d clients",
@@ -424,7 +432,7 @@ class FedDistillExpGuard(DistillationStrategy):
 
         # ---- ExpGuard aggregation ----
         print(f"\n{COLORS.HEADER}Round {round_number} ExpGuard (rho={rho}){COLORS.ENDC}")
-        consensus, new_exp_w = _expguard_aggregate(
+        consensus, new_exp_w, trim_counts, mean_rho = _expguard_aggregate(
             soft_pack_path, soft_client_ids, exp_w, rho, n_public, context.num_classes,
             workers=getattr(config, "robust_workers", 8),
             logger=context.logger, round_number=round_number,
@@ -434,13 +442,20 @@ class FedDistillExpGuard(DistillationStrategy):
 
         if context.poisoned_clients:
             poisoned_set = set(context.poisoned_clients)
-            rejected = [cid for cid in soft_client_ids if new_exp_w[cid] < 1e-10]
-            TP = len(set(rejected) & poisoned_set)
-            FP = len(set(rejected) - poisoned_set)
+            K = len(soft_client_ids)
+            trim_frac = trim_counts.astype(np.float64) / max(n_public, 1)
+            rank_order = np.argsort(-trim_frac)
             context.logger.info(
-                "Round %s | ExpGuard | effective_zero_weight: TP=%d FP=%d (threshold=1e-10)",
-                round_number, TP, FP,
+                "Round %s | ExpGuard | trim_report (descending trim_frac, N_pub=%d)",
+                round_number, n_public,
             )
+            for rank_pos, idx in enumerate(rank_order):
+                cid = soft_client_ids[idx]
+                context.logger.info(
+                    "Round %s | ExpGuard | rank=%d | client=%d | trim_frac=%.4f | outlier=%.4f | byz=%s",
+                    round_number, rank_pos + 1, cid, trim_frac[idx], mean_rho[idx],
+                    "Y" if cid in poisoned_set else "N",
+                )
 
         # ---- train global model on consensus ----
         print(f"\n{COLORS.HEADER}Round {round_number} Global model training{COLORS.ENDC}")

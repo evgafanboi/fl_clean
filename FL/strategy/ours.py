@@ -15,7 +15,7 @@ from tqdm import tqdm
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights, ipoisonedfl_client_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .robust_filter import CronusRobustFilter, RobustFilterV3
@@ -24,6 +24,7 @@ from .common import (
     create_private_dataset,
     load_public_dataset_from_clients,
     lma_logits as _lma_logits,
+    ilma_logits as _ilma_logits,
     numpy_from_dataset,
     poisonedfl_ghost_model_type,
 )
@@ -37,8 +38,8 @@ EVA_PRIVATE_QUANTILE = 0.95 # energy-based vote abstention quantile
 EVW_TAU1 = 0.0
 EVW_TAU2 = 1.0
 
-LOGIT_CACHE_DTYPE = np.float16
-LOGIT_CACHE_ELEMENT_BYTES = np.dtype(LOGIT_CACHE_DTYPE).itemsize  # 2 bytes for float16
+LOGIT_CACHE_DTYPE = np.float32
+LOGIT_CACHE_ELEMENT_BYTES = np.dtype(LOGIT_CACHE_DTYPE).itemsize
 
 
 def _sanitize_logits(logits: np.ndarray, cap: float = LOGIT_ABS_CAP) -> np.ndarray:
@@ -89,6 +90,21 @@ def _support_weights_from_scores(scores: np.ndarray, mode: Optional[str]) -> np.
     if mode == "evw":
         return np.clip((EVW_TAU2 - scores) / max(EVW_TAU2 - EVW_TAU1, EVA_EPS), 0.0, 1.0).astype(np.float32)
     return np.ones_like(scores, dtype=np.float32)
+
+
+def _argmax_counts_from_array(logits: np.ndarray, n_classes: int) -> np.ndarray:
+    return np.bincount(np.argmax(logits.astype(np.float32, copy=False), axis=1), minlength=n_classes)
+
+
+def _argmax_counts_from_file(path: str, shape: tuple, n_classes: int) -> np.ndarray:
+    mmap = np.memmap(path, dtype=LOGIT_CACHE_DTYPE, mode='r', shape=shape)
+    counts = np.zeros(n_classes, dtype=np.int64)
+    for start in range(0, shape[0], EVA_PUBLIC_CHUNK):
+        logits = _sanitize_logits(mmap[start:start + EVA_PUBLIC_CHUNK].astype(np.float32, copy=False))
+        counts += np.bincount(np.argmax(logits, axis=1), minlength=n_classes)
+        del logits
+    del mmap
+    return counts
 
 
 def _load_private_energies(model_wrapper, private_X_path: str, batch_size: int) -> np.ndarray:
@@ -178,6 +194,7 @@ def compute_robust_consensus_from_arrays(
     removal_counts = {c: 0 for c in range(n_clients)}
     samplewise_cronus = isinstance(robust_filter, CronusRobustFilter)
     eig_chunks = [] if samplewise_cronus else None
+    eig_report = None
 
     if isinstance(robust_filter, RobustFilterV3):
         total_counts = np.zeros(n_clients, dtype=np.int64)
@@ -510,6 +527,7 @@ def compute_robust_consensus_from_files(
     removal_counts = {c: 0 for c in range(n_clients)}
     samplewise_cronus = isinstance(robust_filter, CronusRobustFilter)
     eig_chunks = [] if samplewise_cronus else None
+    eig_report = None
 
     mmaps = [np.memmap(f, dtype=LOGIT_CACHE_DTYPE, mode='r', shape=shape) for f in logit_files]
 
@@ -1150,19 +1168,12 @@ class Ours(DistillationStrategy):
 
         print(f"{COLORS.OKGREEN}Preparing Ours ({kd_method.upper()}){COLORS.ENDC}")
 
-        no_cache = getattr(config, 'no_disk_cache', True)
-        if no_cache:
-            self.cache_dir = None
-        else:
-            stem = os.path.splitext(os.path.basename(context.log_filename))[0]
-            self.cache_dir = os.path.join("temp_weights", f"cache_{stem}_ours")
-            if os.path.isdir(self.cache_dir):
-                try:
-                    shutil.rmtree(self.cache_dir, ignore_errors=True)
-                    print(f"{COLORS.WARNING}Cleaned up stale cache from previous run: {self.cache_dir}{COLORS.ENDC}")
-                except Exception as e:
-                    print(f"{COLORS.WARNING}Failed to clean stale cache {self.cache_dir}: {e}{COLORS.ENDC}")
-            os.makedirs(self.cache_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(context.log_filename))[0]
+        self.cache_dir = os.path.join("weight_records", f"cache_{stem}_ours")
+        if os.path.isdir(self.cache_dir):
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
+            print(f"{COLORS.WARNING}Cleaned up stale cache from previous run: {self.cache_dir}{COLORS.ENDC}")
+        os.makedirs(self.cache_dir, exist_ok=True)
 
         public_unlabeled_ds, total_public = load_public_dataset_from_clients(
             context.paths, batch_size=config.batch_size, num_classes=context.num_classes,
@@ -1180,33 +1191,74 @@ class Ours(DistillationStrategy):
             context.add_client_state(client_id, None, paths)
             aggressive_memory_cleanup()
 
+    def _ensure_cache_dir(self, context: PipelineContext) -> None:
+        created = False
+        if getattr(self, "cache_dir", None) is None:
+            stem = os.path.splitext(os.path.basename(context.log_filename))[0]
+            self.cache_dir = os.path.join("weight_records", f"cache_{stem}_ours")
+            created = True
+        if created and os.path.isdir(self.cache_dir):
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    def _stream_client_logits_to_files(self, model, state, public_features, batch_size, eva_mode, logit_path, support_path):
+        logits_model = model.get_logits_model() if hasattr(model, "get_logits_model") else model
+        q95 = None
+        mu = None
+        sigma = None
+        if eva_mode == "eva":
+            q95 = _compute_private_energy_quantile(model, state.paths["train_X"], batch_size)
+        elif eva_mode == "eva2":
+            q95 = _compute_private_energy_eva2(model, state.paths["train_X"], batch_size)
+        elif eva_mode == "evw":
+            mu, sigma = _compute_private_energy_stats(model, state.paths["train_X"], batch_size)
+
+        logits_mmap = None
+        support_mmap = None
+        shape = None
+        for start in range(0, len(public_features), EVA_PUBLIC_CHUNK):
+            chunk = public_features[start:start + EVA_PUBLIC_CHUNK]
+            logits = _sanitize_logits(logits_model.predict(chunk, batch_size=batch_size, verbose=0))
+            rows = len(logits)
+            if logits_mmap is None:
+                shape = (len(public_features), logits.shape[1])
+                logits_mmap = np.memmap(logit_path, dtype=LOGIT_CACHE_DTYPE, mode='w+', shape=shape)
+                if eva_mode is not None:
+                    support_mmap = np.memmap(support_path, dtype=np.float32, mode='w+', shape=(len(public_features),))
+            logits_mmap[start:start + rows] = logits.astype(LOGIT_CACHE_DTYPE)
+            if eva_mode is not None:
+                energies = _energy_from_logits(logits)
+                if eva_mode == "eva" or eva_mode == "eva2":
+                    support = (energies <= q95).astype(np.float32)
+                else:
+                    scores = (energies - mu) / sigma
+                    support = _support_weights_from_scores(scores, eva_mode)
+                    del scores
+                support_mmap[start:start + rows] = support
+                del energies, support
+            del chunk, logits
+        logits_mmap.flush()
+        del logits_mmap
+        if support_mmap is not None:
+            support_mmap.flush()
+            del support_mmap
+        return shape
+
     def _generate_logits(self, context, public_features, first_client=0):
         config = context.config
         pool = context.model_pool
         eva_mode = self.eva_mode
         attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), len(context.client_states))
-        no_cache = getattr(config, 'no_disk_cache', True)
+        budget = getattr(config, "robust_rm_budget", 0) or 0
+        self._ensure_cache_dir(context)
 
         _pfl_gen = getattr(context, 'poisoned_fl_state', None)
-        _ghost_arr = None
-        _ghost_shape = None
-        _ghost_warm = poisonedfl_warmstart_weights(context.shared_state, _pfl_gen, fallback=context.shared_state.get("init_w"), prefer_poisoned=True) if _pfl_gen is not None else None
-        if _pfl_gen is not None and context.poisoned_clients and _ghost_warm is not None:
-            print(f"{COLORS.WARNING}  [PoisonedFL] Ghost model generating logits for {len(context.poisoned_clients)} byzantine clients{COLORS.ENDC}")
-            _gm = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
-            _gm.set_weights(_ghost_warm)
-            _lm = _gm.get_logits_model() if hasattr(_gm, "get_logits_model") else _gm
-            _garr = _sanitize_logits(_lm.predict(public_features, batch_size=config.batch_size, verbose=0))
-            _ghost_arr = _garr.astype(LOGIT_CACHE_DTYPE)
-            _ghost_shape = _garr.shape
-            del _gm, _lm, _garr
-            aggressive_memory_cleanup()
 
         _lma_adv_arr = None
         _lma_adv_shape = None
         _lma_adv_log = None
-        if attack_type == "lma" and context.poisoned_clients:
+        if attack_type in ("lma", "ilma") and context.poisoned_clients:
             stale = context.shared_state.get("lma_stale_consensus")
             if stale is not None:
                 _adv = _lma_logits(stale, raw=True)
@@ -1217,57 +1269,52 @@ class Ours(DistillationStrategy):
                 _lma_adv_log = " | ".join(f"cls{c}:{100*_hcounts[c]/max(len(_adv),1):.1f}%" for c in _htop3 if _hcounts[c] > 0)
                 del _adv, _hcounts
 
-        logit_arrays = []
-        support_arrays = []
         logit_files = []
         support_files = []
         logit_shape = None
         for client_idx, state in enumerate(context.client_states):
             if client_idx < first_client:
                 continue
-            if attack_type == "lma" and state.client_id in context.poisoned_clients:
+            if attack_type in ("lma", "ilma") and state.client_id in context.poisoned_clients:
                 if _lma_adv_arr is not None:
-                    if no_cache:
-                        logit_arrays.append(_lma_adv_arr)
+                    if attack_type == "ilma":
+                        _client_adv = _ilma_logits(context.shared_state.get("lma_stale_consensus"), state.client_id, raw=True).astype(LOGIT_CACHE_DTYPE)
                     else:
-                        fpath = os.path.join(self.cache_dir, f"client_{client_idx}.bin")
-                        _lma_adv_arr.tofile(fpath)
-                        logit_files.append(fpath)
+                        _client_adv = _lma_adv_arr
+                    fpath = os.path.join(self.cache_dir, f"client_{client_idx}.bin")
+                    _client_adv.tofile(fpath)
+                    logit_files.append(fpath)
                     if eva_mode is not None:
-                        if no_cache:
-                            support_arrays.append(np.ones(_lma_adv_shape[0], dtype=np.float32))
-                        else:
-                            spath = os.path.join(self.cache_dir, f"client_{client_idx}_support.bin")
-                            np.ones(_lma_adv_shape[0], dtype=np.float32).tofile(spath)
-                            support_files.append(spath)
+                        spath = os.path.join(self.cache_dir, f"client_{client_idx}_support.bin")
+                        np.ones(_lma_adv_shape[0], dtype=np.float32).tofile(spath)
+                        support_files.append(spath)
                     if logit_shape is None:
                         logit_shape = _lma_adv_shape
-                    context.logger.info("Round %s | Client %s [LMA] | top3 adv-argmax: %s", self._cur_round, state.client_id, _lma_adv_log)
+                    context.logger.info("Round %s | Client %s [%s] | top3 adv-argmax: %s", self._cur_round, state.client_id, "iLMA" if attack_type == "ilma" else "LMA", _lma_adv_log)
+                    if attack_type == "ilma":
+                        del _client_adv
                     continue
                 continue
             if _pfl_gen is not None and state.client_id in context.poisoned_clients:
-                if _ghost_arr is not None:
-                    if no_cache:
-                        logit_arrays.append(_ghost_arr)
-                    else:
-                        fpath = os.path.join(self.cache_dir, f"client_{client_idx}.bin")
-                        _ghost_arr.tofile(fpath)
-                        logit_files.append(fpath)
-                    if eva_mode is not None:
-                        if no_cache:
-                            support_arrays.append(np.ones(_ghost_shape[0], dtype=np.float32))
-                        else:
-                            spath = os.path.join(self.cache_dir, f"client_{client_idx}_support.bin")
-                            np.ones(_ghost_shape[0], dtype=np.float32).tofile(spath)
-                            support_files.append(spath)
-                    if logit_shape is None:
-                        logit_shape = _ghost_shape
-                    _garr2 = _ghost_arr.astype(np.float32, copy=False)
-                    _gcounts = np.bincount(np.argmax(_garr2, axis=1), minlength=context.num_classes)
-                    _gtop3 = np.argsort(_gcounts)[::-1][:3]
-                    _gtop = " | ".join(f"cls{c}:{100*_gcounts[c]/max(_ghost_shape[0],1):.1f}%" for c in _gtop3 if _gcounts[c] > 0)
-                    context.logger.info("Round %s | Client %s [POISONED] | top3 logit-argmax: %s", self._cur_round, state.client_id, _gtop)
-                    del _garr2, _gcounts
+                model = pool.checkout(state.client_id)
+                if attack_type == "ipoisonedfl":
+                    _noisy_w = ipoisonedfl_client_weights(model.get_weights(), state.client_id)
+                    model.set_weights(_noisy_w)
+                fpath = os.path.join(self.cache_dir, f"client_{client_idx}.bin")
+                spath = os.path.join(self.cache_dir, f"client_{client_idx}_support.bin") if eva_mode is not None else None
+                shape = self._stream_client_logits_to_files(
+                    model, state, public_features, config.batch_size, eva_mode, fpath, spath,
+                )
+                pool.release(model)
+                logit_files.append(fpath)
+                if spath is not None:
+                    support_files.append(spath)
+                logit_shape = shape
+                _counts = _argmax_counts_from_file(fpath, shape, context.num_classes)
+                _top3 = np.argsort(_counts)[::-1][:3]
+                _top = " | ".join(f"cls{c}:{100*_counts[c]/max(shape[0],1):.1f}%" for c in _top3 if _counts[c] > 0)
+                context.logger.info("Round %s | Client %s [POISONED] | top3 logit-argmax: %s", self._cur_round, state.client_id, _top)
+                del _counts
                 continue
             model = pool.checkout(state.client_id)
             if state.client_id in context.poisoned_clients and attack_type == "gradient_scale":
@@ -1275,44 +1322,29 @@ class Ours(DistillationStrategy):
                 model.set_weights(poisoned_w)
                 print(f"{COLORS.WARNING}  [POISON] Client {state.client_id}: gradient_scale applied (\u00d7{poison_value}){COLORS.ENDC}")
                 context.logger.info("Round %s | Client %s [POISON] gradient_scale \u00d7%s applied", self._cur_round, state.client_id, poison_value)
-            _logits_arr, shape, support_arr = self._generate_client_logits(
-                model, state, public_features, config.batch_size, eva_mode,
+            fpath = os.path.join(self.cache_dir, f"client_{client_idx}.bin")
+            spath = os.path.join(self.cache_dir, f"client_{client_idx}_support.bin") if eva_mode is not None else None
+            shape = self._stream_client_logits_to_files(
+                model, state, public_features, config.batch_size, eva_mode, fpath, spath,
             )
             pool.release(model)
-            if no_cache:
-                logit_arrays.append(_logits_arr)
-                if support_arr is not None:
-                    support_arrays.append(support_arr)
-            else:
-                fpath = os.path.join(self.cache_dir, f"client_{client_idx}.bin")
-                _logits_arr.astype(LOGIT_CACHE_DTYPE).tofile(fpath)
-                logit_files.append(fpath)
-                if support_arr is not None:
-                    spath = os.path.join(self.cache_dir, f"client_{client_idx}_support.bin")
-                    support_arr.astype(np.float32).tofile(spath)
-                    support_files.append(spath)
-                del _logits_arr, support_arr
+            logit_files.append(fpath)
+            if spath is not None:
+                support_files.append(spath)
             logit_shape = shape
 
             _n_classes = context.num_classes
-            if no_cache:
-                _logits_f32 = _logits_arr.astype(np.float32, copy=False)
-            else:
-                _logits_f32 = _sanitize_logits(np.memmap(fpath, dtype=LOGIT_CACHE_DTYPE, mode='r', shape=shape).astype(np.float32, copy=False))
-            _argmax = np.argmax(_logits_f32, axis=1)
-            _counts = np.bincount(_argmax, minlength=_n_classes)
+            _counts = _argmax_counts_from_file(fpath, shape, _n_classes)
             _top3 = np.argsort(_counts)[::-1][:3]
-            _top = " | ".join(f"cls{c}:{100*_counts[c]/max(len(_argmax),1):.1f}%" for c in _top3 if _counts[c] > 0)
+            _top = " | ".join(f"cls{c}:{100*_counts[c]/max(shape[0],1):.1f}%" for c in _top3 if _counts[c] > 0)
             _poison_tag = " [POISONED]" if state.client_id in context.poisoned_clients else ""
             context.logger.info("Round %s | Client %s%s | top3 logit-argmax: %s", self._cur_round, state.client_id, _poison_tag, _top)
-            del _logits_f32, _argmax, _counts
+            del _counts
 
             print(f"  Client {state.client_id}: logits {shape}")
             if (client_idx + 1) % cleanup_interval == 0:
                 aggressive_memory_cleanup()
 
-        if no_cache:
-            return logit_arrays, support_arrays if eva_mode is not None else None, logit_shape
         return logit_files, support_files if eva_mode is not None else None, logit_shape
 
     def _generate_client_logits(self, model, state, public_features, batch_size, eva_mode):
@@ -1376,19 +1408,19 @@ class Ours(DistillationStrategy):
         config = context.config
         pool = context.model_pool
         n_clients = len(context.client_states)
-        _pfl_m = getattr(context, 'poisoned_fl_state', None)
         attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
-        _lma = attack_type == "lma"
+        _lma = attack_type in ("lma", "ilma")
         accumulator = None
         n_benign = 0
         cleanup_interval = min(getattr(config, 'cleanup_interval', 10), n_clients)
 
         for client_idx, state in enumerate(context.client_states):
-            if _pfl_m is not None and state.client_id in context.poisoned_clients:
-                continue
             if _lma and state.client_id in context.poisoned_clients:
                 continue
             model = pool.checkout(state.client_id)
+            if attack_type == "ipoisonedfl" and state.client_id in context.poisoned_clients:
+                _noisy_w = ipoisonedfl_client_weights(model.get_weights(), state.client_id)
+                model.set_weights(_noisy_w)
             logits_model = model.get_logits_model() if hasattr(model, "get_logits_model") else model
             logits = _sanitize_logits(logits_model.predict(public_features, batch_size=config.batch_size, verbose=0))
             if accumulator is None:
@@ -1398,23 +1430,11 @@ class Ours(DistillationStrategy):
             n_benign += 1
             pool.release(model)
             del logits
-            print(f"  Client {state.client_id}: logits accumulated ({n_benign})")
+            _tag = " [POISONED]" if state.client_id in context.poisoned_clients else ""
+            print(f"  Client {state.client_id}{_tag}: logits accumulated ({n_benign})")
             if (client_idx + 1) % cleanup_interval == 0:
                 aggressive_memory_cleanup()
 
-        _ghost_warm = poisonedfl_warmstart_weights(context.shared_state, _pfl_m, fallback=context.shared_state.get("init_w"), prefer_poisoned=True) if _pfl_m is not None else None
-        if _pfl_m is not None and context.poisoned_clients and _ghost_warm is not None:
-            _gm = create_model(context.input_dim, context.num_classes, config.batch_size, model_type=poisonedfl_ghost_model_type(config))
-            _gm.set_weights(_ghost_warm)
-            _lm = _gm.get_logits_model() if hasattr(_gm, "get_logits_model") else _gm
-            _gl = _sanitize_logits(_lm.predict(public_features, batch_size=config.batch_size, verbose=0)).astype(np.float64)
-            n_byz = len(context.poisoned_clients)
-            if accumulator is None:
-                accumulator = _gl * n_byz
-            else:
-                accumulator += _gl * n_byz
-            n_benign += n_byz
-            del _gm, _lm, _gl
         if _lma and context.poisoned_clients:
             stale = context.shared_state.get("lma_stale_consensus")
             if stale is not None:
@@ -1424,6 +1444,10 @@ class Ours(DistillationStrategy):
                     accumulator = adv.astype(np.float64) * n_byz
                 else:
                     accumulator += adv.astype(np.float64) * n_byz
+                if attack_type == "ilma":
+                    accumulator -= adv.astype(np.float64) * n_byz
+                    for cid in context.poisoned_clients:
+                        accumulator += _ilma_logits(stale, cid, raw=True).astype(np.float64)
                 n_benign += n_byz
                 del adv
         accumulator /= max(n_benign, 1)
@@ -1446,7 +1470,7 @@ class Ours(DistillationStrategy):
             if client_idx < first_client:
                 continue
             _poisoned = state.client_id in context.poisoned_clients
-            if _poisoned and (_pfl_kd is not None or attack_type == "lma"):
+            if _poisoned and (_pfl_kd is not None or attack_type in ("lma", "ilma")):
                 _tag = "PoisonedFL" if _pfl_kd is not None else "LMA"
                 context.logger.info("Round %s | Client %s [%s] KD skipped", self._cur_round, state.client_id, _tag)
                 continue
@@ -1489,7 +1513,7 @@ class Ours(DistillationStrategy):
                 continue
             print(f"\n{COLORS.BOLD}Client {state.client_id} — Stage 1 (CE){COLORS.ENDC}")
             _poisoned = state.client_id in context.poisoned_clients
-            if _poisoned and (_pfl_ce is not None or attack_type == "lma"):
+            if _poisoned and (_pfl_ce is not None or attack_type in ("lma", "ilma")):
                 _tag = "PoisonedFL" if _pfl_ce is not None else "LMA"
                 context.logger.info("Round %s | Client %s [%s] CE skipped", self._cur_round, state.client_id, _tag)
                 continue
@@ -1546,6 +1570,7 @@ class Ours(DistillationStrategy):
         context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost KD'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
         if not getattr(config, "mixed_models", False):
             _pool_g = context.model_pool
+            attack_type, _, _ = parse_poison_config(getattr(config, "poison", None))
             for st in context.client_states:
                 if st.client_id in context.poisoned_clients:
                     m = _pool_g.checkout(st.client_id)
@@ -1559,9 +1584,9 @@ class Ours(DistillationStrategy):
         config = context.config
         public_features = context.shared_state["public_features"]
         eva_mode = self.eva_mode
-        no_filter = not isinstance(self.robust_filter, RobustFilterV3) and getattr(config, "robust_rm_budget", 0) == 0 and eva_mode is None
+        budget = getattr(config, "robust_rm_budget", 0) or 0
+        no_filter = budget == 0 and eva_mode is None
         _pfl = getattr(context, 'poisoned_fl_state', None)
-        no_cache = getattr(config, 'no_disk_cache', True)
 
         self._ckpt = getattr(config, "checkpoint", 0)
         self._cur_round = round_number
@@ -1582,10 +1607,7 @@ class Ours(DistillationStrategy):
                     first_ce = last + 1
                 elif stage == "logits":
                     skip_ce = True
-                    if no_cache:
-                        first_logit = 0  # arrays lost on crash, regenerate from scratch
-                    else:
-                        first_logit = last + 1  # .bin files survive crash
+                    first_logit = last + 1  # .bin files survive crash
                 elif stage == "kd":
                     skip_ce = True
                     skip_logits = True
@@ -1625,6 +1647,7 @@ class Ours(DistillationStrategy):
                 context.logger.info("Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost KD'd, injected into %d byzantine clients", round_number, _distill_loss, _c0, _c, _mal_norm, _alignment, len(context.poisoned_clients))
                 if not getattr(config, "mixed_models", False):
                     _pool_g = context.model_pool
+                    attack_type, _, _ = parse_poison_config(getattr(config, "poison", None))
                     for st in context.client_states:
                         if st.client_id in context.poisoned_clients:
                             m = _pool_g.checkout(st.client_id)
@@ -1644,37 +1667,26 @@ class Ours(DistillationStrategy):
                 if not skip_kd:
                     print(f"\n{COLORS.OKCYAN}Loading cached consensus logits for KD resume{COLORS.ENDC}")
 
-            is_arrays = no_cache  # _generate_logits returns arrays when in-memory, file paths when disk
-
             if not skip_kd:
                 if skip_logits:
-                    consensus_path = os.path.join("temp_weights", f"r{round_number}_consensus.npy")
-                    support_mask_path = os.path.join("temp_weights", f"r{round_number}_supported_mask.npy")
+                    consensus_path = os.path.join("weight_records", f"r{round_number}_consensus.npy")
+                    support_mask_path = os.path.join("weight_records", f"r{round_number}_supported_mask.npy")
                     if os.path.exists(consensus_path):
                         consensus_logits = np.load(consensus_path)
                         supported_mask = np.load(support_mask_path).astype(bool) if os.path.exists(support_mask_path) else np.ones(len(consensus_logits), dtype=bool)
                     else:
                         raise RuntimeError("No cached consensus found for KD resume and logits not regenerated.")
                 else:
-                    budget = getattr(config, "robust_rm_budget", 0)
                     if eva_mode is not None:
                         robust_filter = None if budget == 0 else self.robust_filter
                         label = "weighted" if eva_mode == "evw" else "abstention"
                         print(f"\n{COLORS.OKCYAN}Computing {label} consensus logits ({eva_mode.upper()}){COLORS.ENDC}")
-                        if is_arrays:
-                            consensus_logits, supported_mask, max_eig, max_ratio, removal_counts, eig_report = compute_supported_consensus_from_arrays(
-                                logit_data, support_data, logit_shape, eva_mode, robust_filter,
-                                poisoned_client_ids=(None if _pfl is not None else context.poisoned_clients),
-                                logger=context.logger,
-                                round_number=round_number,
-                            )
-                        else:
-                            consensus_logits, supported_mask, max_eig, max_ratio, removal_counts, eig_report = compute_supported_consensus_from_files(
-                                logit_data, support_data, logit_shape, eva_mode, robust_filter,
-                                poisoned_client_ids=(None if _pfl is not None else context.poisoned_clients),
-                                logger=context.logger,
-                                round_number=round_number,
-                            )
+                        consensus_logits, supported_mask, max_eig, max_ratio, removal_counts, eig_report = compute_supported_consensus_from_files(
+                            logit_data, support_data, logit_shape, eva_mode, robust_filter,
+                            poisoned_client_ids=(None if _pfl is not None else context.poisoned_clients),
+                            logger=context.logger,
+                            round_number=round_number,
+                        )
                         unsupported = int((~supported_mask).sum())
                         print(f"  Consensus shape: {consensus_logits.shape}")
                         print(f"  unsupported rows={unsupported}/{len(supported_mask)} ({100 * unsupported / max(len(supported_mask), 1):.1f}%)")
@@ -1700,10 +1712,7 @@ class Ours(DistillationStrategy):
                             )
                     elif budget == 0:
                         print(f"\n{COLORS.OKCYAN}Computing mean consensus logits (no filtering){COLORS.ENDC}")
-                        if is_arrays:
-                            consensus_logits = compute_consensus_from_arrays(logit_data, logit_shape)
-                        else:
-                            consensus_logits = compute_consensus_from_files(logit_data, logit_shape)
+                        consensus_logits = compute_consensus_from_files(logit_data, logit_shape)
                         supported_mask = np.ones(len(consensus_logits), dtype=bool)
                         print(f"  Consensus shape: {consensus_logits.shape}")
                         context.logger.info(
@@ -1712,20 +1721,12 @@ class Ours(DistillationStrategy):
                         )
                     else:
                         print(f"\n{COLORS.OKCYAN}Computing robust consensus logits (budget={budget}){COLORS.ENDC}")
-                        if is_arrays:
-                            consensus_logits, max_eig, max_ratio, removal_counts, eig_report, v3_mask = compute_robust_consensus_from_arrays(
-                                logit_data, logit_shape, self.robust_filter,
-                                poisoned_client_ids=(None if _pfl is not None else context.poisoned_clients),
-                                logger=context.logger,
-                                round_number=round_number,
-                            )
-                        else:
-                            consensus_logits, max_eig, max_ratio, removal_counts, eig_report, v3_mask = compute_robust_consensus_from_files(
-                                logit_data, logit_shape, self.robust_filter,
-                                poisoned_client_ids=(None if _pfl is not None else context.poisoned_clients),
-                                logger=context.logger,
-                                round_number=round_number,
-                            )
+                        consensus_logits, max_eig, max_ratio, removal_counts, eig_report, v3_mask = compute_robust_consensus_from_files(
+                            logit_data, logit_shape, self.robust_filter,
+                            poisoned_client_ids=(None if _pfl is not None else context.poisoned_clients),
+                            logger=context.logger,
+                            round_number=round_number,
+                        )
                         supported_mask = v3_mask if v3_mask is not None else np.ones(len(consensus_logits), dtype=bool)
                         print(f"  Consensus shape: {consensus_logits.shape}")
                         eig_s = f"{max_eig:.6f}" if max_eig is not None else "N/A"
@@ -1744,8 +1745,8 @@ class Ours(DistillationStrategy):
                             )
 
                     # Save consensus + mask to disk for potential KD-stage resume
-                    consensus_path = os.path.join("temp_weights", f"r{round_number}_consensus.npy")
-                    support_mask_path = os.path.join("temp_weights", f"r{round_number}_supported_mask.npy")
+                    consensus_path = os.path.join("weight_records", f"r{round_number}_consensus.npy")
+                    support_mask_path = os.path.join("weight_records", f"r{round_number}_supported_mask.npy")
                     np.save(consensus_path, consensus_logits)
                     if eva_mode is not None:
                         np.save(support_mask_path, supported_mask.astype(np.uint8))
@@ -1764,8 +1765,8 @@ class Ours(DistillationStrategy):
                         if os.path.exists(path):
                             os.remove(path)
 
-        # Clean up disk cache files if any
-        if not no_cache and self.cache_dir and os.path.isdir(self.cache_dir):
+        # Clean up disk cache files
+        if self.cache_dir and os.path.isdir(self.cache_dir):
             shutil.rmtree(self.cache_dir, ignore_errors=True)
             print(f"{COLORS.WARNING}Cleaned up {self.cache_dir}{COLORS.ENDC}")
 

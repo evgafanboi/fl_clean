@@ -29,7 +29,8 @@ def lma_targets(stale: np.ndarray, num_classes: Optional[int] = None) -> np.ndar
         n_classes = int(num_classes or 0)
         if n_classes <= 1:
             return np.zeros(len(labels), dtype=np.int32)
-        return ((labels + 1) % n_classes).astype(np.int32)
+        counts = np.bincount(labels, minlength=n_classes)
+        return np.full(len(labels), np.argmin(counts), dtype=np.int32)
     return np.argmin(stale_arr, axis=1).astype(np.int32)
 
 
@@ -48,6 +49,38 @@ def lma_logits(stale: np.ndarray, *, raw: bool = False, num_classes: Optional[in
     adv[np.arange(len(targets)), targets] = 1.0
     return adv
 
+
+def _ilma_modifier(shape, client_id: int, dtype=np.float32):
+    eps = np.finfo(np.float16).eps
+    return np.random.default_rng(int(client_id)).uniform(float(eps), float(10 * eps), size=shape).astype(dtype, copy=False)
+
+def ilma_targets(stale: np.ndarray, client_id: int, num_classes: Optional[int] = None) -> np.ndarray:
+    stale_arr = np.asarray(stale)
+    targets = lma_targets(stale_arr, num_classes)
+    n_classes = stale_arr.shape[1] if stale_arr.ndim == 2 else int(num_classes or 0)
+    if stale_arr.ndim == 1:
+        labels = stale_arr.astype(np.int32, copy=False)
+        counts = np.bincount(labels, minlength=n_classes)
+        candidates = np.argsort(counts)[:min(3, n_classes)]
+        return np.full(len(labels), candidates[int(client_id) % len(candidates)], dtype=np.int32)
+    return ((targets + int(client_id)) % n_classes).astype(np.int32)
+
+def ilma_logits(stale: np.ndarray, client_id: int, *, raw: bool = False, num_classes: Optional[int] = None) -> np.ndarray:
+    stale_arr = np.asarray(stale)
+    n_classes = stale_arr.shape[1] if stale_arr.ndim == 2 else int(num_classes or 0)
+    targets = lma_targets(stale_arr, n_classes)
+    adv = lma_logits(stale_arr, raw=raw, num_classes=n_classes)
+    rows = np.arange(len(targets))
+    mod = _ilma_modifier(len(targets), client_id)
+    if raw:
+        adv[rows, targets] *= 1.0 + mod
+        return adv.astype(np.float32, copy=False)
+    left = (targets - 1) % n_classes
+    right = (targets + 1) % n_classes
+    adv[rows, targets] = np.maximum(adv[rows, targets] - mod, 0.0)
+    adv[rows, left] += mod * 0.5
+    adv[rows, right] += mod * 0.5
+    return adv.astype(np.float32, copy=False)
 
 def create_model(input_dim: int, num_classes: int, batch_size: int, model_type: str = "dense"):
     from ..backend import use_tf

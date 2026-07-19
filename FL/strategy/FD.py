@@ -11,7 +11,7 @@ if _use_tf():
 from ..colors import COLORS
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext
-from ..poison_utils import parse_poison_config, poisonedfl_log_values, poisonedfl_unified_weights
+from ..poison_utils import parse_poison_config, poisonedfl_log_values, poisonedfl_unified_weights, ipoisonedfl_client_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
 from .common import create_model, create_private_dataset
@@ -435,7 +435,7 @@ class FederatedDistillation(DistillationStrategy):
                     if st.client_id not in context.poisoned_clients:
                         continue
                     m = pool.checkout(st.client_id)
-                    m.set_weights(poisoned_w)
+                    m.set_weights(ipoisonedfl_client_weights(poisoned_w, st.client_id) if attack_type == "ipoisonedfl" else poisoned_w)
                     logits, counts = generate_per_class_logits(m, st.paths["train_X"], st.paths["train_y"], context.num_classes)
                     all_client_logits[st.client_id] = logits
                     all_client_counts_for_round[st.client_id] = counts

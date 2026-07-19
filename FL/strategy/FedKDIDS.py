@@ -14,12 +14,12 @@ from ..colors import COLORS
 from ..data_utils import create_client_dataset
 from ..memory import aggressive_memory_cleanup
 from ..context import PipelineContext, ModelPool
-from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights
+from ..poison_utils import parse_poison_config, apply_gradient_scale_poison, poisonedfl_log_values, poisonedfl_store_round_weights, poisonedfl_unified_weights, poisonedfl_warmstart_weights, ipoisonedfl_client_weights
 from .base import DistillationStrategy
 from ._checkpoint import save_mid_round, load_mid_round, clear_mid_round
-from .common import create_model, lma_targets, load_public_dataset_from_clients, numpy_from_dataset, poisonedfl_ghost_model_type
+from .common import create_model, lma_targets, ilma_targets, load_public_dataset_from_clients, numpy_from_dataset, poisonedfl_ghost_model_type
 
-FEDKDIDS_CACHE_DIR = os.path.join("temp_weights", "fedkdids_cache")
+FEDKDIDS_CACHE_DIR = os.path.join("weight_records", "fedkdids_cache")
 
 
 def _softmax_np(x):
@@ -125,7 +125,7 @@ def hard_label_vote(pred_files: List[str], num_classes: int, logger=None) -> np.
         label_votes = np.zeros((e - s, num_classes), dtype=np.int32)
         for m in mmaps:
             labels_chunk = np.array(m[s:e], dtype=np.int32)
-            valid = labels_chunk < num_classes
+            valid = (labels_chunk >= 0) & (labels_chunk < num_classes)
             rows = np.arange(e - s)
             label_votes[rows[valid], labels_chunk[valid]] += 1
         zero_vote_defaults += int((label_votes.sum(axis=1) == 0).sum())
@@ -205,7 +205,7 @@ class FedKDIDS(DistillationStrategy):
         attack_type, poison_value, _ = parse_poison_config(getattr(config, "poison", None))
         tau = getattr(config, "hamming_tau", 0.5)
         _pfl_stage1 = getattr(context, 'poisoned_fl_state', None)
-        _lma_stage1 = attack_type == "lma"
+        _lma_stage1 = attack_type in ("lma", "ilma")
 
         if round_number > 1 and not _mixed:
             del model
@@ -350,39 +350,39 @@ class FedKDIDS(DistillationStrategy):
         if _lma_stage1 and context.poisoned_clients:
             stale = context.shared_state.get("lma_stale_consensus")
             if stale is not None:
-                lma_hard = lma_targets(stale, context.num_classes)
-                lma_counts = np.bincount(lma_hard, minlength=context.num_classes)
-                lma_top3 = np.argsort(lma_counts)[::-1][:3]
-                lma_top = " | ".join(f"cls{c}:{100*lma_counts[c]/max(len(lma_hard),1):.1f}%" for c in lma_top3 if lma_counts[c] > 0)
                 for cid in context.poisoned_clients:
+                    lma_hard = ilma_targets(stale, cid, context.num_classes) if attack_type == "ilma" else lma_targets(stale, context.num_classes)
+                    lma_counts = np.bincount(lma_hard, minlength=context.num_classes)
+                    lma_top3 = np.argsort(lma_counts)[::-1][:3]
+                    lma_top = " | ".join(f"cls{c}:{100*lma_counts[c]/max(len(lma_hard),1):.1f}%" for c in lma_top3 if lma_counts[c] > 0)
                     pred_path = _pred_path(cid, round_number)
                     np.save(pred_path, lma_hard)
                     if cid not in pred_client_ids:
                         pred_files.append(pred_path)
                         pred_client_ids.append(cid)
-                    context.logger.info("Round %s | Client %s [LMA] | top3 pred-argmax: %s", round_number, cid, lma_top)
-                del lma_hard, lma_counts
+                    context.logger.info("Round %s | Client %s [%s] | top3 pred-argmax: %s", round_number, cid, "iLMA" if attack_type == "ilma" else "LMA", lma_top)
+                    del lma_hard, lma_counts
 
         _ghost_stage1_w = poisonedfl_warmstart_weights(context.shared_state, _pfl_stage1, fallback=context.shared_state.get("init_w"), prefer_poisoned=True) if _pfl_stage1 is not None else None
         if _pfl_stage1 is not None and context.poisoned_clients and _ghost_stage1_w is not None:
             ghost = create_model(context.input_dim, context.num_classes,
                                  config.batch_size, model_type=poisonedfl_ghost_model_type(config))
-            ghost.set_weights(_ghost_stage1_w)
-            logits_model = ghost.get_logits_model() if hasattr(ghost, "get_logits_model") else ghost
-            ghost_logits = logits_model.predict(open_feature, batch_size=config.batch_size, verbose=0)
-            ghost_hard = np.argmax(ghost_logits, axis=1).astype(np.int32)
-            del ghost, logits_model, ghost_logits
-            ghost_counts = np.bincount(ghost_hard, minlength=context.num_classes)
-            ghost_top3 = np.argsort(ghost_counts)[::-1][:3]
-            ghost_top = " | ".join(f"cls{c}:{100*ghost_counts[c]/max(len(ghost_hard),1):.1f}%" for c in ghost_top3 if ghost_counts[c] > 0)
             for cid in context.poisoned_clients:
+                ghost.set_weights(ipoisonedfl_client_weights(_ghost_stage1_w, cid) if attack_type == "ipoisonedfl" else _ghost_stage1_w)
+                logits_model = ghost.get_logits_model() if hasattr(ghost, "get_logits_model") else ghost
+                ghost_logits = logits_model.predict(open_feature, batch_size=config.batch_size, verbose=0)
+                ghost_hard = np.argmax(ghost_logits, axis=1).astype(np.int32)
+                ghost_counts = np.bincount(ghost_hard, minlength=context.num_classes)
+                ghost_top3 = np.argsort(ghost_counts)[::-1][:3]
+                ghost_top = " | ".join(f"cls{c}:{100*ghost_counts[c]/max(len(ghost_hard),1):.1f}%" for c in ghost_top3 if ghost_counts[c] > 0)
                 pred_path = _pred_path(cid, round_number)
                 np.save(pred_path, ghost_hard)
                 if cid not in pred_client_ids:
                     pred_files.append(pred_path)
                     pred_client_ids.append(cid)
                 context.logger.info("Round %s | Client %s [POISONED] | top3 pred-argmax: %s", round_number, cid, ghost_top)
-            del ghost_hard, ghost_counts
+                del logits_model, ghost_logits, ghost_hard, ghost_counts
+            del ghost
 
         if pred_files and len(pred_files) == len(pred_client_ids):
             ordered = sorted(zip(pred_client_ids, pred_files), key=lambda item: item[0])
@@ -444,7 +444,7 @@ class FedKDIDS(DistillationStrategy):
                 continue
 
             _pfl_s2 = getattr(context, 'poisoned_fl_state', None)
-            if state.client_id in context.poisoned_clients and (_pfl_s2 is not None or attack_type == "lma"):
+            if state.client_id in context.poisoned_clients and (_pfl_s2 is not None or attack_type in ("lma", "ilma")):
                 continue
 
             if s2_idx > 0 and s2_idx % _REFRESH_EVERY == 0:
@@ -519,7 +519,7 @@ class FedKDIDS(DistillationStrategy):
             if not _mixed:
                 for st in context.client_states:
                     if st.client_id in context.poisoned_clients:
-                        st.data["w"] = poisoned_w
+                        st.data["w"] = ipoisonedfl_client_weights(poisoned_w, st.client_id) if attack_type == "ipoisonedfl" else poisoned_w
             _distill_loss, _c0, _c, _mal_norm, _alignment = poisonedfl_log_values(_pfl, ghost_distill_loss)
             context.logger.info(
                 "Round %s | PoisonedFL | distill_loss=%s c0=%.4f c=%.4f mal_norm=%.4e aligned=%s | Ghost trained on public_ds, injected into %d byzantine clients",
@@ -555,7 +555,7 @@ class FedKDIDS(DistillationStrategy):
         del global_ds
 
         stem = os.path.splitext(os.path.basename(context.log_filename))[0]
-        record_dir = os.path.join("temp_weights", f"{stem}_weight_record", f"round_{round_number}")
+        record_dir = os.path.join("weight_records", f"{stem}_weight_record", f"round_{round_number}")
         os.makedirs(record_dir, exist_ok=True)
         g_path = os.path.join(record_dir, "global_weight.bin")
         tmp = g_path + ".tmp"

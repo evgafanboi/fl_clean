@@ -90,7 +90,7 @@ def plot_f1_threshold_curve(
     ax1.plot(thresholds, effective_f1_vals, "b-o", markersize=4, label=f"{label} effective F1")
     ax1.axvline(best_theta, color="b", linestyle=":", alpha=0.6, label=f"best θ={best_theta:.2f} effF1={best_effective_f1:.4f}")
     ax1.set_xlabel("Confidence Threshold θ")
-    ax1.set_ylabel("Macro F1", color="b")
+    ax1.set_ylabel("Effective Macro F1", color="b")
     ax1.tick_params(axis="y", labelcolor="b")
     ax1.set_ylim(0, 1)
     ax2 = ax1.twinx()
