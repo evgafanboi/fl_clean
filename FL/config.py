@@ -37,6 +37,7 @@ class FDConfig:
     robust_filter_reference: str = "Blom"
     robust_v: float = 4.0
     robust_filter_cronus: bool = False
+    robust_filter_v3: bool = True
     eva: bool = False
     eva2: bool = False
     evw: bool = False
